@@ -55,8 +55,7 @@ def parse_inat_source():
     """
     Parse iNaturalist source observations and save them to a gzipped CSV file.
     
-    Note: This can take a long time to run, dataset size is ~120GB and 110+ million rows. 
-    We'll be processing it in chunks to avoid memory issues. The resulting file will be ~2.5GB.
+    Note: This can take a long time to run, we'll be processing it in chunks to avoid memory issues. The resulting file will be ~2.5GB.
     """    
     
     # Load iNaturalist observations
@@ -66,7 +65,10 @@ def parse_inat_source():
     inat_csv_filename = "observations.csv"
     inat_columns = ['occurrenceID', 'decimalLatitude', 'decimalLongitude', 'eventDate', 'taxonID', 'scientificName']
     inat_dst_file = f"{WORKING_DIR}/inat_parsed_observations.csv.gz"
-    inat_df = pd.DataFrame(columns=inat_columns)
+    
+    # Remove existing file if it exists
+    if os.path.exists(inat_dst_file):
+        os.remove(inat_dst_file)
     
     for chunk in tqdm(load_source_observations(inat_source_file, inat_csv_filename, chunk_size=100000, columns=inat_columns), unit="cnk", desc="Loading iNaturalist observations"):
         
@@ -81,17 +83,65 @@ def parse_inat_source():
         chunk[['eventDate', 'eventTime']] = chunk['eventDate'].str.split('T', expand=True)
         
         # Save time as hh:mm
-        chunk['eventTime'] = chunk['eventTime'].str[:5]      
+        chunk['eventTime'] = chunk['eventTime'].str[:5]    
+        
+        # Convert cloumn names to lowercase
+        chunk.columns = [col.lower() for col in chunk.columns]  
             
         # Save chunk to gzipped CSV file
         save_chunk_to_csv(chunk, inat_dst_file, mode='a', header=inat_df.shape[0] == chunk.shape[0])
+        
+def parse_ebird_source():
+    """
+    Parse eBird source observations and save them to a gzipped CSV file.
+    
+    Note: This can take a long time to run, we'll be processing it in chunks to avoid memory issues. The resulting file will be ~XXGB.
+    """
+    
+    # Load eBird observations
+    # https://hosted-datasets.gbif.org/eBird/2023-eBird-dwca-1.0.zip (Publication date March 22, 2024)
+    # Citation: Auer T, Barker S, Barry J, Charnoky M, Curtis J, Davies I, Davis C, Downie I, Fink D, Fredericks T, Ganger J, Gerbracht J, Hanks C, Hochachka W, Iliff M, Imani J, Jordan A, Levatich T, Ligocki S, Long M T, Morris W, Morrow S, Oldham L, Padilla Obregon F, Robinson O, Rodewald A, Ruiz-Gutierrez V, Schloss M, Smith A, Smith J, Stillman A, Strimas-Mackey M, Sullivan B, Weber D, Wolf H, Wood C (2024). EOD – eBird Observation Dataset. Cornell Lab of Ornithology. Occurrence dataset https://doi.org/10.15468/aomfnb accessed via GBIF.org on 2025-06-02.
+    ebird_source_file = f"{WORKING_DIR}/2023-eBird-dwca-1.0.zip"
+    ebird_csv_filename = "eod.csv"
+    ebird_columns = ['occurrenceid', 'decimallatitude', 'decimallongitude', 'year', 'month', 'day', 'scientificname', 'vernacularname', 'taxonconceptid', 'individualcount']
+    ebird_dst_file = f"{WORKING_DIR}/ebird_parsed_observations.csv.gz"
+    
+    # Remove existing file if it exists
+    if os.path.exists(ebird_dst_file):
+        os.remove(ebird_dst_file)
+        
+    for chunk in tqdm(load_source_observations(ebird_source_file, ebird_csv_filename, chunk_size=100000, columns=ebird_columns), unit="cnk", desc="Loading eBird observations"):
+        
+        # Parse occurrenceid
+        chunk['occurrenceid'] = chunk['occurrenceid'].str.split(':').str[-1].astype(int, errors='ignore')
+        
+        # Round lat/lon to 3 decimal places
+        chunk['decimallatitude'] = chunk['decimallatitude'].round(3)
+        chunk['decimallongitude'] = chunk['decimallongitude'].round(3)
+        
+        # Combine year, month, and day into a single date column (with leading zeros)
+        chunk['year'] = chunk['year'].astype(str).str.zfill(4)
+        chunk['month'] = chunk['month'].astype(str).str.zfill(2)
+        chunk['day'] = chunk['day'].astype(str).str.zfill(2)
+        chunk['eventdate'] = chunk[['year', 'month', 'day']].astype(str).agg('-'.join, axis=1)
+        chunk.drop(columns=['year', 'month', 'day'], inplace=True)
+        
+        # Avoid NaN values in individualcount
+        chunk['individualcount'] = chunk['individualcount'].fillna(-1).astype(int)     
+        
+        # Save chunk to gzipped CSV file
+        save_chunk_to_csv(chunk, ebird_dst_file, mode='a', header=chunk.shape[0] == chunk.shape[0])
 
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Parse observation data")
     parser.add_argument('--parse_inat_source', action='store_true', help="Parse iNaturalist source observations")
+    parser.add_argument('--parse_ebird_source', action='store_true', help="Parse eBird source observations")
     
     args = parser.parse_args()
     
     if args.parse_inat_source:
         parse_inat_source()
+        
+    if args.parse_ebird_source:
+        parse_ebird_source()
