@@ -470,6 +470,7 @@ def get_week_from_date(date_series):
 def merge_chunk_with_grid(chunk, grid_data, species_code_cache=None):
     """
     Merge a chunk of observation data with the grid data - optimized version.
+    Ensures each species appears only once per week at each location.
     """
     # Initialize species code cache if not provided
     if species_code_cache is None:
@@ -534,24 +535,26 @@ def merge_chunk_with_grid(chunk, grid_data, species_code_cache=None):
         if species_code is None:
             continue
         
-        # Add to batch updates
+        # Add to batch updates (using sets to eliminate duplicates within the current chunk)
         week_key = f'week_{int(week)}'
         if closest_cell not in updates:
             updates[closest_cell] = {}
             
         if week_key not in updates[closest_cell]:
-            updates[closest_cell][week_key] = []
+            updates[closest_cell][week_key] = set()
             
-        updates[closest_cell][week_key].append(species_code)
+        updates[closest_cell][week_key].add(species_code)
     
-    # Apply batch updates to grid_data
+    # Apply batch updates to grid_data, ensuring uniqueness
     for cell, week_updates in updates.items():
         for week_key, species_codes in week_updates.items():
             current = grid_data.at[cell, week_key]
             if isinstance(current, list):
-                grid_data.at[cell, week_key] = current + species_codes
+                # Convert current list to set, merge with new codes, then back to list
+                updated_species = set(current) | species_codes
+                grid_data.at[cell, week_key] = list(updated_species)
             else:
-                grid_data.at[cell, week_key] = species_codes
+                grid_data.at[cell, week_key] = list(species_codes)
     
     return chunk
 
@@ -637,8 +640,7 @@ def merge_with_grid(grid_file, threads=1):
                     pbar.update(len(chunk))
                     
                     # DEBUG: Break after certain number of rows for testing
-                    #if processed_rows >= 250000:
-                    #    print("DEBUG: Stopping after 1,000,000 rows for testing")
+                    #if processed_rows >= 500000:
                     #    break
     
     # Save the merged grid data to a CSV file
