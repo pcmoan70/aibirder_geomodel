@@ -1,400 +1,490 @@
+"""Utilities for building H3 grids and reducing Earth Engine imagery.
+
+This module builds H3 indexes for a bbox or the globe and computes a
+set of environmental properties per cell by sampling Earth Engine
+datasets. It exposes `compute_environmental_data` and
+`run_global_in_chunks` for chunked processing.
+"""
+
+from typing import Iterable, List, Optional, Dict, Tuple
 import os
-import argparse
+import logging
+import threading
 import math
+import concurrent.futures
+from functools import partial
+
 import ee
-import pandas as pd
+import h3
+import geopandas as gpd
+from shapely.geometry import Polygon
 from tqdm import tqdm
-from global_land_mask import globe
-import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-import numpy as np
-from matplotlib.patches import Rectangle
-import random
-import matplotlib.cm as cm
-from dotenv import load_dotenv
 
-load_dotenv()
+LOG = logging.getLogger(__name__)
 
-# Load working directory from environment variable
-WORKING_DIR = os.getenv('WORKING_DIRECTORY', '')
+# Semaphore to bound concurrent Earth Engine requests. Tunable with
+# the `EE_MAX_CONCURRENCY` environment variable (default: 8).
+try:
+    _EE_MAX_CONCURRENCY = int(os.getenv('EE_MAX_CONCURRENCY', '8'))
+except Exception:
+    _EE_MAX_CONCURRENCY = 8
+_EE_SEMAPHORE = threading.BoundedSemaphore(_EE_MAX_CONCURRENCY)
 
-# Random seed for reproducibility
-random.seed(42)
 
-# Initialize the Earth Engine API
-ee.Initialize()
+def initialize_ee(service_account: Optional[str] = None, key_file: Optional[str] = None) -> None:
+    """Initialize Google Earth Engine.
 
-def is_ocean(lat, lon):
+    Tries a standard client-side initialization first. If `service_account` and
+    `key_file` are provided the function will attempt service account auth.
     """
-    Check if a given location is in the ocean/sea or on land using the global_land_mask package.
-    
-    Parameters:
-    - lat: Latitude of the location
-    - lon: Longitude of the location
-    
-    Returns:
-    - Boolean: True if the location is in ocean/sea, False if it's on land
-    """
-    return not globe.is_land(lat, lon)
+    try:
+        ee.Initialize()
+        LOG.info("Earth Engine initialized (client).")
+        return
+    except Exception:
+        LOG.debug("Standard EE init failed, trying service account if provided.")
 
-def generate_geo_grid(start_lat=-90, end_lat=90, grid_step_km=100, ocean_sample_chance=0.1):
-    """
-    Generate a grid of latitudes and longitudes with a given grid size.
-    Only adds land points to the grid. Ocean points are added with a 10% chance.
-    
-    Parameters:
-    - start_lat: The starting latitude (-90 to 90).
-    - end_lat: The ending latitude (-90 to 90).
-    - grid_step_km: The step size for the grid in kilometers.
-    - ocean_sample_chance: Probability of sampling an ocean point (default: 0.1).
-    
-    Returns:
-    - Generator yielding (latitude, longitude, is_ocean) tuples
-    """
-    # Earth's radius in km (approximate)
-    earth_radius = 6371.0
-    
-    # Calculate latitude step in degrees
-    lat_step_deg = (grid_step_km / earth_radius) * (180 / math.pi)
+    if service_account and key_file and os.path.exists(key_file):
+        credentials = ee.ServiceAccountCredentials(service_account, key_file)
+        ee.Initialize(credentials)
+        LOG.info("Earth Engine initialized with service account.")
+        return
 
-    lat = start_lat
-    while lat <= end_lat:
-        lon = -180
-        while lon <= 180:
-            # Determine if the current location is ocean or land
-            is_ocean_value = is_ocean(lat, lon)
-            
-            # Add land points to the grid. Ocean points are added with a 10% chance.
-            if (not is_ocean_value and lat > -60 and lat < 75) or random.random() < ocean_sample_chance:
-                yield round(lat, 3), round(lon, 3), is_ocean_value
-            
-            # Calculate longitude step in degrees at this latitude
-            cos_lat = math.cos(math.radians(lat))
-            if abs(cos_lat) < 0.01:
-                lon_step_deg = 10.0
+    raise RuntimeError("Unable to initialize Earth Engine. Provide credentials or run `earthengine authenticate`. ")
+
+
+def h3_resolution_for_km(target_km: int) -> int:
+    """Return an H3 resolution that approximately matches the requested
+    target cell size in kilometers.
+
+    Acceptable `target_km` values are 5, 10, or 25. The mapping is a pragmatic
+    choice that balances global coverage and dataset resolution.
+    """
+    # Accept arbitrary positive target_km. We approximate the H3 cell
+    # "diameter" for candidate resolutions by sampling a representative
+    # cell and measuring the maximum pairwise distance across its
+    # boundary. Cache results for speed.
+    if target_km <= 0:
+        raise ValueError("target_km must be positive")
+
+    # cache per-target to avoid recomputation
+    if not hasattr(h3_resolution_for_km, "_cache"):
+        h3_resolution_for_km._cache = {}
+
+    if target_km in h3_resolution_for_km._cache:
+        return h3_resolution_for_km._cache[target_km]
+
+    # helper: haversine distance in km
+    def haversine(a_lat, a_lon, b_lat, b_lon):
+        from math import radians, sin, cos, asin, sqrt
+        a_lat, a_lon, b_lat, b_lon = map(radians, [a_lat, a_lon, b_lat, b_lon])
+        dlon = b_lon - a_lon
+        dlat = b_lat - a_lat
+        aa = sin(dlat/2)**2 + cos(a_lat) * cos(b_lat) * sin(dlon/2)**2
+        return 2 * 6371.0 * asin(sqrt(aa))
+
+    # pick a representative res0 cell
+    res0_cells = h3.get_res0_cells()
+    rep = next(iter(res0_cells))
+
+    best_r = None
+    best_diff = float('inf')
+
+    # evaluate resolutions 0..8 (sufficient for coarse grids)
+    for r in range(0, 9):
+        try:
+            if r == 0:
+                cell = rep
             else:
-                lon_step_deg = (grid_step_km / earth_radius) * (180 / math.pi) / cos_lat
-            
-            lon += lon_step_deg
-        
-        lat += lat_step_deg
+                children = h3.cell_to_children(rep, r)
+                cell = children[0]
+            boundary = h3.cell_to_boundary(cell)
+            # boundary is list of (lat, lon) tuples
+            maxd = 0.0
+            for i in range(len(boundary)):
+                for j in range(i+1, len(boundary)):
+                    a_lat, a_lon = boundary[i]
+                    b_lat, b_lon = boundary[j]
+                    d = haversine(a_lat, a_lon, b_lat, b_lon)
+                    if d > maxd:
+                        maxd = d
+            diff = abs(maxd - float(target_km))
+            if diff < best_diff:
+                best_diff = diff
+                best_r = r
+        except Exception:
+            continue
 
-def get_landcover_class_name(class_value):
-    """
-    Map MODIS MCD12Q1 IGBP land cover class values to their descriptive names.
-    
-    Parameters:
-    - class_value: Numeric class value from the MODIS land cover dataset
-    
-    Returns:
-    - String description of the land cover class
-    """
-    landcover_classes = {
-        0: "Water",
-        1: "Evergreen Needleleaf Forest",
-        2: "Evergreen Broadleaf Forest",
-        3: "Deciduous Needleleaf Forest",
-        4: "Deciduous Broadleaf Forest",
-        5: "Mixed Forest",
-        6: "Closed Shrublands",
-        7: "Open Shrublands",
-        8: "Woody Savannas",
-        9: "Savannas",
-        10: "Grasslands",
-        11: "Permanent Wetlands",
-        12: "Croplands",
-        13: "Urban and Built-up",
-        14: "Cropland/Natural Vegetation Mosaic",
-        15: "Snow and Ice",
-        16: "Barren or Sparsely Vegetated",
-        254: "Unclassified",
-        255: "Fill Value"
-    }
-    
-    return landcover_classes.get(class_value, f"Unknown Class ({class_value})")
+    # fallback if something went wrong
+    if best_r is None:
+        best_r = 2
 
-def get_landcover_data(lat, lon):
-    """
-    Retrieve the basic land cover data for a given latitude and longitude using Google Earth Engine.
-    
-    Parameters:
-    - lat: Latitude of the location
-    - lon: Longitude of the location
-    
-    Returns:
-    - Tuple (landcover_class, landcover_name) or (None, "Unknown") if data not available
-    """
-    try:
-        point = ee.Geometry.Point(lon, lat)
-        landcover = ee.ImageCollection("MODIS/061/MCD12Q1").select('LC_Type1')
-        landcover_image = landcover.filterDate('2023-01-01', '2023-12-31').mean()
-        landcover_value = landcover_image.sample(region=point, scale=1000, numPixels=1).first()
-        
-        if landcover_value is None:
-            return None, "Unknown"
-            
-        landcover_class = landcover_value.get('LC_Type1').getInfo()
-        landcover_name = get_landcover_class_name(landcover_class)
-        
-        return int(landcover_class), landcover_name
-        
-    except Exception as e:
-        return None, "Unknown"
+    LOG.info("H3 resolution for %s km -> %d (approx diameter diff %.2f km)", target_km, best_r, best_diff)
+    h3_resolution_for_km._cache[target_km] = best_r
+    return best_r
 
-def get_elevation(lat, lon):
-    """
-    Get elevation data for a given latitude and longitude.
-    
-    Parameters:
-    - lat: Latitude of the location
-    - lon: Longitude of the location
-    
-    Returns:
-    - Elevation in meters above sea level
-    """
-    try:
-        point = ee.Geometry.Point(lon, lat)
-        elevation = ee.Image("USGS/SRTMGL1_003")
-        elevation_value = elevation.sample(region=point, scale=100, numPixels=1).first()
-        return elevation_value.get("elevation").getInfo()
-    
-    except Exception as e:
-        return 0
 
-def get_tree_canopy_height(lat, lon):
-    """
-    Get tree canopy height for a given latitude and longitude.
-    
-    Parameters:
-    - lat: Latitude of the location
-    - lon: Longitude of the location
-    
-    Returns:
-    - Tree canopy height in meters
-    """
-    try:
-        point = ee.Geometry.Point(lon, lat)
-        canopy = ee.Image("NASA/JPL/global_forest_canopy_height_2005")
-        canopy_value = canopy.sample(region=point, scale=100, numPixels=1).first()
-        return canopy_value.get("1").getInfo()
-    
-    except Exception as e:
-        return 0
+def bbox_to_polygon(lon_min: float, lat_min: float, lon_max: float, lat_max: float) -> List[Tuple[float, float]]:
+    return [
+        (lon_min, lat_min),
+        (lon_min, lat_max),
+        (lon_max, lat_max),
+        (lon_max, lat_min),
+        (lon_min, lat_min),
+    ]
 
-def get_climate_data(lat, lon, is_ocean=False):
+def build_h3_grid(resolution: int, bounds: Optional[Tuple[float, float, float, float]] = None) -> List[str]:
+    """Return a list of H3 indexes covering `bounds` at `resolution`.
+
+    If `bounds` is None the function defaults to the global bbox
+    (-180, -90, 180, 90). The result can be large for fine resolutions; use
+    cautiously.
     """
-    Get climate data (temperature and precipitation) for a given latitude and longitude.
-    
-    Parameters:
-    - lat: Latitude of the location
-    - lon: Longitude of the location
-    - is_ocean: Boolean indicating if the location is in the ocean
-    
-    Returns:
-    - Dictionary with annual mean temperature and precipitation
+    if bounds is None:
+        bounds = (-180.0, -90.0, 180.0, 90.0)
+    lon_min, lat_min, lon_max, lat_max = bounds
+
+    # h3 Python bindings expect LatLngPoly objects (lat, lon order).
+    # If the requested bbox covers the full globe, use a res0-to-children
+    # expansion which is robust for global coverage.
+    if lon_min <= -180.0 and lat_min <= -90.0 and lon_max >= 180.0 and lat_max >= 90.0:
+        hexes = []
+        for base in h3.get_res0_cells():
+            try:
+                children = h3.cell_to_children(base, resolution)
+                hexes.extend(children)
+            except Exception:
+                # skip problematic base cells
+                continue
+        return list(hexes)
+
+    outer = [
+        (lat_min, lon_min),
+        (lat_max, lon_min),
+        (lat_max, lon_max),
+        (lat_min, lon_max),
+    ]
+    poly = h3.LatLngPoly(outer)
+    hexes = h3.h3shape_to_cells(poly, resolution)
+    return list(hexes)
+
+
+def _h3_to_shapely_polygon(h: str) -> Polygon:
+    """Convert an H3 index to a Shapely Polygon (lon,lat order)."""
+    # `cell_to_boundary` returns a tuple of (lat, lon) pairs
+    latlon = h3.cell_to_boundary(h)
+    # convert to (lon, lat) for shapely
+    lonlat = [(lon, lat) for (lat, lon) in latlon]
+    return Polygon(lonlat)
+
+def compute_environmental_data(h3_indexes: Iterable[str], scale: int = 30, fields: Optional[List[str]] = None, use_centroid_sampling: bool = True, chunk_size: int = 200, threads: int = 1) -> gpd.GeoDataFrame:
+    """Compute environmental summaries for a list of H3 cells.
+
+    This function reduces a set of Earth Engine images per-H3 cell and
+    returns a GeoDataFrame with one row per `h3_index`. The reduction is
+    done using centroid sampling (faster) and runs in chunked mode to
+    avoid building large server-side feature collections.
+
+    Parameters
+    - `h3_indexes`: Iterable of H3 cell ids to process.
+    - `scale`: nominal reducer scale (meters).
+    - `fields`: list of datasets to reduce; defaults to all supported fields.
+    - `threads`: number of worker threads used for per-chunk concurrency.
+
+    Returns a `geopandas.GeoDataFrame` containing `h3_index`, `geometry`,
+    and the requested environmental columns.
     """
-    point = ee.Geometry.Point(lon, lat)
-    
-    try:
-    
-        if is_ocean:        
-            oisst = ee.ImageCollection("NOAA/CDR/SST_WHOI/V2")
-            sst = oisst.filterDate('2023-01-01', '2023-12-31').mean().select('sea_surface_temperature')
-            climate_values = sst.sample(region=point, scale=1000, numPixels=1).first()
-            temp = round(climate_values.get("sea_surface_temperature").getInfo(), 1)
-            precip = None  # Precipitation data not available for ocean locations
+    if fields is None:
+        fields = ['water', 'elevation', 'canopy', 'climate', 'landcover']
+
+    # Note: per-chunk EE features are built inside reducers; avoid building
+    # the full feature list here to prevent a large serial overhead.
+
+    # Define datasets (only initialize used ones)
+    jrc = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select('occurrence') if 'water' in fields else None
+    elev_img = ee.Image("USGS/SRTMGL1_003") if 'elevation' in fields else None
+    canopy_img = ee.Image("NASA/JPL/global_forest_canopy_height_2005") if 'canopy' in fields else None
+    worldclim = ee.Image("WORLDCLIM/V1/BIO") if 'climate' in fields else None
+    modis_img = None
+    if 'landcover' in fields:
+        modis = ee.ImageCollection("MODIS/061/MCD12Q1").select('LC_Type1')
+        modis_img = modis.filterDate('2020-01-01', '2020-12-31').first()
+
+    # Helper to map results by h3 id
+    def map_props(res, prop_name_candidates: List[str]) -> Dict[str, Optional[float]]:
+        out = {}
+        if res is None:
+            return out
+        feats = res.get('features', [])
+        for f in feats:
+            props = f.get('properties', {})
+            h3id = props.get('h3')
+            val = None
+            for pn in prop_name_candidates:
+                if pn in props and props[pn] is not None:
+                    val = props[pn]
+                    break
+            out[h3id] = val
+        return out
+
+    # Helper: reduce an image over the h3_indexes in chunks and accumulate
+    # If `use_centroid_sampling` is True, the function will sample the image
+    # at the centroid point of each H3 cell (much faster for coarse grids),
+    # otherwise it will perform polygonal `reduceRegions` to compute area
+    # aggregates.
+    def reduce_image_chunks(image, reducer, scale_arg, prop_candidates, modis_scale=False, centroid=True, label: str = 'image', threads: int = 1):
+        acc = {}
+        total = len(h3_indexes)
+        # prepare chunk ranges
+        ranges = [(i, min(i + chunk_size, total)) for i in range(0, total, chunk_size)]
+
+        def reduce_range(rng):
+            i0, i1 = rng
+            sub = h3_indexes[i0:i1]
+            feats_chunk = []
+            if centroid:
+                for h in sub:
+                    lat, lon = h3.cell_to_latlng(h)
+                    ee_pt = ee.Geometry.Point([lon, lat])
+                    feats_chunk.append(ee.Feature(ee_pt, {"h3": h}))
+                fc_chunk = ee.FeatureCollection(feats_chunk)
+                s = 500 if modis_scale else scale_arg
+                try:
+                    _EE_SEMAPHORE.acquire()
+                    try:
+                        res_chunk = image.sampleRegions(collection=fc_chunk, scale=s).getInfo()
+                    finally:
+                        _EE_SEMAPHORE.release()
+                except Exception as e:
+                    LOG.warning('Chunk %d-%d failed: %s', i0, i1, e)
+                    return {}
+            else:
+                for h in sub:
+                    poly = _h3_to_shapely_polygon(h)
+                    lonlat_coords = [[c[0], c[1]] for c in poly.exterior.coords]
+                    ee_poly = ee.Geometry.Polygon(lonlat_coords)
+                    feats_chunk.append(ee.Feature(ee_poly, {"h3": h}))
+                fc_chunk = ee.FeatureCollection(feats_chunk)
+                s = 500 if modis_scale else scale_arg
+                try:
+                    _EE_SEMAPHORE.acquire()
+                    try:
+                        res_chunk = image.reduceRegions(collection=fc_chunk, reducer=reducer, scale=s).getInfo()
+                    finally:
+                        _EE_SEMAPHORE.release()
+                except Exception as e:
+                    LOG.warning('Chunk %d-%d failed: %s', i0, i1, e)
+                    return {}
+            return map_props(res_chunk, prop_candidates)
+
+        if threads is None or threads <= 1:
+            for rng in ranges:
+                m = reduce_range(rng)
+                acc.update(m)
         else:
-            worldclim = ee.Image("WORLDCLIM/V1/BIO")
-            climate_values = worldclim.sample(region=point, scale=1000, numPixels=1).first()
-            temp = round(climate_values.get("bio01").getInfo() / 10, 1)
-            precip = int(climate_values.get("bio12").getInfo())
-            
-    except Exception as e:
-        #print(f"Error retrieving climate data for ({lat}, {lon}): {e}")
-        temp = None
-        precip = None
-    
-    return {
-        "temperature": temp,
-        "precipitation": precip
-    }
+            # Submit each range as its own future to maximize parallelism.
+            max_workers = max(threads * 4, 4)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = {ex.submit(reduce_range, rng): rng for rng in ranges}
+                for fut in concurrent.futures.as_completed(futures):
+                    try:
+                        m = fut.result()
+                        acc.update(m)
+                    except Exception as e:
+                        LOG.warning('Chunk task failed: %s', e)
 
-def get_environmental_data(lat, lon, is_ocean):
+        return acc
+
+    # Run reductions in chunks (this avoids sending a massive feature collection)
+    water_map = {}
+    elev_map = {}
+    canopy_map = {}
+    wc_bio01_map = {}
+    wc_bio12_map = {}
+    lc_map = {}
+
+    # Compute water first, then run remaining dataset reductions concurrently.
+    water_map = {}
+    if jrc is not None:
+        jrc_props = ['occurrence']
+        try:
+            water_map = reduce_image_chunks(jrc, ee.Reducer.mean(), scale, jrc_props, False, True, 'JRC', threads)
+        except Exception as e:
+            LOG.warning('JRC water reduction failed: %s', e)
+
+    # Prepare remaining per-dataset reduction tasks (exclude JRC/water)
+    tasks = {}
+    if elev_img is not None:
+        elev_props = ['elevation']
+        tasks['elevation'] = partial(reduce_image_chunks, elev_img.select('elevation'), ee.Reducer.mean(), scale, elev_props, False, True, 'SRTM', threads)
+    if canopy_img is not None:
+        canopy_props = ['1']
+        tasks['canopy'] = partial(reduce_image_chunks, canopy_img.select('1'), ee.Reducer.mean(), scale, canopy_props, False, True, 'Canopy', threads)
+    if worldclim is not None:
+        wc_props = ['bio01', 'bio12']
+        tasks['worldclim'] = partial(reduce_image_chunks, worldclim.select(['bio01', 'bio12']), ee.Reducer.mean(), scale, wc_props, False, True, 'WorldClim', threads)
+    if modis_img is not None:
+        lc_props = ['LC_Type1']
+        tasks['modis'] = partial(reduce_image_chunks, modis_img, ee.Reducer.mode(), 500, lc_props, True, True, 'MODIS', threads)
+
+    # Execute remaining dataset reductions concurrently. Each task internally
+    # will use `threads` for chunk-level parallelism.
+    results = {}
+    if tasks:
+        max_workers = max(1, len(tasks))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {ex.submit(func): name for name, func in tasks.items()}
+            for fut in concurrent.futures.as_completed(future_map):
+                name = future_map[fut]
+                try:
+                    results[name] = fut.result()
+                except Exception as e:
+                    LOG.warning('Reduction for %s failed: %s', name, e)
+
+    # Map results to expected variables
+    elev_map = results.get('elevation', {})
+    canopy_map = results.get('canopy', {})
+    wc_map = results.get('worldclim', {})
+    lc_map = results.get('modis', {})
+    wc_bio01_map = wc_map
+    wc_bio12_map = wc_map
+
+    rows = []
+    for h in h3_indexes:
+        poly = _h3_to_shapely_polygon(h)
+        # water fraction: JRC occurrence is 0-100
+        mean_occ = water_map.get(h)
+        water_frac = float(mean_occ) / 100.0 if mean_occ is not None else None
+
+        elev = elev_map.get(h)
+        elev_m = float(elev) if elev is not None else None
+
+        canopy = canopy_map.get(h)
+        canopy_m = float(canopy) if canopy is not None else None
+
+        bio01 = wc_bio01_map.get(h)
+        # WORLDCLIM bio01 is temperature *10 according to dataset docs
+        temp_c = (float(bio01) / 10.0) if bio01 is not None else None
+
+        bio12 = wc_bio12_map.get(h)
+        precip_mm = float(bio12) if bio12 is not None else None
+
+        lc = lc_map.get(h)
+        lc_class = int(lc) if lc is not None else None
+
+        row = {'h3_index': h, 'geometry': poly}
+        if 'water' in fields:
+            row['water_fraction'] = water_frac
+        if 'elevation' in fields:
+            row['elevation_m'] = elev_m
+        if 'climate' in fields:
+            row['precipitation_mm'] = precip_mm
+            row['temperature_c'] = temp_c
+        if 'landcover' in fields:
+            row['landcover_class'] = lc_class
+        if 'canopy' in fields:
+            row['canopy_height_m'] = canopy_m
+        rows.append(row)
+
+    gdf = gpd.GeoDataFrame(rows, geometry='geometry', crs='EPSG:4326')
+    return gdf
+
+
+def export_geoparquet(gdf: gpd.GeoDataFrame, out_path: str) -> None:
+    """Export GeoDataFrame to GeoParquet (Parquet with geometry).
+
+    The function writes a parquet file using PyArrow; ensure `pyarrow` and
+    a recent `geopandas` are installed.
     """
-    Get comprehensive environmental data for a given latitude and longitude.
-    
-    Parameters:
-    - lat: Latitude of the location
-    - lon: Longitude of the location
-    - is_ocean: Boolean indicating if the location is in the ocean
-    
-    Returns:
-    - Dictionary with various environmental parameters
+    # Ensure parent directory exists
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    # Use geopandas to_parquet (pyarrow engine)
+    gdf.to_parquet(out_path, index=False)
+    return
+
+
+def run_global_in_chunks(target_km: int = 10, out_dir: Optional[str] = None, bounds: Optional[Tuple[float, float, float, float]] = None, threads: int = 1) -> List[str]:
+    """Chunk the H3 grid and run reductions per-chunk.
+
+    Behavior:
+    - Always uses centroid sampling for speed and simplicity.
+    - Fixed chunk size: 500 H3 cells per chunk.
+    - Uses a single outer `tqdm` progress bar for chunk completion.
+
+    Returns a list of written parquet file paths (one per chunk).
     """
-    climate = get_climate_data(lat, lon, is_ocean=is_ocean)
-    
-    if is_ocean:
-        landcover_class = 0
-        landcover_string = "Ocean/Sea"
-        elevation = 0
-        canopy_height = 0
+    res = h3_resolution_for_km(target_km)
+    hexes = build_h3_grid(resolution=res, bounds=bounds)
+
+    out_dir = out_dir or 'outputs/chunks'
+    os.makedirs(out_dir, exist_ok=True)
+
+    total_cells = len(hexes)
+    if total_cells == 0:
+        return []
+
+    # Fixed chunk size per user request
+    chunk_size = 500
+    chunks = [(i, hexes[i:i+chunk_size]) for i in range(0, len(hexes), chunk_size)]
+
+    written: List[str] = []
+    progress = tqdm(total=len(chunks), desc='Processing chunks') if len(chunks) > 1 else None
+
+    def process_chunk(item):
+        i, chunk = item
+        gdf = compute_environmental_data(chunk, use_centroid_sampling=True, chunk_size=chunk_size, threads=1)
+        gdf['target_km'] = target_km
+        gdf['h3_resolution'] = res
+        out_path = os.path.join(out_dir, f'water_grid_{target_km}km_chunk_{i//chunk_size:04d}.parquet')
+        export_geoparquet(gdf, out_path)
+        return out_path
+
+    if threads is None or threads <= 1:
+        for item in chunks:
+            out_path = process_chunk(item)
+            written.append(out_path)
+            if progress is not None:
+                progress.update(1)
     else:
-        landcover_class, landcover_string = get_landcover_data(lat, lon)
-        elevation = get_elevation(lat, lon)
-        canopy_height = get_tree_canopy_height(lat, lon)
-    
-    return {
-        "latitude": lat,
-        "longitude": lon,
-        "is_ocean": is_ocean,
-        "landcover_class": int(landcover_class) if landcover_class is not None else None,
-        "landcover_name": landcover_string,
-        "elevation_m": elevation,
-        "canopy_height_m": canopy_height,
-        "temperature_c": climate["temperature"],
-        "precipitation_mm": climate["precipitation"]
-    }
-    
-def get_environmental_data_batch(grid_step_km=100, start_lat=-85, end_lat=85, ocean_sample_chance=0.1):
-    """
-    Get environmental data for a grid of locations across the Earth.
-    
-    Parameters:
-    - grid_step_km: Step size for the grid in kilometers.
-    - start_lat: Starting latitude (default: -85 to avoid extreme poles)
-    - end_lat: Ending latitude (default: 85 to avoid extreme poles)
-    - ocean_sample_chance: Probability of sampling an ocean point (default: 0.1).
-    
-    Returns:
-    - List of dictionaries containing environmental data for each location
-    """
-    data = []
-    grid_gen = generate_geo_grid(
-        start_lat=start_lat, 
-        end_lat=end_lat,
-        grid_step_km=grid_step_km,
-        ocean_sample_chance=ocean_sample_chance
-    )
-    
-    data = [get_environmental_data(lat, lon, is_ocean) for lat, lon, is_ocean in tqdm(list(grid_gen), desc="Processing locations")]
-    
-    return data
-    
-def save_environmental_data_to_csv(data, filename):
-    """
-    Save environmental data to a CSV file.
-    
-    Parameters:
-    - data: List of dictionaries containing environmental data
-    - filename: Name of the output CSV file
-    """
-    df = pd.DataFrame(data)
-    df['landcover_class'] = df['landcover_class'].astype('Int64')
-    df['precipitation_mm'] = df['precipitation_mm'].astype('Int64')
-    df.to_csv(filename, index=False)
-    print(f"Environmental data saved to {filename}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+            future_map = {ex.submit(process_chunk, item): item for item in chunks}
+            for fut in concurrent.futures.as_completed(future_map):
+                try:
+                    out_path = fut.result()
+                    written.append(out_path)
+                except Exception as e:
+                    LOG.warning('Chunk task failed: %s', e)
+                if progress is not None:
+                    progress.update(1)
 
-def plot_column_values(grid_data, column_name, grid_step_km, cmap='viridis'):
-    """
-    Plots the values from a specified column of the grid data on a map.
+    if progress is not None:
+        try:
+            progress.close()
+        except Exception:
+            pass
 
-    Parameters:
-    - grid_data: A Pandas DataFrame containing the grid data.
-                   Must have 'latitude', 'longitude', and the specified column.
-    - column_name: The name of the column to plot.
-    - grid_step_km: Step size for the grid in kilometers (used for rectangle dimensions).
-    - cmap: Colormap to use for the plot (default: 'viridis').
-    """
+    return written
 
-    fig = plt.figure(figsize=(12, 6))
-    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
 
-    # Add continent outlines
-    ax.add_feature(cfeature.COASTLINE)
-    ax.add_feature(cfeature.BORDERS, linestyle=':')
-    ax.add_feature(cfeature.LAND)
-    ax.add_feature(cfeature.OCEAN)
+if __name__ == '__main__':
+    import argparse
+    logging.basicConfig(level=logging.INFO)
 
-    # Function to calculate the bounding box for a given lat, lon, and step_km
-    def calculate_bbox(lat, lon, step_km):
-        earth_radius = 6371.0
-        lat_step_deg = (step_km / earth_radius) * (180 / math.pi)
-        cos_lat = math.cos(math.radians(lat))
-        if abs(cos_lat) < 0.01:
-            lon_step_deg = 10.0
-        else:
-            lon_step_deg = (step_km / earth_radius) * (180 / math.pi) / cos_lat
-        
-        lower_lon = lon - lon_step_deg / 2.0
-        lower_lat = lat - lat_step_deg / 2.0
-        upper_lon = lon + lon_step_deg / 2.0
-        upper_lat = lat + lat_step_deg / 2.0
-        return [lower_lon, lower_lat, upper_lon, upper_lat]
-
-    # Find min and max values for the color scale
-    min_val = grid_data[column_name].min()
-    max_val = grid_data[column_name].max()
-
-    # Plot grid cells as rectangles, colored by the column value
-    for index, row in grid_data.iterrows():
-        lat = row['latitude']
-        lon = row['longitude']
-        value = row[column_name]
-
-        bbox = calculate_bbox(lat, lon, grid_step_km)
-        width = bbox[2] - bbox[0]
-        height = bbox[3] - bbox[1]
-
-        # Normalize the value to be between 0 and 1 for the colormap
-        normalized_value = (value - min_val) / (max_val - min_val)
-
-        # Get the color from the colormap
-        color = plt.colormaps.get_cmap(cmap)(normalized_value)
-
-        rect = Rectangle((bbox[0], bbox[1]), width, height,
-                         facecolor=color, edgecolor='none', alpha=0.7,
-                         transform=ccrs.PlateCarree())
-        ax.add_patch(rect)
-
-    ax.set_global()
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-    ax.set_title(f"Grid Data: {column_name}")
-
-    # Add a colorbar
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=min_val, vmax=max_val))
-    cbar = plt.colorbar(sm, ax=ax, orientation='horizontal', shrink=0.7)
-    cbar.set_label(column_name)
-
-    plt.savefig(f"plots/geo_grid_plot_{column_name}_{grid_step_km}km.png", bbox_inches='tight', dpi=300)
-    plt.show()
-
-if __name__ == "__main__":
-    
-    parser = argparse.ArgumentParser(description="Generate a grid of environmental data.")
-    parser.add_argument('--grid_step_km', type=int, default=100, help='Step size for the grid in kilometers (default: 100)')
-    parser.add_argument('--ocean_sample_chance', type=float, default=0.01, help='Probability of sampling an ocean point (default: 0.01)')
-    parser.add_argument('--plot_column', type=str, default='elevation_m', help='Column to plot (default: elevation_m). None to skip plotting.')
+    parser = argparse.ArgumentParser(description='Generate H3 environmental grids using EE and save as GeoParquet (simplified)')
+    parser.add_argument('--km', type=int, default=10, help='Target cell diameter in km (e.g. 5, 10, 25)')
+    parser.add_argument('--out-dir', type=str, default='outputs/global_chunks', help='Output directory for chunked output')
+    parser.add_argument('--bounds', nargs=4, type=float, metavar=('LON_MIN', 'LAT_MIN', 'LON_MAX', 'LAT_MAX'), help='Optional bounding box to limit processing')
+    parser.add_argument('--threads', type=int, default=4, help='Number of worker threads to use for parallel chunk processing')
     args = parser.parse_args()
-    
-    grid_step_km = args.grid_step_km
-    ocean_sample_chance = args.ocean_sample_chance
-    filepath = f"{WORKING_DIR}/environmental_data_{grid_step_km}km.csv"
-    
-    if not os.path.exists(filepath):    
-        # Get environmental data for the grid
-        environmental_data = get_environmental_data_batch(grid_step_km=grid_step_km, ocean_sample_chance=ocean_sample_chance)
-        save_environmental_data_to_csv(environmental_data, filename=filepath)
-    else:           
-        # Load the grid data from a CSV file
-        grid_data = pd.read_csv(filepath)
-        print(f"Loaded {len(grid_data)} grid points from CSV.")
-    
-    # Plot the grid
-    if args.plot_column and args.plot_column in grid_data.columns:
-        print(f"Plotting column '{args.plot_column}' with step size {grid_step_km} km...")
-        plot_column_values(grid_data, args.plot_column, grid_step_km, cmap='viridis')
-        print(f"...Done! Plot saved as 'plots/geo_grid_plot_{args.plot_column}_{grid_step_km}km.png'")        
-    else:
-        print(f"Column '{args.plot_column}' not found in the grid data. Skipping plotting.")
+
+    # Initialize EE (will raise if not authenticated)
+    initialize_ee()
+
+    bounds = tuple(args.bounds) if args.bounds else None
+
+    # Run work: chunking and centroid sampling are handled inside the
+    # simplified run_global_in_chunks function.
+    written = run_global_in_chunks(target_km=args.km, out_dir=args.out_dir, bounds=bounds, threads=args.threads)
+
+    # Basic use command (Europe only)
+    # python utils/geoutils.py --km 25 --bounds -10.0 34.0 40.0 72.0 --threads 8

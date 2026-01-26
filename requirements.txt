@@ -6,3 +6,7 @@ global-land-mask
 earthengine.api
 numpy
 dotenv
+h3
+geopandas
+shapely
+pyarrow
