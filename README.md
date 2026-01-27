@@ -66,6 +66,8 @@ CLI
 - `--out-dir` : Directory to write per-chunk parquet files (one file per chunk)
 - `--bounds` : Optional bbox (LON_MIN LAT_MIN LON_MAX LAT_MAX) to limit processing
 - `--threads` : Number of worker threads to use for parallel chunk processing
+- `--combine` : If set, combines all chunk parquet files into one after processing
+- `--combined-out` : Output path for combined parquet (if `--combine` is set)
 
 Notes
 
@@ -85,6 +87,31 @@ Programmatic use
 
 Import `compute_environmental_data` or `run_global_in_chunks` from
 `utils.geoutils` to call the functions directly from notebooks or scripts.
+
+### Plotting
+
+Use the provided plotting utility to render PNG maps from GeoParquet outputs.
+
+- Script: `scripts/plot_environmental_clean.py` (clean, streamlined plotting utility)
+- Purpose: Reads a GeoParquet (output from `utils/geoutils.py`) and writes one PNG per variable.
+- Key options:
+    - `--input` (`-i`): Input GeoParquet file (required)
+    - `--outdir` (`-o`): Output directory for PNGs (default: `outputs/plots`)
+    - `--sample-limit`: Max cells to plot (random sample). Use `None` or `-1` to plot all (default: `200000`)
+    - `--columns`: Optional comma-separated list of columns to plot (defaults to common environmental variables)
+
+Example:
+
+```bash
+python scripts/plot_environmental_clean.py --input outputs/europe_chunks/chunk_000.parquet \
+        --outdir outputs/plots --sample-limit 100000
+```
+
+Notes:
+
+- The script downsamples large GeoDataFrames for plotting speed; set `--sample-limit None` to disable downsampling.
+- You can pass `--columns elevation_m,water_fraction` to plot a subset of variables.
+
 
 ### `observations.py`
 

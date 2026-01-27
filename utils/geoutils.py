@@ -8,6 +8,8 @@ datasets. It exposes `compute_environmental_data` and
 
 from typing import Iterable, List, Optional, Dict, Tuple
 import os
+import glob
+import pandas as pd
 import logging
 import threading
 import math
@@ -403,6 +405,66 @@ def export_geoparquet(gdf: gpd.GeoDataFrame, out_path: str) -> None:
     return
 
 
+def combine_parquet_parts(parts_dir: str, out_path: Optional[str] = None, pattern: Optional[str] = None, remove_parts: bool = False) -> Optional[str]:
+    """Combine multiple chunked GeoParquet files into a single GeoParquet.
+
+    - `parts_dir`: directory containing chunk parquet files
+    - `out_path`: path to write the combined parquet. If None, a default
+      filename `combined.parquet` inside `parts_dir` is used.
+    - `pattern`: glob pattern for matching part files (default: "grid_*_chunk_*.parquet").
+    - `remove_parts`: if True, delete the part files after successful combine.
+
+    Returns the `out_path` on success, or `None` if no parts found.
+    """
+    if pattern is None:
+        pattern = "grid_*_chunk_*.parquet"
+    search = os.path.join(parts_dir, pattern)
+    files = sorted(glob.glob(search))
+    if not files:
+        LOG.warning("No parquet parts found in %s matching %s", parts_dir, pattern)
+        return None
+
+    dfs = []
+    for p in files:
+        try:
+            df = gpd.read_parquet(p)
+            dfs.append(df)
+        except Exception as e:
+            LOG.warning('Failed to read part %s: %s', p, e)
+
+    if not dfs:
+        LOG.warning('No readable parquet parts found in %s', parts_dir)
+        return None
+
+    try:
+        combined = pd.concat(dfs, ignore_index=True)
+        # Convert back to GeoDataFrame if geometry column present
+        if 'geometry' in combined.columns:
+            combined = gpd.GeoDataFrame(combined, geometry='geometry', crs='EPSG:4326')
+    except Exception as e:
+        LOG.error('Failed to concatenate parquet parts: %s', e)
+        return None
+
+    out_path = out_path or os.path.join(parts_dir, 'combined.parquet')
+    try:
+        # Ensure parent dir
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        combined.to_parquet(out_path, index=False)
+    except Exception as e:
+        LOG.error('Failed to write combined parquet %s: %s', out_path, e)
+        return None
+
+    if remove_parts:
+        for p in files:
+            try:
+                os.remove(p)
+            except Exception as e:
+                LOG.warning('Failed to remove part %s: %s', p, e)
+
+    LOG.info('Combined %d parts into %s', len(files), out_path)
+    return out_path
+
+
 def run_global_in_chunks(target_km: int = 10, out_dir: Optional[str] = None, bounds: Optional[Tuple[float, float, float, float]] = None, threads: int = 1) -> List[str]:
     """Chunk the H3 grid and run reductions per-chunk.
 
@@ -435,7 +497,7 @@ def run_global_in_chunks(target_km: int = 10, out_dir: Optional[str] = None, bou
         gdf = compute_environmental_data(chunk, use_centroid_sampling=True, chunk_size=chunk_size, threads=1)
         gdf['target_km'] = target_km
         gdf['h3_resolution'] = res
-        out_path = os.path.join(out_dir, f'water_grid_{target_km}km_chunk_{i//chunk_size:04d}.parquet')
+        out_path = os.path.join(out_dir, f'grid_{target_km}km_chunk_{i//chunk_size:04d}.parquet')
         export_geoparquet(gdf, out_path)
         return out_path
 
@@ -475,6 +537,8 @@ if __name__ == '__main__':
     parser.add_argument('--out-dir', type=str, default='outputs/global_chunks', help='Output directory for chunked output')
     parser.add_argument('--bounds', nargs=4, type=float, metavar=('LON_MIN', 'LAT_MIN', 'LON_MAX', 'LAT_MAX'), help='Optional bounding box to limit processing')
     parser.add_argument('--threads', type=int, default=4, help='Number of worker threads to use for parallel chunk processing')
+    parser.add_argument('--combine', action='store_true', help='Combine chunk parquet files into a single parquet after processing')
+    parser.add_argument('--combined-out', type=str, default=None, help='Path to write combined parquet (when --combine used)')
     args = parser.parse_args()
 
     # Initialize EE (will raise if not authenticated)
@@ -486,5 +550,11 @@ if __name__ == '__main__':
     # simplified run_global_in_chunks function.
     written = run_global_in_chunks(target_km=args.km, out_dir=args.out_dir, bounds=bounds, threads=args.threads)
 
+    if args.combine:
+        combined_out = args.combined_out or os.path.join(args.out_dir, f'grid_{args.km}km_combined.parquet')
+        combined = combine_parquet_parts(args.out_dir, out_path=combined_out, remove_parts=True)
+        if combined:
+            LOG.info('Combined parquet written to %s', combined)
+
     # Basic use command (Europe only)
-    # python utils/geoutils.py --km 25 --bounds -10.0 34.0 40.0 72.0 --threads 8
+    # python utils/geoutils.py --km 25 --bounds -10.0 34.0 40.0 72.0 --threads 8 --out-dir outputs/europe_chunks --combine --combined-out outputs/europe_25km.parquet
