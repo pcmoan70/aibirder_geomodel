@@ -68,6 +68,7 @@ CLI
 - `--threads` : Number of worker threads to use for parallel chunk processing
 - `--combine` : If set, combines all chunk parquet files into one after processing
 - `--combined-out` : Output path for combined parquet (if `--combine` is set)
+- `--fill-missing` : If set, fills missing data (e.g. ocean cells) with nearest neighbor values
 
 Notes
 
