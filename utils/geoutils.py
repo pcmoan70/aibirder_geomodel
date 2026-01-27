@@ -15,6 +15,7 @@ import threading
 import math
 import concurrent.futures
 from functools import partial
+import numpy as np
 
 import ee
 import h3
@@ -405,6 +406,63 @@ def export_geoparquet(gdf: gpd.GeoDataFrame, out_path: str) -> None:
     return
 
 
+def fill_missing_with_nearest(gdf: gpd.GeoDataFrame, columns: Optional[List[str]] = None) -> gpd.GeoDataFrame:
+    """Fill missing values in `gdf` by copying the value from the nearest
+    neighbour that has a non-missing value.
+
+    - `columns`: list of columns to process. If None, all non-geometry, non-id
+      columns will be considered.
+
+    This uses centroids of geometries and a simple nearest-neighbour search
+    implemented with NumPy; it's memory-efficient for moderate-sized GeoDataFrames.
+    """
+    if columns is None:
+        # exclude common metadata columns and do NOT fill water_fraction
+        exclude = {'geometry', 'h3_index', 'h3_resolution', 'target_km', 'water_fraction'}
+        columns = [c for c in gdf.columns if c not in exclude]
+
+    if gdf.empty:
+        return gdf
+
+    # Precompute centroid coordinates
+    coords = np.array([[geom.centroid.x, geom.centroid.y] for geom in gdf.geometry])
+
+    # Determine rows that have at least one non-missing value across the
+    # considered columns. We only fill missing values for rows that are not
+    # completely empty (rows that might correspond to missing EE cells).
+    if columns:
+        rows_with_any = (~gdf[columns].isna()).any(axis=1).to_numpy()
+    else:
+        rows_with_any = np.array([False] * len(gdf))
+
+    for col in columns:
+        if col not in gdf.columns:
+            continue
+        missing_mask = gdf[col].isna().to_numpy()
+        if not missing_mask.any():
+            continue
+        non_missing_idx = np.where(~missing_mask)[0]
+        missing_idx = np.where(missing_mask)[0]
+        if non_missing_idx.size == 0:
+            # nothing to fill from
+            continue
+
+        # Only attempt to fill rows that have at least one other value present.
+        # Skip rows that are completely empty across the considered columns.
+        for mi in missing_idx:
+            if not rows_with_any[mi]:
+                continue
+            dists = np.sum((coords[non_missing_idx] - coords[mi]) ** 2, axis=1)
+            nearest = non_missing_idx[int(np.argmin(dists))]
+            try:
+                gdf.at[gdf.index[mi], col] = gdf.iloc[nearest][col]
+            except Exception:
+                # best-effort: skip on any assignment error
+                continue
+
+    return gdf
+
+
 def combine_parquet_parts(parts_dir: str, out_path: Optional[str] = None, pattern: Optional[str] = None, remove_parts: bool = False) -> Optional[str]:
     """Combine multiple chunked GeoParquet files into a single GeoParquet.
 
@@ -465,7 +523,7 @@ def combine_parquet_parts(parts_dir: str, out_path: Optional[str] = None, patter
     return out_path
 
 
-def run_global_in_chunks(target_km: int = 10, out_dir: Optional[str] = None, bounds: Optional[Tuple[float, float, float, float]] = None, threads: int = 1) -> List[str]:
+def run_global_in_chunks(target_km: int = 10, out_dir: Optional[str] = None, bounds: Optional[Tuple[float, float, float, float]] = None, threads: int = 1, fill_missing: bool = False) -> List[str]:
     """Chunk the H3 grid and run reductions per-chunk.
 
     Behavior:
@@ -495,6 +553,11 @@ def run_global_in_chunks(target_km: int = 10, out_dir: Optional[str] = None, bou
     def process_chunk(item):
         i, chunk = item
         gdf = compute_environmental_data(chunk, use_centroid_sampling=True, chunk_size=chunk_size, threads=1)
+        if fill_missing:
+            try:
+                gdf = fill_missing_with_nearest(gdf)
+            except Exception:
+                LOG.warning('fill_missing failed for chunk %d', i)
         gdf['target_km'] = target_km
         gdf['h3_resolution'] = res
         out_path = os.path.join(out_dir, f'grid_{target_km}km_chunk_{i//chunk_size:04d}.parquet')
@@ -537,6 +600,7 @@ if __name__ == '__main__':
     parser.add_argument('--out-dir', type=str, default='outputs/global_chunks', help='Output directory for chunked output')
     parser.add_argument('--bounds', nargs=4, type=float, metavar=('LON_MIN', 'LAT_MIN', 'LON_MAX', 'LAT_MAX'), help='Optional bounding box to limit processing')
     parser.add_argument('--threads', type=int, default=4, help='Number of worker threads to use for parallel chunk processing')
+    parser.add_argument('--fill-missing', action='store_true', help='Fill missing values in each chunk by copying the nearest neighbour value')
     parser.add_argument('--combine', action='store_true', help='Combine chunk parquet files into a single parquet after processing')
     parser.add_argument('--combined-out', type=str, default=None, help='Path to write combined parquet (when --combine used)')
     args = parser.parse_args()
@@ -548,7 +612,7 @@ if __name__ == '__main__':
 
     # Run work: chunking and centroid sampling are handled inside the
     # simplified run_global_in_chunks function.
-    written = run_global_in_chunks(target_km=args.km, out_dir=args.out_dir, bounds=bounds, threads=args.threads)
+    written = run_global_in_chunks(target_km=args.km, out_dir=args.out_dir, bounds=bounds, threads=args.threads, fill_missing=args.fill_missing)
 
     if args.combine:
         combined_out = args.combined_out or os.path.join(args.out_dir, f'grid_{args.km}km_combined.parquet')
@@ -557,4 +621,4 @@ if __name__ == '__main__':
             LOG.info('Combined parquet written to %s', combined)
 
     # Basic use command (Europe only)
-    # python utils/geoutils.py --km 25 --bounds -10.0 34.0 40.0 72.0 --threads 8 --out-dir outputs/europe_chunks --combine --combined-out outputs/europe_25km.parquet
+    # python utils/geoutils.py --km 50 --bounds -10.0 34.0 40.0 72.0 --threads 8 --out-dir outputs/europe_chunks --combine --combined-out outputs/europe_50km.parquet
