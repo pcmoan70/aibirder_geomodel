@@ -151,23 +151,29 @@ def plot_variable(
             gdf_plot = gdf_plot.assign(_area=proxy_area).sort_values('_area', ascending=True)
         except Exception:
             pass
-        cmap_list = plt.get_cmap("tab20").colors
-        cmap_use = ListedColormap(cmap_list[: len(vals)])
-        class_to_idx = {v: i for i, v in enumerate(vals)}
-        gdf_plot = gdf_plot.copy()
-        gdf_plot["_cat"] = gdf_plot[column].map(class_to_idx)
-        gdf_plot.plot(column="_cat", cmap=cmap_use, ax=ax, transform=ccrs.PlateCarree(), linewidth=0, alpha=0.95)
-        def _label_for_class(v):
-            # Prefer explicit names; detect common water aliases
+        # Build a stable color mapping keyed by MODIS class code (0..17).
+        base_colors = list(plt.get_cmap("tab20").colors)
+        # Map class code -> color by using class_code modulo palette length.
+        color_for = {int(c): base_colors[int(c) % len(base_colors)] for c in range(0, 18)}
+        # Plot each present class separately so colors map to class codes
+        patches = []
+        for c in vals:
             try:
-                if int(v) in WATER_ALIASES:
-                    return 'Water'
+                ci = int(c)
             except Exception:
-                pass
-            return LANDCOVER_NAMES.get(v, str(v))
-
-        patches = [mpatches.Patch(color=cmap_use(i), label=_label_for_class(v)) for v, i in class_to_idx.items()]
-        ax.legend(handles=patches, loc="lower left", fontsize="small", framealpha=0.9)
+                continue
+            subset = gdf_plot[gdf_plot[column] == c]
+            if subset.empty:
+                continue
+            col_color = color_for.get(ci, base_colors[ci % len(base_colors)])
+            subset.plot(ax=ax, color=col_color, transform=ccrs.PlateCarree(), linewidth=0, alpha=0.95)
+            # Label handling: map water aliases to 'Water'
+            lab = LANDCOVER_NAMES.get(ci, str(ci))
+            if ci in WATER_ALIASES:
+                lab = 'Water'
+            patches.append(mpatches.Patch(color=col_color, label=lab))
+        if patches:
+            ax.legend(handles=patches, loc="lower left", fontsize="small", framealpha=0.9)
         # GeoPandas may force an 'equal' aspect which keeps the globe square; allow
         # the map projection to fill the axes by using an automatic aspect.
         try:
@@ -200,7 +206,19 @@ def plot_variable(
             gdf_plot = gdf_plot.assign(_area=proxy_area).sort_values('_area', ascending=True)
         except Exception:
             pass
-        gdf_plot.plot(column=column, cmap=cmap, ax=ax, transform=ccrs.PlateCarree(), linewidth=0, alpha=0.95, norm=norm)
+        # For canopy height, avoid plotting the many zero cells which
+        # otherwise dominate the color scale and render the map as
+        # visually 'empty'. Plot only non-zero canopy values.
+        if column == 'canopy_height_m':
+            try:
+                nonzero = gdf_plot[gdf_plot[column] > 0]
+                if nonzero.empty:
+                    return
+                nonzero.plot(column=column, cmap=cmap, ax=ax, transform=ccrs.PlateCarree(), linewidth=0, alpha=0.95, norm=norm)
+            except Exception:
+                gdf_plot.plot(column=column, cmap=cmap, ax=ax, transform=ccrs.PlateCarree(), linewidth=0, alpha=0.95, norm=norm)
+        else:
+            gdf_plot.plot(column=column, cmap=cmap, ax=ax, transform=ccrs.PlateCarree(), linewidth=0, alpha=0.95, norm=norm)
         cbar = fig.colorbar(sm, ax=ax, orientation="horizontal", fraction=0.04, pad=0.05)
         cbar.set_label(column)
         try:
