@@ -1,5 +1,5 @@
 # BirdNET Geomodel
-Spatiotemporal species range prediction for detection post-filtering
+Code to train a geomodel for post-filtering BirdNET acoustic detections based on environmental variables and species occurrence data.
 
 ## Setup
 
@@ -87,6 +87,10 @@ Programmatic use
 Import `compute_environmental_data` or `run_global_in_chunks` from
 `utils.geoutils` to call the functions directly from notebooks or scripts.
 
+### `observations.py`
+
+TODO
+
 ### Plotting
 
 Use the provided plotting utility to render PNG maps from GeoParquet outputs.
@@ -113,28 +117,13 @@ Notes:
 - You can pass `--columns elevation_m,water_fraction` to plot a subset of variables.
 
 
-### `observations.py`
-
-This script processes iNaturalist and eBird observations, filters them, and saves the results.
-
-1.  **Parsing source data:**
-
-    ```bash
-    python observations.py --parse_inat_source --parse_ebird_source
-    ```
-
-    **Arguments:**
-    *   `--parse_inat_source`: If set, parses the iNaturalist source data.
-    *   `--parse_ebird_source`: If set, parses the eBird source data.
-
-
 ## Citation
 If you use this code in your research, please cite as:
 
 ```bibtex
 @article{birdnet-geomodel,
-  title={The BirdNET Geomodel: Spatiotemporal species range prediction for detection post-filtering},
-  author={Kahl, Stefan and Lasseck, Mario and Wood, Connor and Klinck, Holger},
+  title={Using Spatiotemporal Occurrence Models to Post-Filter BirdNET Acoustic Detections},
+  author={Kahl, Stefan and Mauermann, Max and Lasseck, Mario and Wood, Connor and Klinck, Holger},
   year={2025},
 }
 ```
