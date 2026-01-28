@@ -10,6 +10,7 @@ from typing import Iterable, List, Optional, Dict, Tuple
 import os
 import glob
 import pandas as pd
+import pandas.api.types as ptypes
 import logging
 import threading
 import math
@@ -24,6 +25,7 @@ from shapely.geometry import Polygon
 from tqdm import tqdm
 
 LOG = logging.getLogger(__name__)
+from utils.regions import resolve_bounds_arg, REGION_BOUNDS
 
 # Semaphore to bound concurrent Earth Engine requests. Tunable with
 # the `EE_MAX_CONCURRENCY` environment variable (default: 8).
@@ -468,8 +470,8 @@ def fill_missing_with_nearest(gdf: gpd.GeoDataFrame, columns: Optional[List[str]
     implemented with NumPy; it's memory-efficient for moderate-sized GeoDataFrames.
     """
     if columns is None:
-        # exclude common metadata columns and do NOT fill water_fraction
-        exclude = {'geometry', 'h3_index', 'h3_resolution', 'target_km', 'water_fraction'}
+        # exclude common metadata columns
+        exclude = {'geometry', 'h3_index', 'h3_resolution', 'target_km'}
         columns = [c for c in gdf.columns if c not in exclude]
 
     if gdf.empty:
@@ -561,9 +563,42 @@ def combine_parquet_parts(parts_dir: str, out_path: Optional[str] = None, patter
 
     try:
         combined = pd.concat(dfs, ignore_index=True)
-        # Convert back to GeoDataFrame if geometry column present
+        # Convert to GeoDataFrame and validate/fix geometries
         if 'geometry' in combined.columns:
             combined = gpd.GeoDataFrame(combined, geometry='geometry', crs='EPSG:4326')
+        else:
+            # Try to reconstruct geometry from H3 index if available
+            if 'h3_index' in combined.columns:
+                try:
+                    combined['geometry'] = combined['h3_index'].apply(lambda h: _h3_to_shapely_polygon(h) if pd.notna(h) else None)
+                    combined = gpd.GeoDataFrame(combined, geometry='geometry', crs='EPSG:4326')
+                except Exception:
+                    LOG.warning('Failed to reconstruct geometries from h3_index')
+            else:
+                LOG.warning('No geometry or h3_index column found in combined parts')
+
+        # Fill missing geometries from h3_index when possible
+        if 'geometry' in combined.columns and combined['geometry'].isna().any():
+            if 'h3_index' in combined.columns:
+                miss_idx = combined['geometry'].isna()
+                try:
+                    combined.loc[miss_idx, 'geometry'] = combined.loc[miss_idx, 'h3_index'].apply(lambda h: _h3_to_shapely_polygon(h) if pd.notna(h) else None)
+                except Exception:
+                    LOG.debug('Failed filling missing geometries from h3_index')
+
+        # Compute centroids to detect invalid geometries (NaN or out-of-range)
+        if 'geometry' in combined.columns:
+            try:
+                cents = combined.geometry.centroid
+                cx = cents.x
+                cy = cents.y
+                invalid = cx.isna() | cy.isna() | (cx < -180) | (cx > 180) | (cy < -90) | (cy > 90)
+                n_invalid = int(invalid.sum())
+                if n_invalid > 0:
+                    LOG.warning('Dropping %d rows with invalid geometries/centroids during combine', n_invalid)
+                    combined = combined.loc[~invalid].reset_index(drop=True)
+            except Exception:
+                LOG.debug('Could not compute centroids for geometry validation')
     except Exception as e:
         LOG.error('Failed to concatenate parquet parts: %s', e)
         return None
@@ -618,11 +653,6 @@ def run_global_in_chunks(target_km: int = 10, out_dir: Optional[str] = None, bou
     def process_chunk(item):
         i, chunk = item
         gdf = compute_environmental_data(chunk, use_centroid_sampling=True, chunk_size=chunk_size, threads=1)
-        if fill_missing:
-            try:
-                gdf = fill_missing_with_nearest(gdf)
-            except Exception:
-                LOG.warning('fill_missing failed for chunk %d', i)
         gdf['target_km'] = target_km
         gdf['h3_resolution'] = res
         out_path = os.path.join(out_dir, f'grid_{target_km}km_chunk_{i//chunk_size:04d}.parquet')
@@ -659,13 +689,12 @@ def run_global_in_chunks(target_km: int = 10, out_dir: Optional[str] = None, bou
 if __name__ == '__main__':
     import argparse
     logging.basicConfig(level=logging.INFO)
-
     parser = argparse.ArgumentParser(description='Generate H3 environmental grids using EE and save as GeoParquet (simplified)')
     parser.add_argument('--km', type=int, default=10, help='Target cell diameter in km (e.g. 5, 10, 25)')
     parser.add_argument('--out-dir', type=str, default='outputs/global_chunks', help='Output directory for chunked output')
-    parser.add_argument('--bounds', nargs=4, type=float, metavar=('LON_MIN', 'LAT_MIN', 'LON_MAX', 'LAT_MAX'), help='Optional bounding box to limit processing')
+    parser.add_argument('--bounds', nargs='+', help='Optional bounding box (4 floats) or named region (e.g. "usa", "europe", "arctic")')
     parser.add_argument('--threads', type=int, default=4, help='Number of worker threads to use for parallel chunk processing')
-    parser.add_argument('--fill-missing', action='store_true', help='Fill missing values in each chunk by copying the nearest neighbour value')
+    parser.add_argument('--fill-missing', action='store_true', help='After combining parts, fill missing values by nearest neighbours')
     parser.add_argument('--combine', action='store_true', help='Combine chunk parquet files into a single parquet after processing')
     parser.add_argument('--combined-out', type=str, default=None, help='Path to write combined parquet (when --combine used)')
     args = parser.parse_args()
@@ -673,7 +702,8 @@ if __name__ == '__main__':
     # Initialize EE (will raise if not authenticated)
     initialize_ee()
 
-    bounds = tuple(args.bounds) if args.bounds else None
+    # Resolve bounds (delegated to utils.regions)
+    bounds = resolve_bounds_arg(args.bounds)
 
     # Run work: chunking and centroid sampling are handled inside the
     # simplified run_global_in_chunks function.
@@ -684,6 +714,15 @@ if __name__ == '__main__':
         combined = combine_parquet_parts(args.out_dir, out_path=combined_out, remove_parts=True)
         if combined:
             LOG.info('Combined parquet written to %s', combined)
+            if args.fill_missing:
+                try:
+                    gdf_combined = gpd.read_parquet(combined)
+                    gdf_filled = fill_missing_with_nearest(gdf_combined)
+                    export_geoparquet(gdf_filled, combined)
+                    LOG.info('Post-combine fill_missing applied and written to %s', combined)
+                except Exception as e:
+                    LOG.warning('Post-combine fill_missing failed: %s', e)
 
     # Basic use command (Europe only)
-    # python utils/geoutils.py --km 25 --bounds -10.0 34.0 40.0 72.0 --threads 8 --out-dir outputs/europe_chunks --combine --combined-out outputs/europe_25km.parquet
+    # python utils/geoutils.py --km 25 --bounds -10.0 34.0 40.0 72.0 --threads 8 --out-dir outputs/europe_chunks --combine --combined-out outputs/europe_25km.parquet --fill-missing
+    # python utils/geoutils.py --km 50 --threads 8 --out-dir outputs/global_chunks --combine --combined-out outputs/global_50km.parquet

@@ -22,6 +22,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import matplotlib.patches as mpatches
 from matplotlib.colors import ListedColormap
+from utils.regions import resolve_bounds_arg
 
 
 LANDCOVER_NAMES = {
@@ -151,8 +152,14 @@ def plot_variable(
     print(f"Saved {out_path}")
 
 
-def plot_all(input_path: str, outdir: str, sample_limit: Optional[int] = 200000, columns: Optional[List[str]] = None):
+def plot_all(input_path: str, outdir: str, sample_limit: Optional[int] = 200000, columns: Optional[List[str]] = None, bounds: Optional[Tuple[float, float, float, float]] = None):
     gdf = load_gdf(input_path)
+    # If bounds provided, filter to cells whose centroids fall within bbox
+    if bounds is not None:
+        lon_min, lat_min, lon_max, lat_max = bounds
+        cent = gdf.geometry.centroid
+        mask = (cent.x >= lon_min) & (cent.x <= lon_max) & (cent.y >= lat_min) & (cent.y <= lat_max)
+        gdf = gdf[mask]
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -193,11 +200,16 @@ def main():
     parser.add_argument("--input", "-i", required=True, help="Input GeoParquet file produced by geoutils")
     parser.add_argument("--outdir", "-o", default="outputs/plots", help="Output directory for PNGs")
     parser.add_argument("--sample-limit", type=lambda s: None if s in ("None", "none", "-1") else int(s), default=200000, help='Max cells to plot (random sample). Use "None" or -1 for no downsampling')
+    parser.add_argument("--bounds", nargs='+', help='Optional bounding box (4 floats) or named region: usa,europe,arctic,...')
     parser.add_argument("--columns", help="Comma-separated list of columns to plot (default: standard set)")
     args = parser.parse_args()
 
     cols = parse_columns(args.columns)
-    plot_all(args.input, args.outdir, sample_limit=args.sample_limit, columns=cols)
+
+
+    bounds = resolve_bounds_arg(args.bounds)
+
+    plot_all(args.input, args.outdir, sample_limit=args.sample_limit, columns=cols, bounds=bounds)
 
 
 if __name__ == "__main__":
@@ -205,3 +217,4 @@ if __name__ == "__main__":
     
     # Basic use command (Europe only)
     # python scripts/plot_environmental.py --input outputs/europe_25km.parquet --outdir outputs/plots/europe_25km --sample-limit None
+    # python scripts/plot_environmental.py --input outputs/global_50km.parquet --outdir outputs/plots/europe_50km --sample-limit None --bounds europe
