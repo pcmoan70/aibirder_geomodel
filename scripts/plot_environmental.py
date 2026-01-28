@@ -256,6 +256,7 @@ def plot_all(input_path: str, outdir: str, sample_limit: Optional[int] = 200000,
         ("precipitation_mm", "Blues"),
         ("temperature_c", "coolwarm"),
         ("canopy_height_m", "YlGn"),
+        ("urban_fraction", "OrRd"),
     ]
 
     targets = []

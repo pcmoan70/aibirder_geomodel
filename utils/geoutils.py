@@ -411,6 +411,13 @@ def compute_environmental_data(h3_indexes: Iterable[str], scale: int = 30, field
     if modis_img is not None:
         lc_props = ['LC_Type1']
         tasks['modis'] = partial(reduce_image_chunks, modis_img, ee.Reducer.mode(), 500, lc_props, True, True, 'MODIS', threads)
+        try:
+            # compute built-up fraction (classes 13 or 14) as polygonal mean
+            built_mask = modis_img.eq(13).Or(modis_img.eq(14))
+            tasks['landcover_built'] = partial(reduce_image_chunks, built_mask, ee.Reducer.mean(), 500, ['mean', 'b1'], True, False, 'MODIS_built', threads)
+        except Exception:
+            # if expression fails, skip built fraction
+            pass
 
     # Execute remaining dataset reductions concurrently. Each task internally
     # will use `threads` for chunk-level parallelism.
@@ -432,6 +439,8 @@ def compute_environmental_data(h3_indexes: Iterable[str], scale: int = 30, field
     wc_bio01_map = results.get('worldclim_bio01', {})
     wc_bio12_map = results.get('worldclim_bio12', {})
     lc_map = results.get('modis', {})
+    # landcover built-up fraction (0..1) computed from MODIS mask (classes 13/14)
+    lc_built_map = results.get('landcover_built', {})
 
     rows = []
     for h in h3_indexes:
@@ -455,6 +464,12 @@ def compute_environmental_data(h3_indexes: Iterable[str], scale: int = 30, field
 
         lc = lc_map.get(h)
         lc_class = int(lc) if lc is not None else None
+        # built fraction from MODIS (if computed) — expect 0..1 or None
+        built_frac = lc_built_map.get(h)
+        try:
+            built_frac_f = float(built_frac) if built_frac is not None else None
+        except Exception:
+            built_frac_f = None
         row = {'h3_index': h, 'geometry': poly}
         if 'water' in fields:
             row['water_fraction'] = water_frac
@@ -464,6 +479,13 @@ def compute_environmental_data(h3_indexes: Iterable[str], scale: int = 30, field
             row['precipitation_mm'] = precip_mm
             row['temperature_c'] = temp_c
         if 'landcover' in fields:
+            # expose urban/built fraction as a separate column
+            row['urban_fraction'] = built_frac_f
+            try:
+                if built_frac_f is not None and built_frac_f > 0.5:
+                    lc_class = 13
+            except Exception:
+                pass
             row['landcover_class'] = lc_class
         if 'canopy' in fields:
             row['canopy_height_m'] = canopy_m
