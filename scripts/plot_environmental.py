@@ -86,8 +86,8 @@ def safe_vmin_vmax(series, q_low=0.02, q_high=0.98):
                 arr = nonzero
     if arr.size == 0:
         return None, None
-    vmin = np.quantile(arr, q_low)
-    vmax = np.quantile(arr, q_high)
+    vmin = np.percentile(arr, q_low * 100.0)
+    vmax = np.percentile(arr, q_high * 100.0)
     if vmin == vmax:
         vmin -= 1e-6
         vmax += 1e-6
@@ -103,9 +103,38 @@ def plot_variable(
     figsize: Tuple[int, int] = (16, 9),
     sample_limit: Optional[int] = 200000,
 ):
-    """Plot a single column from a GeoDataFrame and save PNG to `out_path`.
+    """Plot a single column from a GeoDataFrame and save PNG to ``out_path``.
 
-    Downsamples to `sample_limit` rows for speed when provided.
+    Downsamples to ``sample_limit`` rows for speed when provided.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        GeoDataFrame containing geometries and the column to plot. Must be in
+        a geographic CRS (latitude/longitude) compatible with ``cartopy``.
+    column : str
+        Name of the column in ``gdf`` to visualize.
+    out_path : str
+        Path to the output PNG file that will be written to disk.
+    cmap : str, optional
+        Name of the Matplotlib colormap used for continuous variables. Ignored
+        if a fully custom colormap is applied inside the function logic.
+    discrete : bool, optional
+        If ``True``, treat values in ``column`` as discrete/categorical and
+        use a discrete colormap and legend. If ``False``, plot as a continuous
+        variable.
+    figsize : tuple of int, optional
+        Figure size in inches as ``(width, height)`` passed to
+        :func:`matplotlib.pyplot.subplots`.
+    sample_limit : int or None, optional
+        If not ``None`` and the GeoDataFrame has more than this number of
+        rows, randomly sample ``sample_limit`` rows for plotting. Use
+        ``None`` to disable downsampling.
+
+    Returns
+    -------
+    None
+        This function creates and saves a plot but does not return a value.
     """
     gdf_plot = gdf
     n = len(gdf)

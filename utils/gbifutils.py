@@ -72,37 +72,37 @@ def process_gbif_file(gbif_zip_path, file, output_csv_path):
         with z.open(file) as f:
             with tqdm(total=estimated_rows, desc="Processing GBIF data") as pbar:
                 for chunk in pd.read_csv(f, sep='\t', chunksize=10000, on_bad_lines='warn'):
-                    output_chunk = pd.DataFrame({
-                        'latitude': [],
-                        'longitude': [],
-                        'taxon': [],
-                        'week': []
-                    })
+                    # Collect rows in a list and create a DataFrame once per chunk
+                    rows = []
 
                     # Process chunk
                     for idx, row in chunk.iterrows():
-                        lat = round(row['decimalLatitude'], 3)
-                        lon = round(row['decimalLongitude'], 3)
-                        day = row['day']
-                        month = row['month']
-                        taxon = row['taxonKey']
-                        if math.isnan(lat) or math.isnan(lon): # Skip row if lat or lon is missing
+                        lat = row.get('decimalLatitude')
+                        lon = row.get('decimalLongitude')
+                        day = row.get('day')
+                        month = row.get('month')
+                        taxon = row.get('taxonKey')
+
+                        if pd.isna(lat) or pd.isna(lon):  # Skip row if lat or lon is missing
                             continue
-                        if math.isnan(day) or math.isnan(month): # Skip row if day or month is missing
+                        if pd.isna(day) or pd.isna(month):  # Skip row if day or month is missing
                             continue
-                        if math.isnan(taxon): # Skip row if taxon is missing
+                        if pd.isna(taxon):  # Skip row if taxon is missing
                             continue
 
-                        week = date_to_week(day, month)
-                        
-                        output_chunk = pd.concat([output_chunk, pd.DataFrame({
-                            'latitude': [lat],
-                            'longitude': [lon],
-                            'taxon': [taxon],
-                            'week': [week]
-                        })], ignore_index=True)
+                        # round coordinates to 3 decimal places
+                        try:
+                            latv = round(float(lat), 3)
+                            lonv = round(float(lon), 3)
+                        except Exception:
+                            continue
 
-                    output_chunk.to_csv(output_csv_path, mode='a', header=False, index=False)
+                        week = date_to_week(int(day), int(month))
+                        rows.append({'latitude': latv, 'longitude': lonv, 'taxon': taxon, 'week': week})
+
+                    if rows:
+                        output_chunk = pd.DataFrame.from_records(rows, columns=['latitude', 'longitude', 'taxon', 'week'])
+                        output_chunk.to_csv(output_csv_path, mode='a', header=False, index=False)
                     pbar.update(len(chunk))
 
 if __name__ == '__main__':

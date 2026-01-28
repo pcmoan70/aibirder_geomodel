@@ -107,7 +107,7 @@ Use the provided plotting utility to render PNG maps from GeoParquet outputs.
 Example:
 
 ```bash
-python scripts/plot_environmental_clean.py --input outputs/europe_chunks/chunk_000.parquet \
+python scripts/plot_environmental.py --input outputs/europe_chunks/chunk_000.parquet \
         --outdir outputs/plots --sample-limit 100000
 ```
 

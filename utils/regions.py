@@ -52,6 +52,6 @@ def resolve_bounds_arg(b: Optional[Sequence[str]]) -> Optional[Tuple[float, floa
     if len(b) == 4:
         try:
             return (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
-        except Exception:
+        except (TypeError, ValueError):
             return None
     return None

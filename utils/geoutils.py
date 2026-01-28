@@ -54,8 +54,13 @@ def initialize_ee(service_account: Optional[str] = None, key_file: Optional[str]
         ee.Initialize()
         LOG.info("Earth Engine initialized (client).")
         return
-    except Exception:
-        LOG.debug("Standard EE init failed, trying service account if provided.")
+    except Exception as exc:
+        LOG.debug(
+            "Standard EE init failed (%s: %s); trying service account if provided.",
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
 
     if service_account and key_file and os.path.exists(key_file):
         credentials = ee.ServiceAccountCredentials(service_account, key_file)
@@ -63,7 +68,7 @@ def initialize_ee(service_account: Optional[str] = None, key_file: Optional[str]
         LOG.info("Earth Engine initialized with service account.")
         return
 
-    raise RuntimeError("Unable to initialize Earth Engine. Provide credentials or run `earthengine authenticate`. ")
+    raise RuntimeError("Unable to initialize Earth Engine. Provide credentials or run `earthengine authenticate`.")
 
 
 def h3_resolution_for_km(target_km: int) -> int:
@@ -346,7 +351,7 @@ def compute_environmental_data(h3_indexes: Iterable[str], scale: int = 30, field
                     finally:
                         _EE_SEMAPHORE.release()
                 except Exception as e:
-                        LOG.warning('Chunk %d-%d reduceRegions failed: %s — attempting centroid fallback', i0, i1, e)
+                        LOG.warning('Chunk %d-%d reduceRegions failed: %s -- attempting centroid fallback', i0, i1, e)
                         # Fallback: try centroid sampling for this chunk (quicker, less reliable for area means)
                         try:
                             feats_cent = []
