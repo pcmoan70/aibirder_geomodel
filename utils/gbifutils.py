@@ -94,13 +94,14 @@ def process_gbif_file(gbif_zip_path, file, output_csv_path):
                             continue
 
                         week = date_to_week(day, month)
-
-                        output_chunk = output_chunk._append({
-                            'latitude': lat,
-                            'longitude': lon,
-                            'taxon': taxon,
-                            'week': week}, ignore_index=True)
                         
+                        output_chunk = pd.concat([output_chunk, pd.DataFrame({
+                            'latitude': [lat],
+                            'longitude': [lon],
+                            'taxon': [taxon],
+                            'week': [week]
+                        })], ignore_index=True)
+
                     output_chunk.to_csv(output_csv_path, mode='a', header=False, index=False)
                     pbar.update(len(chunk))
 
