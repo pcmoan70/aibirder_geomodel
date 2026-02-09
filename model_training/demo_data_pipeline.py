@@ -82,6 +82,7 @@ def demonstrate_data_loading(data_path: str):
     
     print("5. Preparing training data...")
     print("   - Encoding coordinates with sinusoidal encoding")
+    print("   - Encoding weeks with sinusoidal encoding (cyclical)")
     print("   - Normalizing environmental features")
     print("   - Building species vocabulary")
     print("   - Converting species lists to multi-label binary format")
@@ -115,17 +116,16 @@ def demonstrate_data_loading(data_path: str):
     print("  Description: 4 features per sample [sin(lat), cos(lat), sin(lon), cos(lon)]")
     print(f"  Data type: {inputs['coordinates'].dtype}")
     
-    print("\nWeek:")
+    print("\nWeek (sinusoidal encoded):")
     print(f"  Shape: {inputs['week'].shape}")
-    print("  Description: Week of year (0-indexed: 0-47)")
+    print("  Description: 2 features per sample [sin(week), cos(week)] for cyclical encoding")
     print(f"  Data type: {inputs['week'].dtype}")
-    print(f"  Range: {inputs['week'].min()} to {inputs['week'].max()}")
     
     print("\nExample input samples (first 3):")
     for i in range(min(3, len(inputs['coordinates']))):
         print(f"\nSample {i+1}:")
         print(f"  Coordinates (encoded): {inputs['coordinates'][i]}")
-        print(f"  Week: {inputs['week'][i]} (week {inputs['week'][i] + 1} of year)")
+        print(f"  Week (encoded): {inputs['week'][i]}")
     
     # Display target shapes and examples
     print_separator("MODEL TARGETS")

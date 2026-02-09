@@ -50,6 +50,35 @@ class H3DataPreprocessor:
         
         return encoded.astype(np.float32)
     
+    def sinusoidal_encode_weeks(
+        self,
+        weeks: np.ndarray,
+        n_weeks: int = 48
+    ) -> np.ndarray:
+        """
+        Apply sinusoidal encoding to week numbers to handle cyclical nature.
+        
+        This encoding ensures that week 48 and week 1 are treated as adjacent
+        (end of year wraps to beginning of year).
+        
+        Args:
+            weeks: Array of week numbers (1-48)
+            n_weeks: Total number of weeks in a year (default: 48)
+            
+        Returns:
+            Array of shape (n_samples, 2) with [sin(week), cos(week)]
+        """
+        # Convert week numbers to radians (full cycle = 2π)
+        week_rad = 2 * np.pi * (weeks - 1) / n_weeks  # weeks 1-48 → 0 to 2π
+        
+        # Apply sinusoidal encoding
+        encoded = np.column_stack([
+            np.sin(week_rad),
+            np.cos(week_rad)
+        ])
+        
+        return encoded.astype(np.float32)
+    
     def normalize_environmental_features(
         self, 
         env_features: pd.DataFrame, 
@@ -65,10 +94,22 @@ class H3DataPreprocessor:
         Returns:
             Normalized features as numpy array
         """
+        # TODO: Improve NaN handling - current approach (filling with means) is a temporary workaround
+        # Better alternatives: model-based imputation, handling missingness explicitly, or using
+        # separate indicators for missing values
+        # Fill NaN values with column means before scaling
+        env_features_filled = env_features.fillna(env_features.mean())
+        
         if fit:
             self.env_feature_names = list(env_features.columns)
-            return self.env_scaler.fit_transform(env_features)
-        return self.env_scaler.transform(env_features)
+            normalized = self.env_scaler.fit_transform(env_features_filled)
+        else:
+            normalized = self.env_scaler.transform(env_features_filled)
+        
+        # Replace any remaining NaN with 0
+        normalized = np.nan_to_num(normalized, nan=0.0)
+        
+        return normalized
     
     def build_species_vocabulary(
         self, 
@@ -140,11 +181,14 @@ class H3DataPreprocessor:
             fit: Whether to fit encoders/scalers
             
         Returns:
-            inputs: Dict with 'coordinates' (sinusoidal encoded) and 'week' arrays
+            inputs: Dict with 'coordinates' (sinusoidal encoded) and 'week' (sinusoidal encoded) arrays
             targets: Dict with 'species' (binary matrix) and 'env_features' arrays
         """
         # Sinusoidal encode coordinates
         encoded_coords = self.sinusoidal_encode_coordinates(lats, lons)
+        
+        # Sinusoidal encode weeks for cyclical representation
+        encoded_weeks = self.sinusoidal_encode_weeks(weeks)
         
         # Normalize environmental features
         normalized_env = self.normalize_environmental_features(env_features, fit=fit)
@@ -157,7 +201,7 @@ class H3DataPreprocessor:
         # Prepare inputs
         inputs = {
             'coordinates': encoded_coords,  # Shape: (n_samples, 4)
-            'week': weeks - 1  # Convert to 0-indexed (0-47)
+            'week': encoded_weeks  # Shape: (n_samples, 2) - sinusoidal encoded
         }
         
         # Prepare targets
