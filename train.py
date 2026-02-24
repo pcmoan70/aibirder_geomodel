@@ -3,6 +3,13 @@ Training script for BirdNET Geomodel.
 
 Pipeline: load parquet → preprocess → train multi-task model → save checkpoints.
 
+Features:
+  - AdamW optimizer with CosineAnnealingWarmRestarts LR schedule
+  - Automatic mixed-precision (AMP) on CUDA for ~2× speed-up
+  - Early stopping based on validation-loss plateau
+  - Focal loss (default) for heavily imbalanced species labels
+  - Gradient clipping
+
 Usage:
     python train.py --data_path ./outputs/global_350km_ee_gbif.parquet
     python train.py --data_path data.parquet --model_size large --num_epochs 100
@@ -13,7 +20,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -26,36 +33,48 @@ from utils.data import H3DataLoader, H3DataPreprocessor, create_dataloaders, get
 
 
 class Trainer:
-    """Training loop with validation, checkpointing, and history tracking."""
+    """Training loop with validation, checkpointing, LR scheduling, AMP, and early stopping."""
 
     def __init__(
         self,
         model: nn.Module,
         criterion: nn.Module,
         optimizer: torch.optim.Optimizer,
+        scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
         device: torch.device,
         checkpoint_dir: Path,
         model_config: Dict = None,
         species_vocab: Dict = None,
+        patience: int = 10,
         log_interval: int = 10,
     ):
         self.model = model.to(device)
         self.criterion = criterion
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.device = device
         self.checkpoint_dir = checkpoint_dir
         self.model_config = model_config or {}
         self.species_vocab = species_vocab or {}
+        self.patience = patience
         self.log_interval = log_interval
+
+        # AMP scaler — only active on CUDA
+        self.use_amp = device.type == 'cuda'
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         self.history = {
             'train_loss': [], 'train_species_loss': [], 'train_env_loss': [],
             'val_loss': [], 'val_species_loss': [], 'val_env_loss': [],
+            'lr': [],
         }
         self.best_val_loss = float('inf')
         self.current_epoch = 0
+        self._epochs_no_improve = 0
+
+    # -- single epoch -----------------------------------------------------
 
     def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
         self.model.train()
@@ -64,17 +83,22 @@ class Trainer:
 
         pbar = tqdm(train_loader, desc=f'Epoch {self.current_epoch + 1} [Train]')
         for batch_idx, (inputs, targets) in enumerate(pbar):
-            coords = inputs['coordinates'].to(self.device)
-            week = inputs['week'].to(self.device)
-            species_t = targets['species'].to(self.device)
-            env_t = targets['env_features'].to(self.device)
+            coords = inputs['coordinates'].to(self.device, non_blocking=True)
+            week = inputs['week'].to(self.device, non_blocking=True)
+            species_t = targets['species'].to(self.device, non_blocking=True)
+            env_t = targets['env_features'].to(self.device, non_blocking=True)
 
-            self.optimizer.zero_grad()
-            outputs = self.model(coords, week, return_env=True)
-            losses = self.criterion(outputs, {'species': species_t, 'env_features': env_t})
-            losses['total'].backward()
+            self.optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                outputs = self.model(coords, week, return_env=True)
+                losses = self.criterion(outputs, {'species': species_t, 'env_features': env_t})
+
+            self.scaler.scale(losses['total']).backward()
+            self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             total_loss += losses['total'].item()
             total_species += losses['species'].item()
@@ -96,13 +120,14 @@ class Trainer:
         n_batches = 0
 
         for inputs, targets in tqdm(val_loader, desc=f'Epoch {self.current_epoch + 1} [Val]  '):
-            coords = inputs['coordinates'].to(self.device)
-            week = inputs['week'].to(self.device)
-            species_t = targets['species'].to(self.device)
-            env_t = targets['env_features'].to(self.device)
+            coords = inputs['coordinates'].to(self.device, non_blocking=True)
+            week = inputs['week'].to(self.device, non_blocking=True)
+            species_t = targets['species'].to(self.device, non_blocking=True)
+            env_t = targets['env_features'].to(self.device, non_blocking=True)
 
-            outputs = self.model(coords, week, return_env=True)
-            losses = self.criterion(outputs, {'species': species_t, 'env_features': env_t})
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                outputs = self.model(coords, week, return_env=True)
+                losses = self.criterion(outputs, {'species': species_t, 'env_features': env_t})
 
             total_loss += losses['total'].item()
             total_species += losses['species'].item()
@@ -111,6 +136,8 @@ class Trainer:
 
         return {'loss': total_loss / n_batches, 'species_loss': total_species / n_batches,
                 'env_loss': total_env / n_batches}
+
+    # -- checkpointing ----------------------------------------------------
 
     def save_checkpoint(self, is_best: bool = False):
         checkpoint = {
@@ -122,6 +149,10 @@ class Trainer:
             'model_config': self.model_config,
             'species_vocab': self.species_vocab,
         }
+        if self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        if self.use_amp:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
 
         torch.save(checkpoint, self.checkpoint_dir / 'checkpoint_latest.pt')
         if is_best:
@@ -129,7 +160,7 @@ class Trainer:
             print(f"  Saved best model (val_loss: {self.best_val_loss:.4f})")
 
     def load_checkpoint(self, checkpoint_path: Path):
-        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt['model_state_dict'])
         self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         self.current_epoch = ckpt['epoch']
@@ -137,11 +168,21 @@ class Trainer:
         self.history = ckpt['history']
         self.model_config = ckpt.get('model_config', {})
         self.species_vocab = ckpt.get('species_vocab', {})
+        if self.scheduler is not None and 'scheduler_state_dict' in ckpt:
+            self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        if self.use_amp and 'scaler_state_dict' in ckpt:
+            self.scaler.load_state_dict(ckpt['scaler_state_dict'])
         print(f"Resumed from epoch {self.current_epoch + 1}")
+
+    # -- main loop --------------------------------------------------------
 
     def train(self, train_loader: DataLoader, val_loader: DataLoader,
               num_epochs: int, save_every: int = 5):
         print(f"\nTraining for {num_epochs} epochs on {self.device}")
+        if self.use_amp:
+            print("  Mixed precision (AMP): enabled")
+        if self.patience:
+            print(f"  Early stopping patience: {self.patience}")
         print(f"  Train: {len(train_loader.dataset):,} samples  |  Val: {len(val_loader.dataset):,} samples")
         print(f"  Batch size: {train_loader.batch_size}  |  Batches/epoch: {len(train_loader)}\n")
 
@@ -151,19 +192,34 @@ class Trainer:
             train_m = self.train_epoch(train_loader)
             val_m = self.validate(val_loader)
 
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            lr = self.optimizer.param_groups[0]['lr']
+            self.history['lr'].append(lr)
             for k in ('loss', 'species_loss', 'env_loss'):
                 self.history[f'train_{k}'].append(train_m[k])
                 self.history[f'val_{k}'].append(val_m[k])
 
-            print(f"\nEpoch {epoch + 1} — "
+            print(f"\nEpoch {epoch + 1} — lr={lr:.2e}  "
                   f"Train: {train_m['loss']:.4f} (sp={train_m['species_loss']:.4f} env={train_m['env_loss']:.4f})  "
                   f"Val: {val_m['loss']:.4f} (sp={val_m['species_loss']:.4f} env={val_m['env_loss']:.4f})")
 
             is_best = val_m['loss'] < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_m['loss']
+                self._epochs_no_improve = 0
+            else:
+                self._epochs_no_improve += 1
+
             if (epoch + 1) % save_every == 0 or is_best:
                 self.save_checkpoint(is_best=is_best)
+
+            # Early stopping
+            if self.patience and self._epochs_no_improve >= self.patience:
+                print(f"\nEarly stopping — no improvement for {self.patience} epochs")
+                self.save_checkpoint(is_best=False)
+                break
 
         # Save final history
         with open(self.checkpoint_dir / 'training_history.json', 'w') as f:
@@ -184,11 +240,27 @@ def main():
 
     # Training
     parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--num_epochs', type=int, default=50)
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--weight_decay', type=float, default=1e-5)
+    parser.add_argument('--num_epochs', type=int, default=100)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--species_weight', type=float, default=1.0)
     parser.add_argument('--env_weight', type=float, default=0.1)
+    parser.add_argument('--species_loss', type=str, default='focal', choices=['focal', 'bce'],
+                        help='Species loss function (default: focal)')
+    parser.add_argument('--focal_alpha', type=float, default=0.25)
+    parser.add_argument('--focal_gamma', type=float, default=2.0)
+
+    # LR schedule
+    parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],
+                        help='LR scheduler (default: cosine annealing with warm restarts)')
+    parser.add_argument('--lr_T0', type=int, default=10,
+                        help='Cosine restart period in epochs (default: 10)')
+    parser.add_argument('--lr_min', type=float, default=1e-6,
+                        help='Minimum LR for cosine schedule')
+
+    # Early stopping
+    parser.add_argument('--patience', type=int, default=15,
+                        help='Early stopping patience (0 = disabled)')
 
     # Data split
     parser.add_argument('--test_size', type=float, default=0.2)
@@ -219,7 +291,8 @@ def main():
     print(f"  Model:      {args.model_size}")
     print(f"  Epochs:     {args.num_epochs}")
     print(f"  Batch size: {args.batch_size}")
-    print(f"  LR:         {args.lr}")
+    print(f"  LR:         {args.lr}  (schedule: {args.lr_schedule})")
+    print(f"  Loss:       {args.species_loss}")
     print(f"  Device:     {device}")
 
     # -- Data loading & preprocessing ---
@@ -311,13 +384,28 @@ def main():
     named = sum(1 for idx in range(n_species) if preprocessor.idx_to_species[idx] in name_map)
     print(f"   Saved {n_species} labels ({named} with names) to {labels_path}")
 
+    # -- Criterion, optimizer, scheduler --
     criterion = MultiTaskLoss(
-        species_weight=args.species_weight, env_weight=args.env_weight, pos_weight=None
+        species_weight=args.species_weight, env_weight=args.env_weight,
+        species_loss=args.species_loss,
+        focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
     )
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+    )
+
+    scheduler = None
+    if args.lr_schedule == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=args.lr_T0, eta_min=args.lr_min,
+        )
+
     trainer = Trainer(
-        model=model, criterion=criterion, optimizer=optimizer, device=device,
-        checkpoint_dir=checkpoint_dir, model_config=model_config, species_vocab=species_vocab,
+        model=model, criterion=criterion, optimizer=optimizer,
+        scheduler=scheduler, device=device,
+        checkpoint_dir=checkpoint_dir, model_config=model_config,
+        species_vocab=species_vocab,
+        patience=args.patience,
     )
 
     if args.resume:

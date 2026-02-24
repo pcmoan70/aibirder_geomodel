@@ -132,6 +132,12 @@ class H3DataPreprocessor:
         self.idx_to_species: Dict[int, int] = {}
         self.env_feature_names: Optional[List[str]] = None
 
+        # Column classification for proper encoding
+        self._categorical_cols: List[str] = []
+        self._fraction_cols: List[str] = []
+        self._continuous_cols: List[str] = []
+        self._category_maps: Dict[str, List] = {}  # col → sorted unique values (for one-hot)
+
     # -- Encoding ---------------------------------------------------------
 
     @staticmethod
@@ -159,19 +165,84 @@ class H3DataPreprocessor:
         result[yearly_mask] = 0.0
         return result
 
+    # -- Environmental feature classification -----------------------------
+
+    # Columns that are categorical (one-hot encoded)
+    CATEGORICAL_COLUMNS = {'landcover_class'}
+    # Columns that are already 0-1 fractions (passed through as-is)
+    FRACTION_COLUMNS = {'water_fraction', 'urban_fraction'}
+    # Columns that carry no information (constant across all rows) — dropped
+    DROP_COLUMNS = {'target_km', 'h3_resolution'}
+
     # -- Normalization ----------------------------------------------------
+
+    def _classify_env_columns(self, env_features: pd.DataFrame) -> None:
+        """Classify environmental columns into categorical, fraction, and continuous."""
+        self._categorical_cols = []
+        self._fraction_cols = []
+        self._continuous_cols = []
+
+        for col in env_features.columns:
+            if col in self.DROP_COLUMNS:
+                continue
+            elif col in self.CATEGORICAL_COLUMNS:
+                self._categorical_cols.append(col)
+            elif col in self.FRACTION_COLUMNS:
+                self._fraction_cols.append(col)
+            else:
+                self._continuous_cols.append(col)
 
     def normalize_environmental_features(
         self, env_features: pd.DataFrame, fit: bool = True
     ) -> np.ndarray:
-        """Normalize environmental features with StandardScaler (NaNs filled with column means)."""
-        filled = env_features.fillna(env_features.mean())
+        """
+        Encode environmental features with type-appropriate transformations:
+          - Categorical columns → one-hot encoded (NaN → all-zero row)
+          - Fraction columns   → passed through as-is (NaN → 0)
+          - Continuous columns  → StandardScaler (NaN → column mean before scaling)
+          - Constant columns   → dropped
+        """
         if fit:
-            self.env_feature_names = list(env_features.columns)
-            normalized = self.env_scaler.fit_transform(filled)
-        else:
-            normalized = self.env_scaler.transform(filled)
-        return np.nan_to_num(normalized, nan=0.0)
+            self._classify_env_columns(env_features)
+
+        parts: List[np.ndarray] = []
+        feature_names: List[str] = []
+
+        # 1) One-hot encode categoricals
+        for col in self._categorical_cols:
+            series = env_features[col]
+            if fit:
+                # Learn the set of categories (excluding NaN)
+                cats = sorted(series.dropna().unique().tolist())
+                self._category_maps[col] = cats
+            cats = self._category_maps[col]
+            ohe = np.zeros((len(series), len(cats)), dtype=np.float32)
+            for i, cat in enumerate(cats):
+                ohe[:, i] = (series.values == cat).astype(np.float32)
+            parts.append(ohe)
+            feature_names.extend([f'{col}_{int(c)}' for c in cats])
+
+        # 2) Fractions — pass through, fill NaN with 0
+        for col in self._fraction_cols:
+            arr = env_features[col].fillna(0.0).values.astype(np.float32).reshape(-1, 1)
+            parts.append(arr)
+            feature_names.append(col)
+
+        # 3) Continuous — StandardScaler
+        if self._continuous_cols:
+            cont = env_features[self._continuous_cols].copy()
+            cont = cont.fillna(cont.mean())
+            if fit:
+                scaled = self.env_scaler.fit_transform(cont)
+            else:
+                scaled = self.env_scaler.transform(cont)
+            parts.append(np.nan_to_num(scaled, nan=0.0).astype(np.float32))
+            feature_names.extend(self._continuous_cols)
+
+        if fit:
+            self.env_feature_names = feature_names
+
+        return np.hstack(parts) if parts else np.empty((len(env_features), 0), dtype=np.float32)
 
     # -- Species vocabulary -----------------------------------------------
 

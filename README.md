@@ -138,10 +138,27 @@ python utils/combine.py \
 **Model architecture:**
 
 - **Inputs:** Sinusoidally encoded lat/lon (4 features) + week (2 features) = 6 total
-- **Shared encoder:** Fully connected layers (BatchNorm, ReLU, Dropout) → 512-dim embedding
-- **Species head:** Multi-label binary classification (BCE loss)
+- **Shared encoder:** Residual blocks with pre-norm (LayerNorm → GELU → Linear + skip connections)
+- **Species head:** Multi-label classification with residual blocks (focal loss by default)
 - **Environmental head:** Regression on env features (MSE loss, auxiliary — training only)
-- **Sizes:** small (~1.4M params), medium (~1.1M, default), large (~3.4M)
+- **Sizes:** small (~860K params), medium (~3.9M, default), large (~21.5M)
+
+**Environmental feature encoding:**
+
+The environmental targets are encoded according to their type:
+- **Categorical** (e.g. `landcover_class`) → one-hot encoded (NaN → all-zero)
+- **Fractions** (e.g. `water_fraction`, `urban_fraction`) → passed through as-is
+- **Continuous** (e.g. `elevation_m`, `temperature_c`) → StandardScaler normalized
+- **Constants** (e.g. `target_km`, `h3_resolution`) → dropped
+
+**Training features:**
+
+- AdamW optimizer with decoupled weight decay
+- Cosine annealing with warm restarts LR schedule
+- Automatic mixed precision (AMP) on CUDA
+- Early stopping with configurable patience
+- Focal loss for species (handles extreme label imbalance)
+- Gradient clipping (max norm 1.0)
 
 **Key CLI options:**
 
@@ -150,10 +167,18 @@ python utils/combine.py \
 | `--data_path` | `./outputs/global_350km_ee_gbif.parquet` | Combined parquet from Stage 3 |
 | `--model_size` | `medium` | `small`, `medium`, or `large` |
 | `--batch_size` | `256` | Training batch size |
-| `--num_epochs` | `50` | Number of training epochs |
+| `--num_epochs` | `100` | Number of training epochs |
 | `--lr` | `0.001` | Learning rate |
-| `--species_weight` | `1.0` | Weight for species BCE loss |
+| `--weight_decay` | `1e-4` | AdamW weight decay |
+| `--species_loss` | `focal` | `focal` or `bce` |
+| `--focal_alpha` | `0.25` | Focal loss alpha |
+| `--focal_gamma` | `2.0` | Focal loss gamma |
+| `--species_weight` | `1.0` | Weight for species loss |
 | `--env_weight` | `0.1` | Weight for environmental MSE loss |
+| `--lr_schedule` | `cosine` | `cosine` or `none` |
+| `--lr_T0` | `10` | Cosine restart period (epochs) |
+| `--lr_min` | `1e-6` | Minimum LR for cosine schedule |
+| `--patience` | `15` | Early stopping patience (0 = disabled) |
 | `--taxonomy` | auto-detect | Path to taxonomy CSV from combine |
 | `--checkpoint_dir` | `./checkpoints` | Where to save checkpoints |
 | `--resume` | — | Resume from a checkpoint |
@@ -220,6 +245,7 @@ geomodel/
 │   ├── combine.py             # Join geodata + GBIF (Stage 3)
 │   └── data.py                # PyTorch Dataset / DataLoader / preprocessing
 ├── scripts/
+│   ├── plot_species_weeks.py   # Per-species weekly probability charts
 │   └── plot_environmental.py  # Environmental feature visualization
 ├── checkpoints/               # Model checkpoints + labels.txt
 ├── data/                      # Input GeoParquet files
