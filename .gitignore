@@ -4,6 +4,9 @@
 # Exclude outputs dir
 outputs/
 
+# Exclude dev files
+commands.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -55,7 +55,7 @@ def estimate_rows(zip_archive, file_path, sample_rows=10000):
     else:
         return 0
 
-def process_gbif_file(gbif_zip_path, file, output_csv_path):
+def process_gbif_file(gbif_zip_path, file, output_csv_path, only_classes=None, max_rows=None):
 
     output_df = pd.DataFrame({
         'latitude': [],
@@ -83,7 +83,7 @@ def process_gbif_file(gbif_zip_path, file, output_csv_path):
                         day = row.get('day')
                         month = row.get('month')
                         taxon = row.get('taxonKey')
-                        scientific_name = row.get('scientificName')
+                        scientific_name = row.get('verbatimScientificName')
                         cls = row.get('class')
 
                         if pd.isna(lat) or pd.isna(lon):  # Skip row if lat or lon is missing
@@ -94,6 +94,10 @@ def process_gbif_file(gbif_zip_path, file, output_csv_path):
                             continue
                         if pd.isna(cls):  # Skip row if class is missing
                             continue
+                        if only_classes and cls.lower() not in only_classes:  # Skip row if class is not in the specified list
+                            continue
+                        if len(scientific_name.split()) > 2: # Only full species, ingoring subspecies and higher taxa
+                            continue
 
                         # round coordinates to 3 decimal places
                         try:
@@ -103,12 +107,14 @@ def process_gbif_file(gbif_zip_path, file, output_csv_path):
                             continue
 
                         week = date_to_week(int(day), int(month))
-                        rows.append({'latitude': latv, 'longitude': lonv, 'taxon': taxon, 'scientificName': scientific_name, 'week': week, 'class': cls})
+                        rows.append({'latitude': latv, 'longitude': lonv, 'taxonID': taxon, 'scientificName': scientific_name, 'week': week, 'class': cls})
 
                     if rows:
-                        output_chunk = pd.DataFrame.from_records(rows, columns=['latitude', 'longitude', 'taxon', 'scientificName', 'week', 'class'])
+                        output_chunk = pd.DataFrame.from_records(rows, columns=['latitude', 'longitude', 'taxonID', 'scientificName', 'week', 'class'])
                         output_chunk.to_csv(output_csv_path, mode='a', header=False, index=False, encoding='utf-8')
                     pbar.update(len(chunk))
+                    if max_rows is not None and pbar.n >= max_rows:
+                        break
 
 if __name__ == '__main__':
     import argparse
@@ -118,10 +124,8 @@ if __name__ == '__main__':
     parser.add_argument('--gbif', type=str, default="gbif_dev.zip", help='Path to the zipped GBIF file')
     parser.add_argument('--file', type=str, default="gbif_dev.csv", help='Name of the CSV file inside the zip')
     parser.add_argument('--output', type=str, default="./outputs/gbif_processed.gz", help='Output gzipped CSV file')
+    parser.add_argument('--only_classes', nargs='*', default=['aves', 'amphibia', 'insecta', 'mammalia', 'reptilia'], help='List of classes to include (default: aves, amphibia, insecta, mammalia, reptilia)')
+    parser.add_argument('--max_rows', type=int, default=None, help='Maximum number of rows to process (for testing purposes)')
     args = parser.parse_args()
 
-    gbif = args.gbif
-    file = args.file
-    output = args.output
-
-    process_gbif_file(gbif, file, output)
+    process_gbif_file(args.gbif, args.file, args.output, only_classes=[cls.lower() for cls in args.only_classes], max_rows=args.max_rows)
