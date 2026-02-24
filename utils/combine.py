@@ -65,40 +65,77 @@ def combine_geodata_and_gbif(geodata_path, gbif_processed_path, output_path, val
     h3_res = h3.get_resolution(cell)
     logging.info(f"Using H3 resolution {h3_res} based on first cell {cell}")
 
-    # Initialize week columns
-    for week in range(1, 49):
-        gdf[f'week_{week}'] = [[] for _ in range(len(gdf))]
+    # Build a set of valid h3 indices for O(1) membership checks
+    valid_h3_cells = set(gdf['h3_index'])
 
-    # Estiamte rows for progressbar
+    # Accumulate species per (cell, week) in a dict of sets for fast deduplication
+    # Key: (h3_index, week_number) -> set of taxon keys
+    cell_week_species = {}
+
+    # Use a set for fast class filtering
+    valid_classes_set = set(valid_classes)
+
+    # Track cells not found to avoid spamming warnings
+    missing_cells = set()
+
+    # Estimate rows for progressbar
     estimated_rows = estimate_gzip_rows(gbif_processed_path)
 
     with gzip.open(gbif_processed_path, 'rt', encoding='utf-8') as f:
         with tqdm(total=estimated_rows, desc="Processing GBIF data") as pbar:
 
-            # iterate the gbif file in chunks and write observations to the correct h3 cell and week
-            for chunk in pd.read_csv(f, chunksize=10000):
-                for idx, row in chunk.iterrows():
-                    taxon_class = row['class']
+            for chunk in pd.read_csv(f, chunksize=100000):
+                # Vectorized: filter to valid classes
+                chunk = chunk[chunk['class'].isin(valid_classes_set)]
 
-                    # Skip if class is not valid
-                    if taxon_class not in valid_classes:
-                        continue
-                    lat = row['latitude']
-                    lon = row['longitude']
-                    taxon = row['taxon']
+                if chunk.empty:
+                    pbar.update(len(chunk))
+                    continue
 
-                    cell = h3.latlng_to_cell(lat, lon, h3_res)
-                    week = int(row['week'])
+                # Vectorized: compute H3 cells for the entire chunk
+                chunk = chunk.copy()
+                chunk['h3_cell'] = [
+                    h3.latlng_to_cell(lat, lon, h3_res)
+                    for lat, lon in zip(chunk['latitude'].values, chunk['longitude'].values)
+                ]
 
-                    gdf_row = gdf[gdf['h3_index'] == cell]
-                    if not gdf_row.empty:
-                        if taxon not in gdf_row[f'week_{week}']:
-                            gdf.at[gdf_row.index[0], f'week_{week}'].append(taxon)
-                    else:
-                        logging.warning(f"Cell {cell} not found in geographical data.")
+                # Vectorized: filter to only rows whose H3 cell exists in geodata
+                mask = chunk['h3_cell'].isin(valid_h3_cells)
+                missing = set(chunk.loc[~mask, 'h3_cell'].unique())
+                new_missing = missing - missing_cells
+                if new_missing:
+                    logging.warning(f"{len(new_missing)} H3 cell(s) not found in geographical data (e.g. {next(iter(new_missing))})")
+                    missing_cells.update(new_missing)
+
+                chunk = chunk[mask]
+
+                # Accumulate species into (cell, week) sets
+                for h3_cell, week, taxon in zip(
+                    chunk['h3_cell'].values,
+                    chunk['week'].values,
+                    chunk['taxon'].values,
+                ):
+                    key = (h3_cell, int(week))
+                    if key not in cell_week_species:
+                        cell_week_species[key] = set()
+                    cell_week_species[key].add(taxon)
 
                 pbar.update(len(chunk))
 
+    # Build h3_index -> gdf row index mapping for O(1) assignment
+    h3_to_idx = {h3_val: idx for idx, h3_val in zip(gdf.index, gdf['h3_index'])}
+
+    # Initialize week columns with empty lists
+    for week in range(1, 49):
+        gdf[f'week_{week}'] = [[] for _ in range(len(gdf))]
+
+    # Assign accumulated species lists to gdf
+    for (h3_cell, week), species_set in cell_week_species.items():
+        gdf_idx = h3_to_idx[h3_cell]
+        gdf.at[gdf_idx, f'week_{week}'] = list(species_set)
+
+    if missing_cells:
+        logging.info(f"Total {len(missing_cells)} unique H3 cell(s) from GBIF not found in geographical data.")
 
     gdf.to_parquet(output_path, index=False)
 
