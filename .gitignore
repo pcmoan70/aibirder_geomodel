@@ -1,5 +1,5 @@
 # Exclude plots
-*.png
+outputs/plots/
 
 # Exclude outputs dir
 outputs/
