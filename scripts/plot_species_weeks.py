@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.model import create_model
 from predict import load_labels
-from utils.data import H3DataPreprocessor
 
 NUM_WEEKS = 48
 
@@ -53,26 +52,23 @@ def predict_all_weeks(checkpoint_path: str, lat: float, lon: float, device: str 
         n_species=model_config['n_species'],
         n_env_features=model_config['n_env_features'],
         model_size=model_config['model_size'],
+        coord_harmonics=model_config.get('coord_harmonics', 4),
+        week_harmonics=model_config.get('week_harmonics', 2),
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(dev)
     model.eval()
 
-    # Encode coordinates (same for all weeks)
-    coords_enc = H3DataPreprocessor.sinusoidal_encode_coordinates(
-        np.array([lat]), np.array([lon])
-    )
-    coords_t = torch.from_numpy(coords_enc).float().to(dev)
-
-    # Batch all 48 weeks + yearly (week 0)
+    # Batch all 48 weeks + yearly (week 0) — pass raw values
+    n_total = NUM_WEEKS + 1
     weeks = np.concatenate([np.arange(1, NUM_WEEKS + 1), [0]])  # 1..48, 0
-    week_enc = H3DataPreprocessor.sinusoidal_encode_weeks(weeks)
 
-    coords_batch = coords_t.repeat(len(weeks), 1)
-    week_batch = torch.from_numpy(week_enc).float().to(dev)
+    lat_batch = torch.full((n_total,), lat, dtype=torch.float32, device=dev)
+    lon_batch = torch.full((n_total,), lon, dtype=torch.float32, device=dev)
+    week_batch = torch.from_numpy(weeks).float().to(dev)
 
     with torch.no_grad():
-        output = model(coords_batch, week_batch, return_env=False)
+        output = model(lat_batch, lon_batch, week_batch, return_env=False)
         probs = torch.sigmoid(output['species_logits']).cpu().numpy()  # (49, n_species)
 
     # Load labels

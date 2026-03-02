@@ -13,11 +13,9 @@ import argparse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 
 from model.model import create_model
-from utils.data import H3DataPreprocessor
 
 
 def load_labels(labels_path: str) -> Dict[int, Tuple[str, str]]:
@@ -78,23 +76,21 @@ def predict(
         n_species=model_config['n_species'],
         n_env_features=model_config['n_env_features'],
         model_size=model_config['model_size'],
+        coord_harmonics=model_config.get('coord_harmonics', 4),
+        week_harmonics=model_config.get('week_harmonics', 2),
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(dev)
     model.eval()
 
-    # Encode inputs
-    coords_enc = H3DataPreprocessor.sinusoidal_encode_coordinates(
-        np.array([lat]), np.array([lon])
-    )
-    week_enc = H3DataPreprocessor.sinusoidal_encode_weeks(np.array([week]))
-
-    coords_t = torch.from_numpy(coords_enc).float().to(dev)
-    week_t = torch.from_numpy(week_enc).float().to(dev)
+    # Raw inputs — the model handles circular encoding internally
+    lat_t = torch.tensor([lat], dtype=torch.float32, device=dev)
+    lon_t = torch.tensor([lon], dtype=torch.float32, device=dev)
+    week_t = torch.tensor([week], dtype=torch.float32, device=dev)
 
     # Predict
     with torch.no_grad():
-        output = model(coords_t, week_t, return_env=False)
+        output = model(lat_t, lon_t, week_t, return_env=False)
         probs = torch.sigmoid(output['species_logits']).cpu().numpy()[0]
 
     # Load labels file (auto-detect from checkpoint dir)

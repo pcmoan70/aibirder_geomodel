@@ -83,7 +83,8 @@ class Trainer:
 
         pbar = tqdm(train_loader, desc=f'Epoch {self.current_epoch + 1} [Train]')
         for batch_idx, (inputs, targets) in enumerate(pbar):
-            coords = inputs['coordinates'].to(self.device, non_blocking=True)
+            lat = inputs['lat'].to(self.device, non_blocking=True)
+            lon = inputs['lon'].to(self.device, non_blocking=True)
             week = inputs['week'].to(self.device, non_blocking=True)
             species_t = targets['species'].to(self.device, non_blocking=True)
             env_t = targets['env_features'].to(self.device, non_blocking=True)
@@ -91,7 +92,7 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast('cuda', enabled=self.use_amp):
-                outputs = self.model(coords, week, return_env=True)
+                outputs = self.model(lat, lon, week, return_env=True)
                 losses = self.criterion(outputs, {'species': species_t, 'env_features': env_t})
 
             self.scaler.scale(losses['total']).backward()
@@ -120,13 +121,14 @@ class Trainer:
         n_batches = 0
 
         for inputs, targets in tqdm(val_loader, desc=f'Epoch {self.current_epoch + 1} [Val]  '):
-            coords = inputs['coordinates'].to(self.device, non_blocking=True)
+            lat = inputs['lat'].to(self.device, non_blocking=True)
+            lon = inputs['lon'].to(self.device, non_blocking=True)
             week = inputs['week'].to(self.device, non_blocking=True)
             species_t = targets['species'].to(self.device, non_blocking=True)
             env_t = targets['env_features'].to(self.device, non_blocking=True)
 
             with torch.amp.autocast('cuda', enabled=self.use_amp):
-                outputs = self.model(coords, week, return_env=True)
+                outputs = self.model(lat, lon, week, return_env=True)
                 losses = self.criterion(outputs, {'species': species_t, 'env_features': env_t})
 
             total_loss += losses['total'].item()
@@ -237,6 +239,10 @@ def main():
 
     # Model
     parser.add_argument('--model_size', type=str, default='medium', choices=['small', 'medium', 'large'])
+    parser.add_argument('--coord_harmonics', type=int, default=4,
+                        help='Number of harmonics for lat/lon circular encoding (default: 4)')
+    parser.add_argument('--week_harmonics', type=int, default=2,
+                        help='Number of harmonics for week circular encoding (default: 2)')
 
     # Training
     parser.add_argument('--batch_size', type=int, default=256)
@@ -312,14 +318,14 @@ def main():
     info = preprocessor.get_preprocessing_info()
     n_species = info['n_species']
     n_env = info['n_env_features']
-    print(f"   Samples: {len(inputs['coordinates']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
+    print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
 
     print("4. Splitting data...")
     train_in, val_in, test_in, train_tgt, val_tgt, test_tgt = preprocessor.split_data(
         inputs, targets, test_size=args.test_size, val_size=args.val_size,
         random_state=42, split_by_location=True,
     )
-    print(f"   Train: {len(train_in['coordinates']):,}  |  Val: {len(val_in['coordinates']):,}  |  Test: {len(test_in['coordinates']):,}")
+    print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}  |  Test: {len(test_in['lat']):,}")
 
     print("5. Creating DataLoaders...")
     train_loader, val_loader = create_dataloaders(
@@ -331,7 +337,10 @@ def main():
 
     # -- Model ---
     print("\n6. Creating model...")
-    model = create_model(n_species=n_species, n_env_features=n_env, model_size=args.model_size)
+    model = create_model(
+        n_species=n_species, n_env_features=n_env, model_size=args.model_size,
+        coord_harmonics=args.coord_harmonics, week_harmonics=args.week_harmonics,
+    )
     total_params = sum(p.numel() for p in model.parameters())
     print(f"   {args.model_size} — {total_params:,} params (~{total_params * 4 / 1024 / 1024:.1f} MB)")
 
@@ -339,6 +348,8 @@ def main():
         'model_size': args.model_size,
         'n_species': n_species,
         'n_env_features': n_env,
+        'coord_harmonics': args.coord_harmonics,
+        'week_harmonics': args.week_harmonics,
     }
     species_vocab = {
         'species_to_idx': preprocessor.species_to_idx,

@@ -139,31 +139,9 @@ class H3DataPreprocessor:
         self._category_maps: Dict[str, List] = {}  # col → sorted unique values (for one-hot)
 
     # -- Encoding ---------------------------------------------------------
-
-    @staticmethod
-    def sinusoidal_encode_coordinates(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
-        """Sinusoidal encoding: [sin(lat), cos(lat), sin(lon), cos(lon)]."""
-        lat_rad = np.deg2rad(lats)
-        lon_rad = np.deg2rad(lons)
-        return np.column_stack([
-            np.sin(lat_rad), np.cos(lat_rad),
-            np.sin(lon_rad), np.cos(lon_rad),
-        ]).astype(np.float32)
-
-    @staticmethod
-    def sinusoidal_encode_weeks(weeks: np.ndarray, n_weeks: int = 48) -> np.ndarray:
-        """
-        Cyclical sinusoidal encoding: [sin(week), cos(week)].
-
-        Week 0 (yearly / all-year) is encoded as [0, 0].
-        """
-        weeks = np.asarray(weeks)
-        week_rad = 2 * np.pi * (weeks - 1) / n_weeks
-        result = np.column_stack([np.sin(week_rad), np.cos(week_rad)]).astype(np.float32)
-        # Zero out yearly samples (week == 0)
-        yearly_mask = weeks == 0
-        result[yearly_mask] = 0.0
-        return result
+    # NOTE: Circular encoding of lat/lon/week is now handled inside the model
+    # (see model/model.py CircularEncoding + SpatioTemporalEncoder).
+    # The data pipeline passes raw lat, lon, week values to the model.
 
     # -- Environmental feature classification -----------------------------
 
@@ -309,8 +287,6 @@ class H3DataPreprocessor:
         fit: bool = True,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         """Run full preprocessing: encode inputs, normalize targets, build vocab."""
-        encoded_coords = self.sinusoidal_encode_coordinates(lats, lons)
-        encoded_weeks = self.sinusoidal_encode_weeks(weeks)
         normalized_env = self.normalize_environmental_features(env_features, fit=fit)
         if fit:
             self.build_species_vocabulary(species_lists)
@@ -327,7 +303,12 @@ class H3DataPreprocessor:
         else:
             species_enc = self.encode_species_multilabel(species_lists)
 
-        inputs = {'coordinates': encoded_coords, 'week': encoded_weeks}
+        # Pass raw lat/lon/week — the model handles circular encoding internally
+        inputs = {
+            'lat': lats.astype(np.float32),
+            'lon': lons.astype(np.float32),
+            'week': weeks.astype(np.float32),
+        }
         targets = {'species': species_enc, 'env_features': normalized_env}
         return inputs, targets
 
@@ -344,11 +325,11 @@ class H3DataPreprocessor:
 
         Handles both dense ndarray and sparse list-of-arrays species targets.
         """
-        n_samples = len(inputs['coordinates'])
+        n_samples = len(inputs['lat'])
         indices = np.arange(n_samples)
 
         if split_by_location:
-            coord_tuples = [tuple(c) for c in inputs['coordinates']]
+            coord_tuples = list(zip(inputs['lat'].tolist(), inputs['lon'].tolist()))
             unique_map: Dict[tuple, int] = {}
             loc_ids = np.array([unique_map.setdefault(c, len(unique_map)) for c in coord_tuples])
             unique_locs = np.unique(loc_ids)
@@ -414,7 +395,8 @@ class BirdSpeciesDataset(Dataset):
 
     def __init__(self, inputs: Dict[str, np.ndarray], targets: Dict[str, Any],
                  n_species: int = 0):
-        self.coordinates = torch.from_numpy(inputs['coordinates']).float()
+        self.lat = torch.from_numpy(inputs['lat']).float()
+        self.lon = torch.from_numpy(inputs['lon']).float()
         self.week = torch.from_numpy(inputs['week']).float()
         self.env_features = torch.from_numpy(targets['env_features']).float()
 
@@ -430,10 +412,10 @@ class BirdSpeciesDataset(Dataset):
             self.species_sparse = species
             self.n_species = n_species
 
-        assert len(self.coordinates) == len(self.week) == len(self.env_features)
+        assert len(self.lat) == len(self.lon) == len(self.week) == len(self.env_features)
 
     def __len__(self) -> int:
-        return len(self.coordinates)
+        return len(self.lat)
 
     def __getitem__(self, idx: int):
         if self.species_dense is not None:
@@ -445,7 +427,7 @@ class BirdSpeciesDataset(Dataset):
             if len(indices) > 0:
                 sp[indices] = 1.0
         return (
-            {'coordinates': self.coordinates[idx], 'week': self.week[idx]},
+            {'lat': self.lat[idx], 'lon': self.lon[idx], 'week': self.week[idx]},
             {'species': sp, 'env_features': self.env_features[idx]},
         )
 

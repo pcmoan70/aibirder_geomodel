@@ -30,7 +30,6 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.model import create_model
-from utils.data import H3DataPreprocessor
 from utils.regions import resolve_bounds_arg
 
 
@@ -55,6 +54,8 @@ def load_model(checkpoint_path: str, device: torch.device):
         n_species=model_config['n_species'],
         n_env_features=model_config['n_env_features'],
         model_size=model_config['model_size'],
+        coord_harmonics=model_config.get('coord_harmonics', 4),
+        week_harmonics=model_config.get('week_harmonics', 2),
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(device)
@@ -77,21 +78,19 @@ def count_species_above_threshold(
     Returns:
         counts: np.ndarray of shape (n_cells,) — number of species above threshold per cell
     """
-    coords_enc = H3DataPreprocessor.sinusoidal_encode_coordinates(lats, lons)
-    week_enc = H3DataPreprocessor.sinusoidal_encode_weeks(np.array([week]))
-    week_enc = np.tile(week_enc, (len(lats), 1))
-
-    coords_t = torch.from_numpy(coords_enc).float()
-    week_t = torch.from_numpy(week_enc).float()
+    lat_t = torch.from_numpy(lats.astype(np.float32))
+    lon_t = torch.from_numpy(lons.astype(np.float32))
+    week_t = torch.full((len(lats),), week, dtype=torch.float32)
 
     all_counts = []
     n = len(lats)
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
-        cb = coords_t[start:end].to(device)
+        lb = lat_t[start:end].to(device)
+        lnb = lon_t[start:end].to(device)
         wb = week_t[start:end].to(device)
         with torch.no_grad():
-            output = model(cb, wb, return_env=False)
+            output = model(lb, lnb, wb, return_env=False)
             probs = torch.sigmoid(output['species_logits'])
             counts = (probs >= threshold).sum(dim=1).cpu().numpy()
         all_counts.append(counts)
