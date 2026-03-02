@@ -248,10 +248,11 @@ geomodel/
 │   ├── combine.py             # Join geodata + GBIF (Stage 3)
 │   └── data.py                # PyTorch Dataset / DataLoader / preprocessing
 ├── scripts/
-│   ├── plot_species_weeks.py  # Per-species weekly probability charts
-│   ├── plot_range_maps.py     # Species range maps (2×2 seasonal grid)
-│   ├── plot_richness.py       # Species richness map per grid cell
-│   └── plot_environmental.py  # Environmental feature visualization
+│   ├── plot_species_weeks.py       # Per-species weekly probability charts
+│   ├── plot_range_maps.py          # Species range maps (2×2 seasonal grid)
+│   ├── plot_richness.py            # Species richness map per grid cell
+│   ├── plot_variable_importance.py # Variable–species correlation bar charts
+│   └── plot_environmental.py       # Environmental feature visualization
 ├── checkpoints/               # Model checkpoints + labels.txt
 ├── data/                      # Input GeoParquet files
 └── outputs/                   # Processing outputs
@@ -306,6 +307,25 @@ python scripts/plot_richness.py --bounds europe --resolution 1.0
 | `--threshold` | `0.1` | Probability threshold for counting a species as present |
 | `--resolution` | `0.5` | Grid resolution in degrees |
 | `--bounds` | `world` | Region name or 4 floats |
+
+### Variable Importance
+
+`scripts/plot_variable_importance.py` measures how each variable (lat, lon, week, and all environmental features) correlates with a species' predicted occurrence probability across training data. Produces one horizontal bar chart per species with variables sorted alphabetically for cross-species comparability.
+
+```bash
+python scripts/plot_variable_importance.py --species "Barn Swallow" \
+    --data_path /path/to/data.parquet
+python scripts/plot_variable_importance.py --species "House Sparrow" "European Robin" \
+    --data_path /path/to/data.parquet --max_samples 200000
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--species` | — | Species names (substring match) |
+| `--taxon_keys` | — | GBIF taxonKeys |
+| `--data_path` | — | Training parquet file (required) |
+| `--max_samples` | `200000` | Max samples for correlation computation |
+| `--outdir` | `outputs/plots/variable_importance` | Output directory |
 
 ### Environmental Features
 
