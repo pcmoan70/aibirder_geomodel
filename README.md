@@ -5,7 +5,7 @@
 <h1 align="center">BirdNET Geomodel</h1>
 
 <p align="center">
-  <a href="https://github.com/birdnet-team/geomodel/blob/main/LICENSE"><img src="https://img.shields.io/github/license/birdnet-team/geomodel?color=blue" alt="License"></a>
+  <a href="https://github.com/birdnet-team/geomodel/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg" alt="PyTorch"></a>
   <a href="https://birdnet-team.github.io/geomodel/"><img src="https://img.shields.io/badge/docs-mkdocs-blue.svg" alt="Documentation"></a>
