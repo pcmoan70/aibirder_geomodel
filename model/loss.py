@@ -87,6 +87,16 @@ class MultiTaskLoss(nn.Module):
         targets: Dict[str, torch.Tensor],
         compute_env_loss: bool = True,
     ) -> Dict[str, torch.Tensor]:
+        """Compute weighted multi-task loss.
+
+        Args:
+            predictions: Dict with ``'species_logits'`` and optionally ``'env_pred'``.
+            targets: Dict with ``'species'`` and ``'env_features'`` tensors.
+            compute_env_loss: Whether to include the environmental MSE term.
+
+        Returns:
+            Dict with ``'species'``, ``'env'`` (if computed), and ``'total'`` losses.
+        """
         logits = predictions['species_logits']
         species_t = targets['species']
 

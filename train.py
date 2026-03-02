@@ -77,6 +77,15 @@ class Trainer:
     # -- single epoch -----------------------------------------------------
 
     def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
+        """Run one training epoch with AMP and gradient clipping.
+
+        Args:
+            train_loader: DataLoader yielding (inputs, targets) batches.
+
+        Returns:
+            Dict with average 'loss', 'species_loss', and 'env_loss' over
+            all batches.
+        """
         self.model.train()
         total_loss = total_species = total_env = 0.0
         n_batches = 0
@@ -116,6 +125,14 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
+        """Run a validation pass (no gradients).
+
+        Args:
+            val_loader: DataLoader yielding (inputs, targets) batches.
+
+        Returns:
+            Dict with average 'loss', 'species_loss', and 'env_loss'.
+        """
         self.model.eval()
         total_loss = total_species = total_env = 0.0
         n_batches = 0
@@ -142,6 +159,14 @@ class Trainer:
     # -- checkpointing ----------------------------------------------------
 
     def save_checkpoint(self, is_best: bool = False):
+        """Save model, optimizer, scheduler, and AMP scaler state to disk.
+
+        Always writes ``checkpoint_latest.pt``.  When *is_best* is True also
+        writes ``checkpoint_best.pt``.
+
+        Args:
+            is_best: If True, save an additional best-model checkpoint.
+        """
         checkpoint = {
             'epoch': self.current_epoch,
             'model_state_dict': self.model.state_dict(),
@@ -162,6 +187,14 @@ class Trainer:
             print(f"  Saved best model (val_loss: {self.best_val_loss:.4f})")
 
     def load_checkpoint(self, checkpoint_path: Path):
+        """Restore training state from a checkpoint file.
+
+        Loads model weights, optimizer state, scheduler state, AMP scaler,
+        epoch counter, best validation loss, and training history.
+
+        Args:
+            checkpoint_path: Path to a ``.pt`` checkpoint file.
+        """
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt['model_state_dict'])
         self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -180,6 +213,14 @@ class Trainer:
 
     def train(self, train_loader: DataLoader, val_loader: DataLoader,
               num_epochs: int, save_every: int = 5):
+        """Main training loop with checkpointing, LR scheduling, and early stopping.
+
+        Args:
+            train_loader: Training DataLoader.
+            val_loader: Validation DataLoader.
+            num_epochs: Maximum number of epochs to train.
+            save_every: Save a checkpoint every *save_every* epochs.
+        """
         print(f"\nTraining for {num_epochs} epochs on {self.device}")
         if self.use_amp:
             print("  Mixed precision (AMP): enabled")
@@ -232,6 +273,7 @@ class Trainer:
 
 
 def main():
+    """Entry point: parse CLI args, load data, build model, and run training."""
     parser = argparse.ArgumentParser(description='Train BirdNET Geomodel')
 
     # Data

@@ -1,3 +1,9 @@
+"""Combine H3 geodata with processed GBIF observations.
+
+Maps each GBIF record to its H3 cell and week, producing a combined
+parquet with per-week species lists and an accompanying taxonomy CSV.
+"""
+
 import geopandas as gpd
 import gzip
 import logging

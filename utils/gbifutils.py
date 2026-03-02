@@ -1,3 +1,9 @@
+"""GBIF data processing utilities.
+
+Functions for reading, filtering, and transforming GBIF Darwin Core Archive
+records into a clean CSV suitable for downstream H3 aggregation.
+"""
+
 import ast
 import logging
 import zipfile

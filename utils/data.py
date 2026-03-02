@@ -28,6 +28,11 @@ class H3DataLoader:
     """Load and prepare H3 cell-based species occurrence data for model training."""
 
     def __init__(self, data_path: str):
+        """Initialize the data loader.
+
+        Args:
+            data_path: Path to the H3 cell parquet file.
+        """
         self.data_path = Path(data_path)
         self.gdf: Optional[gpd.GeoDataFrame] = None
         self.week_columns: List[str] = []
@@ -44,10 +49,12 @@ class H3DataLoader:
         return self.gdf
 
     def _require_loaded(self):
+        """Raise if data has not been loaded yet."""
         if self.gdf is None:
             raise ValueError("Data not loaded. Call load_data() first.")
 
     def get_h3_cells(self) -> np.ndarray:
+        """Return the array of H3 cell index strings."""
         self._require_loaded()
         return self.gdf['h3_index'].values
 
@@ -60,6 +67,7 @@ class H3DataLoader:
         return lats, lons
 
     def get_environmental_features(self) -> pd.DataFrame:
+        """Return the environmental feature columns as a DataFrame."""
         self._require_loaded()
         return self.gdf[self.env_columns]
 
@@ -108,6 +116,7 @@ class H3DataLoader:
         return lats, lons, weeks, species_lists, env_features_df
 
     def get_data_info(self) -> Dict:
+        """Return a summary dict with counts and column names."""
         self._require_loaded()
         return {
             'n_h3_cells': len(self.gdf),
@@ -126,6 +135,7 @@ class H3DataPreprocessor:
     """Preprocess H3 cell and species occurrence data for multi-task learning."""
 
     def __init__(self):
+        """Initialize the preprocessor with empty state."""
         self.env_scaler = StandardScaler()
         self.species_vocab: Set[int] = set()
         self.species_to_idx: Dict[int, int] = {}
@@ -369,6 +379,7 @@ class H3DataPreprocessor:
         )
 
     def get_preprocessing_info(self) -> Dict[str, Any]:
+        """Return a dict with species vocab size and environmental feature info."""
         return {
             'n_species': len(self.species_vocab),
             'n_env_features': len(self.env_feature_names) if self.env_feature_names else 0,
@@ -395,6 +406,13 @@ class BirdSpeciesDataset(Dataset):
 
     def __init__(self, inputs: Dict[str, np.ndarray], targets: Dict[str, Any],
                  n_species: int = 0):
+        """Wrap preprocessed arrays as a PyTorch Dataset.
+
+        Args:
+            inputs: Dict with 'lat', 'lon', 'week' float32 arrays.
+            targets: Dict with 'species' (dense or sparse) and 'env_features'.
+            n_species: Total number of species (required when species is sparse).
+        """
         self.lat = torch.from_numpy(inputs['lat']).float()
         self.lon = torch.from_numpy(inputs['lon']).float()
         self.week = torch.from_numpy(inputs['week']).float()
@@ -418,6 +436,7 @@ class BirdSpeciesDataset(Dataset):
         return len(self.lat)
 
     def __getitem__(self, idx: int):
+        """Return (inputs_dict, targets_dict) for one sample."""
         if self.species_dense is not None:
             sp = self.species_dense[idx]
         else:

@@ -1,350 +1,122 @@
-# BirdNET Geomodel
-Code to train a geomodel for post-filtering BirdNET acoustic detections based on environmental variables and species occurrence data.
+<p align="center">
+  <img src="birdnet-logo-circle.png" width="150" alt="BirdNET Logo">
+</p>
+
+<h1 align="center">BirdNET Geomodel</h1>
+
+<p align="center">
+  <a href="https://github.com/birdnet-team/geomodel/blob/main/LICENSE"><img src="https://img.shields.io/github/license/birdnet-team/geomodel?color=blue" alt="License"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
+  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg" alt="PyTorch"></a>
+  <a href="https://birdnet-team.github.io/geomodel/"><img src="https://img.shields.io/badge/docs-mkdocs-blue.svg" alt="Documentation"></a>
+  <a href="https://github.com/birdnet-team/geomodel/actions/workflows/docs.yml"><img src="https://github.com/birdnet-team/geomodel/actions/workflows/docs.yml/badge.svg" alt="Docs"></a>
+</p>
+
+<p align="center">
+  Spatiotemporal species occurrence prediction for post-filtering BirdNET acoustic detections.<br>
+  Predicts which species are likely to occur at a given location and week of the year.
+</p>
+
+<p align="center">
+  <a href="https://birdnet-team.github.io/geomodel/"><b>Documentation</b></a> · <a href="CONTRIBUTING.md"><b>Contributing</b></a> · <a href="LICENSE"><b>License</b></a>
+</p>
 
 ## Setup
-
-1. Clone the repository and create a Python virtual environment (recommended):
 
 ```bash
 git clone https://github.com/birdnet-team/geomodel.git
 cd geomodel
-python3 -m venv .venv
-source .venv/bin/activate
-```
+python3 -m venv .venv && source .venv/bin/activate
 
-2. (Linux/Ubuntu) Install system libraries required for building geospatial packages:
+# Linux: install geospatial system libraries
+sudo apt install -y build-essential python3-dev gdal-bin libgdal-dev \
+    libproj-dev proj-data proj-bin libgeos-dev libspatialindex-dev
 
-```bash
-sudo apt update
-sudo apt install -y build-essential python3-dev gdal-bin libgdal-dev libproj-dev proj-data proj-bin libgeos-dev libspatialindex-dev
-
-# Upgrade pip/build tools
-python3 -m pip install --upgrade pip setuptools wheel
-```
-
-3. Install Python dependencies:
-
-```bash
 pip install -r requirements.txt
 ```
 
-Notes:
+Authenticate with Google Earth Engine: `earthengine authenticate`
 
-- Installing `geopandas` and related spatial libraries via pip on Linux often requires the GDAL/PROJ/GEOS development headers; step 2 installs commonly-needed packages.
-- If `pip install -r requirements.txt` fails for a package, install the package individually (for example: `pip install pyproj shapely fiona rtree pyarrow`) to reveal build errors.
-- Manylinux wheels typically provide pre-built binaries for packages such as `pyarrow` and `shapely` on common Python versions.
-
-4. Google Earth Engine (EE):
-
-- Sign up at https://earthengine.google.com/ if you don't have an account.
-- Authenticate once via `earthengine authenticate` (opens a browser).
-- In scripts, call `ee.Initialize()` (the provided `initialize_ee()` helper attempts client or service-account auth).
-
-## Pipeline Overview
-
-The full pipeline has five stages:
+## Pipeline
 
 ```
-1. geoutils.py     — Build H3 grid + sample Earth Engine environmental data
-2. gbifutils.py    — Process raw GBIF occurrence zip → filtered CSV
-3. combine.py      — Join geodata + GBIF → training parquet + taxonomy CSV
-4. train.py        — Train multi-task model → checkpoints + labels
-5. predict.py      — Inference: (lat, lon, week) → species list
+1. geoutils.py   — Build H3 grid + sample Earth Engine environmental data
+2. gbifutils.py  — Process raw GBIF occurrence archive → filtered CSV
+3. combine.py    — Join geodata + GBIF → training parquet + taxonomy CSV
+4. train.py      — Train multi-task model → checkpoints
+5. predict.py    — Inference: (lat, lon, week) → species list
 ```
-
-### Stage 1 — Earth Engine Environmental Data
-
-`utils/geoutils.py` builds an H3 hexagonal grid at a target resolution and samples per-cell environmental features from Google Earth Engine.
-
-**Environmental features per H3 cell:**
-
-| Feature | Source |
-|---|---|
-| `water_fraction` | JRC Global Surface Water (0.0–1.0) |
-| `elevation_m` | SRTM elevation (meters) |
-| `precipitation_mm` | WorldClim bioclim |
-| `temperature_c` | WorldClim bioclim |
-| `landcover_class` | MODIS LC_Type1 |
-| `canopy_height_m` | NASA/JPL canopy height |
-
-**CLI options:**
-
-| Flag | Description |
-|---|---|
-| `--km` | Target cell diameter in km (e.g. 5, 10, 25) |
-| `--out-dir` | Directory for per-chunk parquet files |
-| `--bounds` | Optional bbox or named region |
-| `--threads` | Parallel worker threads |
-| `--fraction` | Random subsample fraction (0.0–1.0) |
-| `--combine` | Merge chunks into one parquet |
-| `--combined-out` | Output path for merged file |
-| `--fill-missing` | Fill missing values with nearest-neighbor |
 
 ```bash
+# 1. Sample environmental data on H3 grid
 python utils/geoutils.py --km 350 --out-dir outputs/global_chunks \
     --threads 8 --combine --combined-out data/global_350km_ee.parquet --fill-missing
+
+# 2. Process GBIF archive
+python utils/gbifutils.py --gbif /path/to/gbif_archive.zip --file occurrence.csv \
+    --output ./outputs/gbif_processed.csv.gz --taxonomy taxonomy.csv
+
+# 3. Combine
+python utils/combine.py --geodata data/global_350km_ee.parquet \
+    --gbif ./outputs/gbif_processed.csv.gz --output ./outputs/combined.parquet
+
+# 4. Train
+python train.py --data_path ./outputs/combined.parquet --model_size medium --num_epochs 100
+
+# 5. Predict
+python predict.py --lat 50.83 --lon 12.92 --week 22
 ```
 
-### Stage 2 — GBIF Occurrence Processing
+See the [documentation](https://birdnet-team.github.io/geomodel/) for detailed usage, model architecture, and visualization scripts.
 
-`utils/gbifutils.py` reads a raw GBIF Darwin Core Archive zip, filters records, and writes a processed CSV. When a taxonomy file is provided (`--taxonomy`), only species listed in it are kept, and common names are added from the taxonomy.
+## Model
 
-**Obtaining GBIF data:**
+A multi-task neural network that learns spatial-temporal patterns from coordinates alone:
 
-1. Go to [GBIF.org](https://www.gbif.org/) and navigate to **Occurrences**
-2. Apply filters for your region / taxa of interest (e.g. class Aves, country, date range)
-3. Download the results as a **Darwin Core Archive** (`.zip`)
-4. The zip contains a tab-separated CSV (e.g. `occurrence.csv` or `0000069-*.csv`) — pass both the zip path and the CSV filename to `gbifutils.py`
+- **Input:** Raw (lat, lon, week) — circular encoding is handled inside the model
+- **Primary task:** Multi-label species classification (BCE or focal loss)
+- **Auxiliary task:** Environmental feature regression (training only, acts as regularizer)
+- **Sizes:** small (~860K), medium (~3.5M), large (~21.5M) parameters
 
-**Filters applied:**
-
-1. Drop rows with missing coordinates, date, taxonKey, or scientific name
-2. Keep only specified taxonomic classes (default: Aves, Amphibia, Insecta, Mammalia, Reptilia)
-3. Keep binomial names only (exactly 2 words — skip subspecies and higher taxa)
-4. Filter to species present in the taxonomy (when `--taxonomy` is provided)
-
-**Output columns:** `latitude`, `longitude`, `taxonKey`, `verbatimScientificName`, `commonName`, `week`, `class`
+## Visualization
 
 ```bash
-python utils/gbifutils.py \
-    --gbif /path/to/gbif_archive.zip \
-    --file occurrence.csv \
-    --output ./outputs/gbif_processed.csv.gz \
-    --taxonomy taxonomy.csv \
-    --max_rows 10000000
-```
+# Per-species weekly probability charts
+python scripts/plot_species_weeks.py --lat 50.83 --lon 12.92
 
-### Stage 3 — Combine Geodata + GBIF
+# Seasonal range maps
+python scripts/plot_range_maps.py --species "Barn Swallow" --bounds europe
 
-`utils/combine.py` joins the H3 GeoParquet (from Stage 1) with the processed GBIF CSV (from Stage 2). Each GBIF observation is mapped to its H3 cell and week, producing a combined parquet with per-week species lists.
+# Species richness heatmap
+python scripts/plot_richness.py --week 26
 
-**Outputs:**
+# Variable importance (Spearman correlations)
+python scripts/plot_variable_importance.py --species "Great Tit" --data_path data.parquet
 
-- `<output>.parquet` — Combined dataset with `h3_index`, environmental features, and `week_1`…`week_48` columns (each a list of taxonKeys)
-- `<output>_taxonomy.csv` — Taxonomy with columns: `taxonKey`, `scientificName`, `commonName`
-
-```bash
-python utils/combine.py \
-    --geodata data/global_350km_ee.parquet \
-    --gbif ./outputs/gbif_processed.csv.gz \
-    --output ./outputs/combined.parquet \
-    --valid_classes Aves Mammalia Amphibia
-```
-
-### Stage 4 — Training
-
-`train.py` loads the combined parquet, preprocesses it, and trains a multi-task neural network. The taxonomy CSV (from Stage 3) is auto-detected or can be passed via `--taxonomy` to produce a `labels.txt` in the checkpoint directory.
-
-**Model architecture:**
-
-- **Inputs:** Raw latitude, longitude, and week number — circular encoding is handled inside the model
-- **Circular encoding:** Multi-harmonic `[sin(θ), cos(θ), sin(2θ), cos(2θ), …]` applied to lat (radians), lon (radians), and week (mapped to 2π cycle). Number of harmonics is configurable (`--coord_harmonics`, `--week_harmonics`)
-- **Shared encoder:** Residual blocks with pre-norm (LayerNorm → GELU → Linear + skip connections)
-- **Species head:** Multi-label classification with residual blocks (BCE loss by default; focal loss optional)
-- **Environmental head:** Regression on env features (MSE loss, auxiliary — training only)
-- **Sizes:** small (~860K params), medium (~3.5M, default), large (~21.5M)
-
-**Environmental feature encoding:**
-
-The environmental targets are encoded according to their type:
-- **Categorical** (e.g. `landcover_class`) → one-hot encoded (NaN → all-zero)
-- **Fractions** (e.g. `water_fraction`, `urban_fraction`) → passed through as-is
-- **Continuous** (e.g. `elevation_m`, `temperature_c`) → StandardScaler normalized
-- **Constants** (e.g. `target_km`, `h3_resolution`) → dropped
-
-**Training features:**
-
-- AdamW optimizer with decoupled weight decay
-- Cosine annealing with warm restarts LR schedule
-- Automatic mixed precision (AMP) on CUDA
-- Early stopping with configurable patience
-- BCE loss for species (well-calibrated probabilities); focal loss available as option
-- Gradient clipping (max norm 1.0)
-
-**Key CLI options:**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--data_path` | `./outputs/global_350km_ee_gbif.parquet` | Combined parquet from Stage 3 |
-| `--model_size` | `medium` | `small`, `medium`, or `large` |
-| `--coord_harmonics` | `4` | Number of harmonics for lat/lon circular encoding |
-| `--week_harmonics` | `2` | Number of harmonics for week circular encoding |
-| `--batch_size` | `256` | Training batch size |
-| `--num_epochs` | `100` | Number of training epochs |
-| `--lr` | `0.001` | Learning rate |
-| `--weight_decay` | `1e-4` | AdamW weight decay |
-| `--species_loss` | `bce` | `bce` or `focal` |
-| `--focal_alpha` | `0.25` | Focal loss alpha |
-| `--focal_gamma` | `2.0` | Focal loss gamma |
-| `--species_weight` | `1.0` | Weight for species loss |
-| `--env_weight` | `0.1` | Weight for environmental MSE loss |
-| `--lr_schedule` | `cosine` | `cosine` or `none` |
-| `--lr_T0` | `10` | Cosine restart period (epochs) |
-| `--lr_min` | `1e-6` | Minimum LR for cosine schedule |
-| `--patience` | `15` | Early stopping patience (0 = disabled) |
-| `--taxonomy` | auto-detect | Path to taxonomy CSV from combine |
-| `--checkpoint_dir` | `./checkpoints` | Where to save checkpoints |
-| `--resume` | — | Resume from a checkpoint |
-
-```bash
-python train.py --data_path ./outputs/combined.parquet --model_size medium --num_epochs 50
-```
-
-**Outputs in checkpoint directory:**
-
-- `checkpoint_best.pt` — Best validation loss
-- `checkpoint_latest.pt` — Most recent epoch
-- `labels.txt` — `taxonKey<TAB>scientificName<TAB>commonName`, one line per species in vocab order
-- `training_history.json` — Loss curves
-
-### Stage 5 — Inference
-
-`predict.py` loads a checkpoint and predicts species occurrence for a given location and week. Species names are resolved from `labels.txt` (auto-detected in the checkpoint directory).
-
-Pass `--week -1` to get a **yearly** species list (the model is trained with yearly samples that aggregate all weeks).
-
-```bash
-python predict.py --lat 50.83 --lon 12.92 --week 10
-python predict.py --lat 42.44 --lon -76.50 --week 20 --top_k 20 --threshold 0.1
-python predict.py --lat 50.83 --lon 12.92 --week -1   # yearly prediction
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--checkpoint` | `checkpoints/checkpoint_best.pt` | Path to model checkpoint |
-| `--lat` | (required) | Latitude (-90 to 90) |
-| `--lon` | (required) | Longitude (-180 to 180) |
-| `--week` | (required) | Week number (1–48, or -1 for yearly) |
-| `--top_k` | `100` | Maximum species to show |
-| `--threshold` | `0.05` | Minimum probability |
-| `--device` | `auto` | `auto`, `cuda`, or `cpu` |
-
-**Example output:**
-
-```
-Predictions for lat=50.83, lon=12.92, week=10
-Rank  TaxonKey     Probability  Common Name                    Scientific Name
-----------------------------------------------------------------------------------------------------
-1     9750482      0.8312       Eurasian Blackbird             Turdus merula
-2     9809111      0.7841       Great Tit                      Parus major
-3     9809169      0.7523       Eurasian Blue Tit              Cyanistes caeruleus
-...
+# Environmental feature maps
+python scripts/plot_environmental.py --input data/global_350km_ee.parquet
 ```
 
 ## Project Structure
 
 ```
 geomodel/
-├── train.py                   # Training entry point (Stage 4)
-├── predict.py                 # Inference entry point (Stage 5)
-├── taxonomy.csv               # Master species taxonomy
-├── requirements.txt
+├── train.py                 # Training (Stage 4)
+├── predict.py               # Inference (Stage 5)
 ├── model/
-│   ├── model.py               # Neural network architecture
-│   └── loss.py                # Multi-task loss functions
+│   ├── model.py             # Neural network architecture
+│   └── loss.py              # Multi-task loss functions
 ├── utils/
-│   ├── geoutils.py            # H3 grid + Earth Engine sampling (Stage 1)
-│   ├── gbifutils.py           # GBIF occurrence processing (Stage 2)
-│   ├── combine.py             # Join geodata + GBIF (Stage 3)
-│   └── data.py                # PyTorch Dataset / DataLoader / preprocessing
-├── scripts/
-│   ├── plot_species_weeks.py       # Per-species weekly probability charts
-│   ├── plot_range_maps.py          # Species range maps (2×2 seasonal grid)
-│   ├── plot_richness.py            # Species richness map per grid cell
-│   ├── plot_variable_importance.py # Variable–species correlation bar charts
-│   └── plot_environmental.py       # Environmental feature visualization
-├── checkpoints/               # Model checkpoints + labels.txt
-├── data/                      # Input GeoParquet files
-└── outputs/                   # Processing outputs
+│   ├── geoutils.py          # H3 grid + Earth Engine (Stage 1)
+│   ├── gbifutils.py         # GBIF processing (Stage 2)
+│   ├── combine.py           # Join geodata + GBIF (Stage 3)
+│   └── data.py              # Dataset / DataLoader / preprocessing
+├── scripts/                 # Plotting scripts
+├── docs/                    # MkDocs documentation source
+└── checkpoints/             # Model checkpoints + labels.txt
 ```
-
-## Plotting
-
-### Species Occurrence Over Weeks
-
-`scripts/plot_species_weeks.py` runs inference across all 48 weeks plus the yearly prediction for a given location and generates bar charts showing each species' probability over time.
-
-```bash
-python scripts/plot_species_weeks.py --lat 50.83 --lon 12.92
-python scripts/plot_species_weeks.py --lat 42.44 --lon -76.50 --top_k 20 --threshold 0.1 --outdir outputs/plots
-```
-
-Outputs:
-- One PNG per species with weekly + yearly probability bars
-- A `summary.png` grid with the top species stacked vertically
-
-### Species Range Maps
-
-`scripts/plot_range_maps.py` generates a 2×2 map grid for each species, showing predicted occurrence probability across a lat/lon grid for weeks 1, 13, 26, and 39 (roughly Jan, Apr, Jul, Oct).
-
-```bash
-python scripts/plot_range_maps.py --species "Barn Swallow" "House Sparrow"
-python scripts/plot_range_maps.py --taxon_keys 9515886
-python scripts/plot_range_maps.py --species "Barn Swallow" --resolution 1.0 --bounds europe
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--species` | — | Species names (substring match against common/scientific) |
-| `--taxon_keys` | — | GBIF taxonKeys |
-| `--resolution` | `2.0` | Grid resolution in degrees |
-| `--bounds` | `world` | Region name or 4 floats (lon_min lat_min lon_max lat_max) |
-| `--outdir` | `outputs/plots/range_maps` | Output directory |
-
-### Species Richness Map
-
-`scripts/plot_richness.py` plots the number of species above a probability threshold per grid cell for a single week.
-
-```bash
-python scripts/plot_richness.py
-python scripts/plot_richness.py --week 13 --threshold 0.1
-python scripts/plot_richness.py --bounds europe --resolution 1.0
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--week` | `26` | Week number (1–48) |
-| `--threshold` | `0.1` | Probability threshold for counting a species as present |
-| `--resolution` | `0.5` | Grid resolution in degrees |
-| `--bounds` | `world` | Region name or 4 floats |
-
-### Variable Importance
-
-`scripts/plot_variable_importance.py` measures how each variable (lat, lon, week, and all environmental features) correlates with a species' predicted occurrence probability across training data. Produces one horizontal bar chart per species with variables sorted alphabetically for cross-species comparability.
-
-```bash
-python scripts/plot_variable_importance.py --species "Barn Swallow" \
-    --data_path /path/to/data.parquet
-python scripts/plot_variable_importance.py --species "House Sparrow" "European Robin" \
-    --data_path /path/to/data.parquet --max_samples 200000
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--species` | — | Species names (substring match) |
-| `--taxon_keys` | — | GBIF taxonKeys |
-| `--data_path` | — | Training parquet file (required) |
-| `--max_samples` | `200000` | Max samples for correlation computation |
-| `--outdir` | `outputs/plots/variable_importance` | Output directory |
-
-### Environmental Features
-
-Use `scripts/plot_environmental.py` to render PNG maps from GeoParquet outputs.
-- Key options:
-  - `--input` (`-i`): Input GeoParquet file (required)
-  - `--outdir` (`-o`): Output directory for PNGs (default: `outputs/plots`)
-  - `--sample-limit`: Max cells to plot (default: `200000`)
-  - `--columns`: Comma-separated list of columns to plot
-  - `--bounds`: Optional bbox to limit plotting area
-
-```bash
-python scripts/plot_environmental.py --input data/global_350km_ee.parquet \
-    --outdir outputs/plots --sample-limit 100000
-```
-
 
 ## Citation
-If you use this code in your research, please cite as:
 
 ```bibtex
 @article{birdnet-geomodel,

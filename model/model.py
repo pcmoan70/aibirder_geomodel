@@ -31,6 +31,11 @@ class CircularEncoding(nn.Module):
     """
 
     def __init__(self, n_harmonics: int = 1):
+        """Initialize circular encoding.
+
+        Args:
+            n_harmonics: Number of harmonic frequencies to use.
+        """
         super().__init__()
         self.n_harmonics = n_harmonics
         # Register harmonic indices [1, 2, ..., n] as a buffer (not a parameter)
@@ -62,6 +67,12 @@ class ResidualBlock(nn.Module):
     """Pre-norm residual block: LayerNorm → GELU → Linear → LayerNorm → GELU → Dropout → Linear."""
 
     def __init__(self, dim: int, dropout: float = 0.1):
+        """Initialize a residual block.
+
+        Args:
+            dim: Hidden dimension (input and output are both *dim*).
+            dropout: Dropout probability.
+        """
         super().__init__()
         self.block = nn.Sequential(
             nn.LayerNorm(dim),
@@ -74,6 +85,7 @@ class ResidualBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply residual connection: ``x + block(x)``."""
         return x + self.block(x)
 
 
@@ -109,6 +121,16 @@ class SpatioTemporalEncoder(nn.Module):
         dropout: float = 0.1,
         n_weeks: int = 48,
     ):
+        """Initialize the spatio-temporal encoder.
+
+        Args:
+            coord_harmonics: Harmonics for lat/lon circular encoding.
+            week_harmonics: Harmonics for week circular encoding.
+            embed_dim: Output embedding dimension.
+            n_blocks: Number of residual blocks.
+            dropout: Dropout probability.
+            n_weeks: Total weeks in the annual cycle.
+        """
         super().__init__()
         self.coord_harmonics = coord_harmonics
         self.week_harmonics = week_harmonics
@@ -179,6 +201,16 @@ class SpeciesPredictionHead(nn.Module):
         dropout: float = 0.2,
         bottleneck: int = 128,
     ):
+        """Initialize the species prediction head.
+
+        Args:
+            input_dim: Dimension of the encoder output.
+            n_species: Number of target species (output logits).
+            hidden_dim: Hidden dimension of residual blocks.
+            n_blocks: Number of residual blocks.
+            dropout: Dropout probability.
+            bottleneck: Low-rank bottleneck dimension before the output layer.
+        """
         super().__init__()
         self.n_species = n_species
         self.proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
@@ -193,6 +225,14 @@ class SpeciesPredictionHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project encoder output to species logits.
+
+        Args:
+            x: Encoder output of shape ``(batch, input_dim)``.
+
+        Returns:
+            Logits of shape ``(batch, n_species)``.
+        """
         x = self.proj(x)
         x = self.blocks(x)
         return self.head(x)
@@ -209,6 +249,15 @@ class EnvironmentalPredictionHead(nn.Module):
         n_blocks: int = 1,
         dropout: float = 0.1,
     ):
+        """Initialize the environmental prediction head.
+
+        Args:
+            input_dim: Dimension of the encoder output.
+            n_env_features: Number of environmental features to predict.
+            hidden_dim: Hidden dimension of residual blocks.
+            n_blocks: Number of residual blocks.
+            dropout: Dropout probability.
+        """
         super().__init__()
         self.n_env_features = n_env_features
         self.proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
@@ -221,6 +270,14 @@ class EnvironmentalPredictionHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Predict environmental features from encoder output.
+
+        Args:
+            x: Encoder output of shape ``(batch, input_dim)``.
+
+        Returns:
+            Predicted features of shape ``(batch, n_env_features)``.
+        """
         x = self.proj(x)
         x = self.blocks(x)
         return self.head(x)
@@ -257,6 +314,24 @@ class BirdNETGeoModel(nn.Module):
         species_dropout: float = 0.2,
         env_dropout: float = 0.1,
     ):
+        """Initialize the full multi-task model.
+
+        Args:
+            n_species: Number of target species.
+            n_env_features: Number of environmental features (auxiliary task).
+            coord_harmonics: Harmonics for lat/lon encoding.
+            week_harmonics: Harmonics for week encoding.
+            embed_dim: Encoder embedding dimension.
+            encoder_blocks: Number of residual blocks in the encoder.
+            species_head_dim: Hidden dim for species head.
+            species_head_blocks: Residual blocks in species head.
+            species_bottleneck: Low-rank bottleneck size.
+            env_head_dim: Hidden dim for environmental head.
+            env_head_blocks: Residual blocks in environmental head.
+            dropout: Encoder dropout.
+            species_dropout: Species head dropout.
+            env_dropout: Environmental head dropout.
+        """
         super().__init__()
         self.n_species = n_species
         self.n_env_features = n_env_features
@@ -283,6 +358,17 @@ class BirdNETGeoModel(nn.Module):
         week: torch.Tensor,
         return_env: bool = True,
     ) -> Dict[str, torch.Tensor]:
+        """Run the full model forward pass.
+
+        Args:
+            lat: Raw latitude in degrees, shape ``(batch,)``.
+            lon: Raw longitude in degrees, shape ``(batch,)``.
+            week: Week number (0–48), shape ``(batch,)``.
+            return_env: If True, also predict environmental features.
+
+        Returns:
+            Dict with ``'species_logits'`` and optionally ``'env_pred'``.
+        """
         encoded = self.encoder(lat, lon, week)
         output = {'species_logits': self.species_head(encoded)}
         if return_env:
@@ -293,6 +379,17 @@ class BirdNETGeoModel(nn.Module):
         self, lat: torch.Tensor, lon: torch.Tensor, week: torch.Tensor,
         threshold: float = 0.5,
     ) -> torch.Tensor:
+        """Return binary species predictions at the given threshold.
+
+        Args:
+            lat: Latitude tensor.
+            lon: Longitude tensor.
+            week: Week tensor.
+            threshold: Probability threshold for a positive prediction.
+
+        Returns:
+            Binary tensor of shape ``(batch, n_species)``.
+        """
         self.eval()
         with torch.no_grad():
             probs = torch.sigmoid(
@@ -303,6 +400,16 @@ class BirdNETGeoModel(nn.Module):
     def get_species_probabilities(
         self, lat: torch.Tensor, lon: torch.Tensor, week: torch.Tensor,
     ) -> torch.Tensor:
+        """Return sigmoid probabilities for all species.
+
+        Args:
+            lat: Latitude tensor.
+            lon: Longitude tensor.
+            week: Week tensor.
+
+        Returns:
+            Probability tensor of shape ``(batch, n_species)``.
+        """
         self.eval()
         with torch.no_grad():
             return torch.sigmoid(
