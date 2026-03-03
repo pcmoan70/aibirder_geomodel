@@ -12,14 +12,14 @@ python convert.py --formats all                      # everything
 
 ## Supported Formats
 
-| Format | Flag | Description |
-|---|---|---|
-| ONNX FP32 | `onnx` | Full-precision ONNX model |
-| ONNX FP16 | `onnx_fp16` | Half-precision ONNX (default) |
-| TFLite FP32 | `tflite` | TensorFlow Lite, full precision |
-| TFLite FP16 | `tflite_fp16` | TensorFlow Lite, half precision |
-| TFLite INT8 | `tflite_int8` | TensorFlow Lite, dynamic-range quantisation |
-| TF SavedModel | `tf` | TensorFlow SavedModel directory |
+| Format | Flag | Size (medium) | Description |
+|---|---|---|---|
+| ONNX FP32 | `onnx` | ~19 MB | Full-precision ONNX model |
+| ONNX FP16 | `onnx_fp16` | ~9 MB | Half-precision ONNX (default) |
+| TFLite FP32 | `tflite` | ~19 MB | TensorFlow Lite, full precision |
+| TFLite FP16 | `tflite_fp16` | ~10 MB | TensorFlow Lite, half precision |
+| TFLite INT8 | `tflite_int8` | ~5 MB | TensorFlow Lite, dynamic-range quantisation |
+| TF SavedModel | `tf` | ~19 MB | TensorFlow SavedModel directory |
 
 Use `--formats all` to export everything at once.
 
@@ -83,16 +83,11 @@ The script will print a clear error message if a required package is missing —
 
 ```
 exports/
-├── geomodel.onnx           # ONNX FP32
-├── geomodel.onnx.data       # ONNX FP32 external weights
+├── geomodel.onnx             # ONNX FP32
 ├── geomodel_fp16.onnx       # ONNX FP16
-├── geomodel_fp16.onnx.data  # ONNX FP16 external weights
 ├── geomodel.tflite          # TFLite FP32
 ├── geomodel_fp16.tflite     # TFLite FP16
 ├── geomodel_int8.tflite     # TFLite INT8
 ├── saved_model/             # TF SavedModel
 └── labels.txt               # Species vocabulary (copied from checkpoint dir)
 ```
-
-!!! note "ONNX external data"
-    PyTorch's ONNX exporter stores large models with external data files (`.onnx.data`).  Both the `.onnx` and `.onnx.data` files are needed for inference.

@@ -138,6 +138,13 @@ def _export_onnx(wrapper: ExportWrapper, ref_inputs: np.ndarray,
         opset_version=18,
     )
 
+    # Merge external data into a single .onnx file
+    data_path = Path(str(path) + ".data")
+    if data_path.exists():
+        model_proto = onnx.load(str(path), load_external_data=True)
+        data_path.unlink()
+        onnx.save(model_proto, str(path), save_as_external_data=False)
+
     if fp16:
         from onnxconverter_common import float16
         model_fp32 = onnx.load(str(path))
@@ -157,9 +164,6 @@ def _export_onnx(wrapper: ExportWrapper, ref_inputs: np.ndarray,
                    tol=0.05 if fp16 else tol)  # FP16 gets wider tolerance
 
     total_bytes = path.stat().st_size
-    data_path = Path(str(path) + ".data")
-    if data_path.exists():
-        total_bytes += data_path.stat().st_size
     size_mb = total_bytes / (1024 * 1024)
     print(f"  File size: {size_mb:.1f} MB")
     return ok
