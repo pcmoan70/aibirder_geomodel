@@ -83,10 +83,13 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 
 **data.py** - PyTorch Dataset:
 - `BirdSpeciesDataset`: PyTorch Dataset wrapper with sparse-to-dense conversion
+  - Optional `jitter_std` (degrees) adds Gaussian noise to lat/lon on each draw
+  - Lat clamped to [-90, 90], lon wrapped at ±180°
 - `FractionalRandomSampler`: Sampler that draws a deterministic random subset of
   training indices each epoch (seed `42 + epoch`). Used when `sample_fraction < 1`.
 - `create_dataloaders()`: Creates training and validation DataLoaders
   - Accepts `sample_fraction` (0–1]; uses `FractionalRandomSampler` when < 1
+  - Accepts `jitter_std`; applied to training set only (val is never jittered)
   - Val loader always uses all validation samples
 
 **geoutils.py**: Google Earth Engine feature extraction for H3 cells
@@ -202,6 +205,7 @@ the PyTorch reference model.  Default format is ONNX FP16.
 5. Normalize environmental features → Auxiliary targets
 6. Split by location → Train/Val/Test sets
 7. Create PyTorch DataLoaders → Batched sampling
+   - `--jitter` adds Gaussian noise to training lat/lon (scale from H3 cell size)
 8. Training loop:
    - Forward pass: raw (lat, lon, week) → spatial encoding + FiLM temporal conditioning → (species_logits, env_pred)
    - Compute multi-task loss (AN + MSE)

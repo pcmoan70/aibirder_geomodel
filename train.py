@@ -418,6 +418,12 @@ def run_autotune(args, device: torch.device):
         include_yearly=not args.no_yearly,
     )
 
+    # Coordinate jitter
+    jitter_std = 0.0
+    if args.jitter:
+        jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
+        print(f"   Coordinate jitter: ±{jitter_std:.4f}° std")
+
     print("3. Preprocessing...")
     preprocessor = H3DataPreprocessor()
     inputs, targets = preprocessor.prepare_training_data(
@@ -458,6 +464,7 @@ def run_autotune(args, device: torch.device):
             pin_memory=(device.type == 'cuda'),
             n_species=n_species,
             sample_fraction=args.sample_fraction,
+            jitter_std=jitter_std,
         )
 
         # Fresh model
@@ -625,6 +632,9 @@ def main():
     parser.add_argument('--no_yearly', action='store_true',
                         help='Exclude week-0 (yearly) samples from training. '
                              'Year-round predictions are computed by averaging all 48 weeks at inference.')
+    parser.add_argument('--jitter', action='store_true',
+                        help='Jitter training coordinates within H3 cells each epoch '
+                             '(Gaussian noise scaled to cell size, augments spatial inputs)')
 
     # LR schedule
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],
@@ -697,6 +707,8 @@ def main():
         print(f"  Obs cap:    {args.max_obs_per_species} per species")
     if args.ocean_sample_rate < 1.0:
         print(f"  Ocean:      keep {args.ocean_sample_rate:.0%} of high-water cells")
+    if args.jitter:
+        print(f"  Jitter:     enabled (Gaussian noise within H3 cells)")
     print(f"  Device:     {device}")
 
     # -- Data loading & preprocessing ---
@@ -709,6 +721,12 @@ def main():
         ocean_sample_rate=args.ocean_sample_rate,
         include_yearly=not args.no_yearly,
     )
+
+    # Coordinate jitter
+    jitter_std = 0.0
+    if args.jitter:
+        jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
+        print(f"   Coordinate jitter: ±{jitter_std:.4f}° std")
 
     print("3. Preprocessing...")
     preprocessor = H3DataPreprocessor()
@@ -739,6 +757,7 @@ def main():
         pin_memory=(device.type == 'cuda'),
         n_species=n_species,
         sample_fraction=args.sample_fraction,
+        jitter_std=jitter_std,
     )
 
     # -- Model ---

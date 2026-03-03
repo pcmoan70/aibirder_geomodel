@@ -64,6 +64,7 @@ The training script handles the full pipeline automatically:
 | `--max_obs_per_species` | `0` | Cap observations per species (0 = no cap) |
 | `--ocean_sample_rate` | `0.1` | Fraction of high-water cells to keep (1.0 = keep all) |
 | `--no_yearly` | off | Exclude week-0 (yearly) samples from training |
+| `--jitter` | off | Jitter training coordinates within H3 cells each epoch |
 
 ### Learning Rate Schedule
 
@@ -97,6 +98,14 @@ When `--sample_fraction` is less than 1.0, a `FractionalRandomSampler` is used o
 - **Validation and test sets are unaffected** — they always use all samples.
 - **Different subset each epoch** — the model sees different data every epoch, improving coverage over time.
 - **Deterministic** — epoch *e* uses seed `42 + e`, so results are reproducible across runs.
+
+#### Coordinate jitter
+
+When `--jitter` is passed, Gaussian noise is added to training coordinates every time a sample is drawn.  The noise standard deviation is derived automatically from the H3 cell resolution (40 % of the average edge length in degrees), so most jittered points stay inside their originating cell.
+
+- **Validation and test sets are never jittered** — they always use exact cell centres.
+- **Each draw is independent** — the same sample receives different noise every epoch.
+- Latitude is clamped to $[-90, 90]$; longitude wraps at $\pm 180°$.
 
 ### Checkpoints
 

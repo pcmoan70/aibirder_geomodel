@@ -66,6 +66,19 @@ class H3DataLoader:
         lons = np.array([c[1] for c in coords])
         return lats, lons
 
+    @staticmethod
+    def compute_jitter_std(h3_cells: np.ndarray) -> float:
+        """Compute coordinate jitter std (degrees) from H3 cell resolution.
+
+        Returns a standard deviation equal to 40 % of the average hexagon
+        edge length (converted to degrees).  With Gaussian noise at this
+        scale, ~95 % of jittered points remain inside the originating cell.
+        """
+        res = h3.get_resolution(h3_cells[0])
+        edge_km = h3.average_hexagon_edge_length(res, unit='km')
+        edge_deg = edge_km / 111.0  # approximate km → degree conversion
+        return edge_deg * 0.4
+
     def get_environmental_features(self) -> pd.DataFrame:
         """Return the environmental feature columns as a DataFrame."""
         self._require_loaded()
@@ -509,18 +522,23 @@ class BirdSpeciesDataset(Dataset):
     """
 
     def __init__(self, inputs: Dict[str, np.ndarray], targets: Dict[str, Any],
-                 n_species: int = 0):
+                 n_species: int = 0, jitter_std: float = 0.0):
         """Wrap preprocessed arrays as a PyTorch Dataset.
 
         Args:
             inputs: Dict with 'lat', 'lon', 'week' float32 arrays.
             targets: Dict with 'species' (dense or sparse) and 'env_features'.
             n_species: Total number of species (required when species is sparse).
+            jitter_std: Standard deviation (degrees) of Gaussian noise added
+                to lat/lon coordinates each time a sample is drawn.  Set to
+                0.0 to disable (default).  Typically derived from H3 cell
+                resolution via ``H3DataLoader.compute_jitter_std``.
         """
         self.lat = torch.from_numpy(inputs['lat']).float()
         self.lon = torch.from_numpy(inputs['lon']).float()
         self.week = torch.from_numpy(inputs['week']).float()
         self.env_features = torch.from_numpy(targets['env_features']).float()
+        self.jitter_std = jitter_std
 
         species = targets['species']
         if isinstance(species, np.ndarray):
@@ -541,6 +559,14 @@ class BirdSpeciesDataset(Dataset):
 
     def __getitem__(self, idx: int):
         """Return (inputs_dict, targets_dict) for one sample."""
+        lat = self.lat[idx]
+        lon = self.lon[idx]
+
+        if self.jitter_std > 0:
+            noise = torch.randn(2) * self.jitter_std
+            lat = (lat + noise[0]).clamp(-90.0, 90.0)
+            lon = ((lon + noise[1] + 180.0) % 360.0) - 180.0
+
         if self.species_dense is not None:
             sp = self.species_dense[idx]
         else:
@@ -550,7 +576,7 @@ class BirdSpeciesDataset(Dataset):
             if len(indices) > 0:
                 sp[indices] = 1.0
         return (
-            {'lat': self.lat[idx], 'lon': self.lon[idx], 'week': self.week[idx]},
+            {'lat': lat, 'lon': lon, 'week': self.week[idx]},
             {'species': sp, 'env_features': self.env_features[idx]},
         )
 
@@ -591,14 +617,19 @@ def create_dataloaders(
     pin_memory: bool = True,
     n_species: int = 0,
     sample_fraction: float = 1.0,
+    jitter_std: float = 0.0,
 ) -> Tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
     Args:
         sample_fraction: Fraction of training samples to use per epoch
             (0–1]. Each epoch draws a fresh random subset.
+        jitter_std: Gaussian noise std (degrees) added to training
+            coordinates each time a sample is drawn.  Validation
+            coordinates are never jittered.
     """
-    train_ds = BirdSpeciesDataset(train_inputs, train_targets, n_species=n_species)
+    train_ds = BirdSpeciesDataset(train_inputs, train_targets,
+                                  n_species=n_species, jitter_std=jitter_std)
     val_ds = BirdSpeciesDataset(val_inputs, val_targets, n_species=n_species)
 
     if sample_fraction < 1.0:
