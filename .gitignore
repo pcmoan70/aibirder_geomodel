@@ -1,3 +1,6 @@
+# Exclude export outputs
+exports/
+
 # Exclude plots
 outputs/plots/
 
