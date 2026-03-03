@@ -73,7 +73,7 @@ def _make_reference_inputs(n: int = 200) -> np.ndarray:
     rng = np.random.RandomState(42)
     lats = rng.uniform(-90, 90, size=n).astype(np.float32)
     lons = rng.uniform(-180, 180, size=n).astype(np.float32)
-    weeks = rng.randint(0, 49, size=n).astype(np.float32)  # 0–48
+    weeks = rng.randint(1, 49, size=n).astype(np.float32)  # 1–48
     return np.stack([lats, lons, weeks], axis=1)
 
 
@@ -350,7 +350,7 @@ def convert(
         n_env_features=model_config["n_env_features"],
         model_size=model_config["model_size"],
         coord_harmonics=model_config.get("coord_harmonics", 4),
-        week_harmonics=model_config.get("week_harmonics", 2),
+        week_harmonics=model_config.get("week_harmonics", 4),
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(dev)

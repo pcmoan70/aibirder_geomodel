@@ -31,12 +31,12 @@ NUM_WEEKS = 48
 
 def predict_all_weeks(checkpoint_path: str, lat: float, lon: float, device: str = 'auto'):
     """
-    Run inference for all 48 weeks plus the yearly (week 0) prediction.
+    Run inference for all 48 weeks.
 
     Returns:
         idx_to_species: dict mapping model index → taxonKey
         labels: dict mapping model index → (sciName, comName)
-        probs: np.ndarray of shape (49, n_species) — rows 0–47 = weeks 1–48, row 48 = yearly
+        probs: np.ndarray of shape (48, n_species) — rows 0–47 = weeks 1–48
     """
     if device == 'auto':
         dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -53,23 +53,22 @@ def predict_all_weeks(checkpoint_path: str, lat: float, lon: float, device: str 
         n_env_features=model_config['n_env_features'],
         model_size=model_config['model_size'],
         coord_harmonics=model_config.get('coord_harmonics', 4),
-        week_harmonics=model_config.get('week_harmonics', 2),
+        week_harmonics=model_config.get('week_harmonics', 4),
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(dev)
     model.eval()
 
-    # Batch all 48 weeks + yearly (week 0) — pass raw values
-    n_total = NUM_WEEKS + 1
-    weeks = np.concatenate([np.arange(1, NUM_WEEKS + 1), [0]])  # 1..48, 0
+    # Batch all 48 weeks — pass raw values
+    weeks = np.arange(1, NUM_WEEKS + 1)  # 1..48
 
-    lat_batch = torch.full((n_total,), lat, dtype=torch.float32, device=dev)
-    lon_batch = torch.full((n_total,), lon, dtype=torch.float32, device=dev)
+    lat_batch = torch.full((NUM_WEEKS,), lat, dtype=torch.float32, device=dev)
+    lon_batch = torch.full((NUM_WEEKS,), lon, dtype=torch.float32, device=dev)
     week_batch = torch.from_numpy(weeks).float().to(dev)
 
     with torch.no_grad():
         output = model(lat_batch, lon_batch, week_batch, return_env=False)
-        probs = torch.sigmoid(output['species_logits']).cpu().numpy()  # (49, n_species)
+        probs = torch.sigmoid(output['species_logits']).cpu().numpy()  # (48, n_species)
 
     # Load labels
     labels_path = Path(checkpoint_path).parent / 'labels.txt'
@@ -90,9 +89,9 @@ def plot_species_weeks(
     """Generate per-species bar charts of probability across 48 weeks."""
     idx_to_species, labels, probs = predict_all_weeks(checkpoint_path, lat, lon, device)
 
-    # probs shape: (49, n_species) — rows 0–47 = weeks 1–48, row 48 = yearly
-    weekly_probs = probs[:NUM_WEEKS]   # (48, n_species)
-    yearly_probs = probs[NUM_WEEKS]    # (n_species,)
+    # probs shape: (48, n_species) — rows 0–47 = weeks 1–48
+    weekly_probs = probs                          # (48, n_species)
+    yearly_probs = weekly_probs.max(axis=0)       # (n_species,)  max across weeks
 
     weeks = np.arange(1, NUM_WEEKS + 1)
 

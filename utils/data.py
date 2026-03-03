@@ -75,12 +75,13 @@ class H3DataLoader:
         self,
         ocean_sample_rate: float = 1.0,
         water_threshold: float = 0.9,
+        include_yearly: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[List[int]], pd.DataFrame]:
         """
         Flatten H3-cell × weeks to individual (lat, lon, week, species, env) samples.
 
-        For each cell, creates 48 weekly samples (week 1–48) plus one yearly
-        sample (week 0) whose species list is the union of all weeks.
+        For each cell, creates 48 weekly samples (week 1–48) and optionally
+        one yearly sample (week 0) whose species list is the union of all weeks.
 
         Args:
             ocean_sample_rate: Fraction of high-water cells to keep (0–1).
@@ -88,6 +89,8 @@ class H3DataLoader:
                 randomly kept at this rate.  Default 1.0 (keep all).
             water_threshold: ``water_fraction`` above which a cell is
                 considered ocean.  Default 0.9.
+            include_yearly: If True (default), include a week-0 yearly sample
+                per cell.  Set to False to train on weekly data only.
 
         Returns:
             lats, lons, weeks, species_lists, env_features
@@ -121,12 +124,14 @@ class H3DataLoader:
             gdf_iter = self.gdf
 
         n_weeks = 48
-        samples_per_cell = n_weeks + 1  # 48 weekly + 1 yearly
+        samples_per_cell = n_weeks + (1 if include_yearly else 0)
 
         lats = np.repeat(cell_lats, samples_per_cell)
         lons = np.repeat(cell_lons, samples_per_cell)
-        # Week order per cell: 1..48, 0 (yearly)
-        week_pattern = np.concatenate([np.arange(1, n_weeks + 1), [0]])
+        # Week order per cell: 1..48 (and optionally 0 for yearly)
+        week_pattern = np.arange(1, n_weeks + 1)
+        if include_yearly:
+            week_pattern = np.concatenate([week_pattern, [0]])
         weeks = np.tile(week_pattern, n_cells)
 
         species_lists: List = []
@@ -137,7 +142,8 @@ class H3DataLoader:
                 species_lists.append(sp)
                 if hasattr(sp, '__iter__'):
                     yearly_species.update(sp)
-            species_lists.append(list(yearly_species))
+            if include_yearly:
+                species_lists.append(list(yearly_species))
 
         env_features_df = pd.DataFrame(
             np.repeat(env_data.values, samples_per_cell, axis=0),

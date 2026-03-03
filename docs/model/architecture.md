@@ -32,16 +32,17 @@ graph TD
     A --> D
 
     subgraph Encoder
-        E[Concatenate]
+        E["Concatenate lat + lon"]
         F[Linear Projection]
-        G["Residual Blocks × N"]
+        G["Residual Block × N"]
+        FiLM["FiLM: γ × block + β"]
         H[LayerNorm]
     end
 
     B --> E
     C --> E
-    D --> E
-    E --> F --> G --> H
+    D --> FiLM
+    E --> F --> G --> FiLM --> H
 
     subgraph Heads
         I["Species Head<br/>(multi-label classification)"]
@@ -66,19 +67,20 @@ $$
 
 - **Latitude**: degrees → radians, then encoded with `coord_harmonics` harmonics (default 4 → 8 features)
 - **Longitude**: same as latitude (8 features)
-- **Week**: mapped to $[0, 2\pi)$ over 48 weeks, then encoded with `week_harmonics` harmonics (default 2 → 4 features)
+- **Week**: mapped to $[0, 2\pi)$ over 48 weeks, then encoded with `week_harmonics` harmonics (default 4 → 8 features)
 
-Total input features: $2 \times (2 \times \text{coord\_harmonics} + \text{week\_harmonics})$ = 20 by default.
+Spatial input features: $2 \times 2 \times \text{coord\_harmonics}$ = 16 by default.  Week features (8) are used for FiLM conditioning rather than concatenated.
 
-For **yearly samples** (week = 0), the week encoding is zeroed out so the model predicts year-round occurrence.
+Year-round predictions (week 0) are computed at inference time as the **max** across all 48 weekly predictions — no special week-0 encoding is needed.
 
 ### Shared Encoder (`SpatioTemporalEncoder`)
 
-The encoder transforms the 20-dimensional circular encoding into a rich embedding:
+The encoder maps spatial coordinates into a rich embedding, **modulated by temporal information** via FiLM (Feature-wise Linear Modulation):
 
-1. **Linear projection** to `embed_dim` (default 512)
+1. **Spatial projection**: Concatenated lat+lon circular features → Linear to `embed_dim` (default 512)
 2. **Residual blocks** — each block applies LayerNorm → GELU → Linear → LayerNorm → GELU → Dropout → Linear with a skip connection
-3. **Final LayerNorm** for stable downstream processing
+3. **FiLM conditioning** — after each residual block, the week encoding generates per-block scale (γ) and shift (β) parameters: $x' = \gamma \cdot \text{block}(x) + \beta$.  This forces the model to actively modulate spatial representations based on the time of year.
+4. **Final LayerNorm** for stable downstream processing
 
 The pre-norm residual design ensures stable training and strong gradient flow even with many blocks.
 
@@ -101,9 +103,9 @@ A regression head that predicts normalized environmental features (elevation, te
 
 | Size | Embed Dim | Encoder Blocks | Species Head | Bottleneck | Approx. Parameters |
 |------|-----------|----------------|--------------|------------|-------------------|
-| `small` | 256 | 3 | 256, 1 block | 64 | ~860K + species |
-| `medium` | 512 | 4 | 512, 2 blocks | 128 | ~3.5M + species |
-| `large` | 1024 | 6 | 1024, 3 blocks | 256 | ~21.5M + species |
+| `small` | 256 | 3 | 256, 1 block | 64 | ~1.8M + species |
+| `medium` | 512 | 4 | 512, 2 blocks | 128 | ~7.2M + species |
+| `large` | 1024 | 6 | 1024, 3 blocks | 256 | ~36.5M + species |
 
 The "+ species" part scales with the number of species in the vocabulary (bottleneck × n_species parameters).
 
@@ -112,7 +114,7 @@ The "+ species" part scales with the number of species in the vocabulary (bottle
 | Parameter | Default | Effect |
 |---|---|---|
 | `--coord_harmonics` | 4 | Higher values capture finer spatial patterns (more harmonics) |
-| `--week_harmonics` | 2 | Higher values capture sharper weekly transitions |
+| `--week_harmonics` | 4 | Higher values capture sharper weekly transitions |
 
 !!! tip "Choosing harmonics"
-    The default values (4 coordinate, 2 week) work well for global models. Higher harmonics add capacity for finer-grained spatial patterns but increase input dimensionality and risk overfitting on small datasets.
+    The default values (4 coordinate, 4 week) work well for global models. Higher harmonics add capacity for finer-grained patterns but increase input dimensionality and risk overfitting on small datasets.

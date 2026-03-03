@@ -25,13 +25,14 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
   - Each coordinate → [sin(θ), cos(θ), sin(2θ), cos(2θ), …, sin(nθ), cos(nθ)]
   - Default `coord_harmonics=4` → 8 features per coordinate (16 total for lat+lon)
   - Preserves spherical continuity (e.g., -180° and 180° longitude map to same point)
-- **Temporal**: Week number (0-48; 1-48 for weekly, 0 for yearly/all-year)
+- **Temporal**: Week number (1-48)
   - Uses **multi-harmonic circular encoding** for cyclical representation
-  - Default `week_harmonics=2` → 4 features
+  - Default `week_harmonics=4` → 8 features
   - Ensures week 48 and week 1 are treated as adjacent
-  - Week 0 (yearly samples) → encoding zeroed out
+  - Temporal signal modulates spatial embedding via **FiLM conditioning**
+    (Feature-wise Linear Modulation: γ × spatial + β per residual block)
 
-**Total Input Features**: 20 (16 for coordinates + 4 for week)
+**Total Input Features**: 16 spatial (lat+lon) + 8 temporal (week FiLM)
 
 **Training Targets:**
 - **Primary target**: Species list (GBIF taxonKeys) for that location/week combination
@@ -48,6 +49,7 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - Only predict species lists for a given location (lat/lon) and week
 - Environmental features are NOT used as input or predicted during inference
 - The model relies on learned patterns from coordinates and temporal information
+- Yearly (week 0) predictions: max of predictions across all 48 weeks
 
 ### Key Design Principles
 1. Environmental data is used during training only (as auxiliary targets, not inputs)
@@ -103,10 +105,10 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 2. **ResidualBlock**: Pre-norm residual block
    - LayerNorm → GELU → Linear → LayerNorm → GELU → Dropout → Linear + skip connection
 
-3. **SpatioTemporalEncoder**: Shared encoder processing raw (lat, lon, week)
-   - Input: Raw lat, lon (degrees), week (0-48)
-   - Internal circular encoding: lat→8, lon→8, week→4 = 20 features
-   - Linear projection to embed_dim → residual blocks → LayerNorm
+3. **SpatioTemporalEncoder**: Shared encoder with FiLM temporal conditioning
+   - Spatial: lat→8, lon→8 = 16 features → Linear projection to embed_dim
+   - Temporal: week→8 features → per-block FiLM generators produce (γ, β)
+   - Residual blocks modulated by FiLM: block(x) * γ + β
    - Output: embed_dim-dimensional embedding (default 512)
 
 4. **SpeciesPredictionHead**: Multi-label classification head (primary task)
@@ -127,9 +129,9 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
    - `get_species_probabilities()`: Get occurrence probabilities
 
 **Model Sizes:**
-- Small: ~860K parameters, embed_dim=256, encoder: 3 blocks
-- Medium: ~3.5M parameters, embed_dim=512, encoder: 4 blocks (default)
-- Large: ~21.5M parameters, embed_dim=1024, encoder: 6 blocks
+- Small: ~1.8M parameters, embed_dim=256, encoder: 3 blocks
+- Medium: ~7.2M parameters, embed_dim=512, encoder: 4 blocks (default)
+- Large: ~36.5M parameters, embed_dim=1024, encoder: 6 blocks
 
 **loss.py** - Loss Functions:
 - `AssumeNegativeLoss`: Default loss — LAN-full strategy (Cole et al., 2023) for presence-only data
@@ -193,6 +195,7 @@ the PyTorch reference model.  Default format is ONNX FP16.
 **Training:**
 1. Load H3 cell data from parquet → GeoPandas DataFrame
 2. Flatten to (cell, week) samples → Extract lat/lon, species, env features
+   - `--no_yearly` excludes week-0 samples (recommended for temporal learning)
 3. Build species vocabulary → Multi-label sparse encoding
 4. Downsample ocean cells (default: keep 10% of cells with water_fraction > 0.9)
 5. Cap observations per species (if configured) → Reduce common-species dominance
@@ -200,14 +203,14 @@ the PyTorch reference model.  Default format is ONNX FP16.
 6. Split by location → Train/Val/Test sets
 7. Create PyTorch DataLoaders → Batched sampling
 8. Training loop:
-   - Forward pass: raw (lat, lon, week) → circular encoding (inside model) → (species_logits, env_pred)
+   - Forward pass: raw (lat, lon, week) → spatial encoding + FiLM temporal conditioning → (species_logits, env_pred)
    - Compute multi-task loss (AN + MSE)
    - Backward pass with AMP and gradient clipping
    - Update model parameters
 9. Save checkpoints periodically and when validation improves
 
 **Inference:**
-1. Accept raw (lat, lon, week) input
+1. Accept raw (lat, lon, week) input (week 1–48; week 0 = max across all 48)
 2. Forward pass through model (encoding is internal)
 3. Apply sigmoid → species probabilities
 4. Threshold or return top-k species

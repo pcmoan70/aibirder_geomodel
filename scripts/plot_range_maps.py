@@ -128,7 +128,7 @@ def load_model_and_labels(checkpoint_path: str, device: torch.device):
         n_env_features=model_config['n_env_features'],
         model_size=model_config['model_size'],
         coord_harmonics=model_config.get('coord_harmonics', 4),
-        week_harmonics=model_config.get('week_harmonics', 2),
+        week_harmonics=model_config.get('week_harmonics', 4),
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(device)

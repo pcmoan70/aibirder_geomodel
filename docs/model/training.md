@@ -23,7 +23,7 @@ python train.py \
 The training script handles the full pipeline automatically:
 
 1. **Load data** — read combined parquet file
-2. **Flatten** — expand H3 cells × 48 weeks into individual samples (plus 1 yearly sample per cell)
+2. **Flatten** — expand H3 cells × 48 weeks into individual samples
 3. **Preprocess** — build species vocabulary, normalize environmental features
 4. **Split** — location-based train/val/test split (prevents spatial data leakage)
 5. **Train** — multi-task training with checkpointing
@@ -43,7 +43,7 @@ The training script handles the full pipeline automatically:
 |---|---|---|
 | `--model_size` | `medium` | `small`, `medium`, or `large` |
 | `--coord_harmonics` | `4` | Harmonics for lat/lon encoding |
-| `--week_harmonics` | `2` | Harmonics for week encoding |
+| `--week_harmonics` | `4` | Harmonics for week encoding |
 
 ### Training
 
@@ -63,6 +63,7 @@ The training script handles the full pipeline automatically:
 | `--label_smoothing` | `0.01` | Smooth binary targets to prevent overconfidence (0 = off) |
 | `--max_obs_per_species` | `0` | Cap observations per species (0 = no cap) |
 | `--ocean_sample_rate` | `0.1` | Fraction of high-water cells to keep (1.0 = keep all) |
+| `--no_yearly` | off | Exclude week-0 (yearly) samples from training |
 
 ### Learning Rate Schedule
 
@@ -87,7 +88,7 @@ The training script handles the full pipeline automatically:
 | `--val_size` | `0.1` | Validation set fraction |
 | `--sample_fraction` | `1.0` | Fraction of training samples per epoch (0–1) |
 
-Splitting is **location-based**: all 49 samples from one H3 cell (48 weeks + 1 yearly) go to the same split, preventing spatial data leakage.  The split uses a fixed random seed (`42`) for reproducibility.
+Splitting is **location-based**: all samples from one H3 cell go to the same split, preventing spatial data leakage.  The split uses a fixed random seed (`42`) for reproducibility.
 
 #### Sample fraction
 

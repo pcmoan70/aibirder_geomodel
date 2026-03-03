@@ -77,21 +77,30 @@ def predict(
         n_env_features=model_config['n_env_features'],
         model_size=model_config['model_size'],
         coord_harmonics=model_config.get('coord_harmonics', 4),
-        week_harmonics=model_config.get('week_harmonics', 2),
+        week_harmonics=model_config.get('week_harmonics', 4),
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(dev)
     model.eval()
 
-    # Raw inputs — the model handles circular encoding internally
-    lat_t = torch.tensor([lat], dtype=torch.float32, device=dev)
-    lon_t = torch.tensor([lon], dtype=torch.float32, device=dev)
-    week_t = torch.tensor([week], dtype=torch.float32, device=dev)
-
-    # Predict
-    with torch.no_grad():
-        output = model(lat_t, lon_t, week_t, return_env=False)
-        probs = torch.sigmoid(output['species_logits']).cpu().numpy()[0]
+    # Yearly (week 0): average predictions across all 48 weeks
+    if week == 0:
+        import numpy as np
+        lat_batch = torch.full((48,), lat, dtype=torch.float32, device=dev)
+        lon_batch = torch.full((48,), lon, dtype=torch.float32, device=dev)
+        week_batch = torch.arange(1, 49, dtype=torch.float32, device=dev)
+        with torch.no_grad():
+            output = model(lat_batch, lon_batch, week_batch, return_env=False)
+            probs = torch.sigmoid(output['species_logits']).cpu().numpy()  # (48, n_species)
+        probs = probs.max(axis=0)  # yearly = max across weeks
+    else:
+        # Raw inputs — the model handles circular encoding internally
+        lat_t = torch.tensor([lat], dtype=torch.float32, device=dev)
+        lon_t = torch.tensor([lon], dtype=torch.float32, device=dev)
+        week_t = torch.tensor([week], dtype=torch.float32, device=dev)
+        with torch.no_grad():
+            output = model(lat_t, lon_t, week_t, return_env=False)
+            probs = torch.sigmoid(output['species_logits']).cpu().numpy()[0]
 
     # Load labels file (auto-detect from checkpoint dir)
     labels_path = Path(checkpoint_path).parent / 'labels.txt'

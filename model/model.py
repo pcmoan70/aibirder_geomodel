@@ -95,27 +95,32 @@ class ResidualBlock(nn.Module):
 
 class SpatioTemporalEncoder(nn.Module):
     """
-    Shared encoder that accepts **raw** latitude, longitude, and week number
-    and encodes them internally via multi-harmonic circular encoding before
-    projecting into *embed_dim* and passing through residual blocks.
+    Shared encoder that maps raw (lat, lon, week) to an embedding via
+    multi-harmonic circular encoding and FiLM temporal conditioning.
+
+    **Spatial** features (lat, lon) are projected into *embed_dim* and
+    processed by residual blocks.  **Temporal** features (week) are
+    encoded separately and used to generate per-block FiLM (Feature-wise
+    Linear Modulation) scale and shift parameters that modulate the
+    spatial representation.  This forces the network to actively use
+    temporal information rather than relying on a weak concatenated signal.
 
     Inputs (all per-sample):
         lat  : float in [-90, 90]
         lon  : float in [-180, 180]
-        week : int in {0, 1, …, 48}  (0 = yearly / all-year)
+        week : int in {1, …, 48}
 
     Internal encoding produces:
         lat  → CircularEncoding(lat_rad)  → 2 * coord_harmonics features
         lon  → CircularEncoding(lon_rad)  → 2 * coord_harmonics features
         week → CircularEncoding(week_rad) → 2 * week_harmonics features
-                                             (zeroed when week == 0)
-    Total input features = 2 * (2 * coord_harmonics + week_harmonics)
+                → FiLM generators produce (γ, β) per residual block
     """
 
     def __init__(
         self,
         coord_harmonics: int = 4,
-        week_harmonics: int = 2,
+        week_harmonics: int = 4,
         embed_dim: int = 512,
         n_blocks: int = 4,
         dropout: float = 0.1,
@@ -135,17 +140,27 @@ class SpatioTemporalEncoder(nn.Module):
         self.coord_harmonics = coord_harmonics
         self.week_harmonics = week_harmonics
         self.n_weeks = n_weeks
+        self.n_blocks = n_blocks
 
         self.lat_enc = CircularEncoding(coord_harmonics)
         self.lon_enc = CircularEncoding(coord_harmonics)
         self.week_enc = CircularEncoding(week_harmonics)
 
-        input_dim = self.lat_enc.output_dim + self.lon_enc.output_dim + self.week_enc.output_dim
+        spatial_dim = self.lat_enc.output_dim + self.lon_enc.output_dim
+        week_dim = self.week_enc.output_dim
 
-        self.input_proj = nn.Linear(input_dim, embed_dim)
-        self.blocks = nn.Sequential(
-            *[ResidualBlock(embed_dim, dropout) for _ in range(n_blocks)]
+        self.input_proj = nn.Linear(spatial_dim, embed_dim)
+        self.blocks = nn.ModuleList(
+            [ResidualBlock(embed_dim, dropout) for _ in range(n_blocks)]
         )
+        # FiLM: one (γ, β) pair per residual block, generated from week encoding
+        self.film_generators = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(week_dim, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, 2 * embed_dim),  # (γ, β)
+            ) for _ in range(n_blocks)
+        ])
         self.norm = nn.LayerNorm(embed_dim)
         self.output_dim = embed_dim
 
@@ -154,7 +169,7 @@ class SpatioTemporalEncoder(nn.Module):
         Parameters:
             lat:  (batch,) raw latitude in degrees [-90, 90]
             lon:  (batch,) raw longitude in degrees [-180, 180]
-            week: (batch,) week number (1–48, or 0 for yearly)
+            week: (batch,) week number (1–48)
         """
         # Convert degrees → radians
         lat_rad = lat * (math.pi / 180.0)
@@ -167,13 +182,17 @@ class SpatioTemporalEncoder(nn.Module):
         lon_features = self.lon_enc(lon_rad)    # (batch, 2*coord_harmonics)
         week_features = self.week_enc(week_rad) # (batch, 2*week_harmonics)
 
-        # Zero out week encoding for yearly samples (week == 0)
-        yearly_mask = (week == 0).unsqueeze(1)  # (batch, 1)
-        week_features = week_features.masked_fill(yearly_mask, 0.0)
-
-        x = torch.cat([lat_features, lon_features, week_features], dim=1)
+        # Spatial projection
+        x = torch.cat([lat_features, lon_features], dim=1)
         x = self.input_proj(x)
-        x = self.blocks(x)
+
+        # FiLM-conditioned residual blocks
+        for block, film_gen in zip(self.blocks, self.film_generators):
+            film = film_gen(week_features)        # (batch, 2*embed_dim)
+            gamma, beta = film.chunk(2, dim=1)    # each (batch, embed_dim)
+            gamma = gamma + 1.0                   # centre around identity
+            x = block(x) * gamma + beta
+
         return self.norm(x)
 
 
@@ -302,7 +321,7 @@ class BirdNETGeoModel(nn.Module):
         n_species: int,
         n_env_features: int,
         coord_harmonics: int = 4,
-        week_harmonics: int = 2,
+        week_harmonics: int = 4,
         embed_dim: int = 512,
         encoder_blocks: int = 4,
         species_head_dim: int = 512,
@@ -426,7 +445,7 @@ def create_model(
     n_env_features: int,
     model_size: str = 'medium',
     coord_harmonics: int = 4,
-    week_harmonics: int = 2,
+    week_harmonics: int = 4,
 ) -> BirdNETGeoModel:
     """Create model with predefined size configuration."""
     configs = {
