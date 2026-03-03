@@ -173,6 +173,12 @@ python train.py \
 Loads a checkpoint and predicts species probabilities for arbitrary (lat, lon, week) inputs.
 Supports CSV output, top-k filtering, and global grid prediction with chunked output.
 
+### Model Export (`convert.py`)
+
+Converts a PyTorch checkpoint to portable inference formats (ONNX, TFLite, TF SavedModel)
+with FP16 and INT8 quantisation options.  Each conversion is automatically validated against
+the PyTorch reference model.  Default format is ONNX FP16.
+
 ### Data Flow
 
 **Training:**
@@ -203,6 +209,7 @@ Supports CSV output, top-k filtering, and global grid prediction with chunked ou
 geomodel/
 ├── train.py                    # Training script
 ├── predict.py                  # Inference script
+├── convert.py                  # Model export (ONNX, TFLite, TF SavedModel)
 ├── model/
 │   ├── __init__.py
 │   ├── model.py                # Neural network architecture
