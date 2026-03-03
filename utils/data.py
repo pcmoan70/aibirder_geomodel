@@ -217,14 +217,20 @@ class H3DataPreprocessor:
             feature_names.append(col)
 
         # 3) Continuous — StandardScaler
+        #    NaN positions are preserved so the loss can skip them rather
+        #    than predicting a meaningless placeholder value.
         if self._continuous_cols:
             cont = env_features[self._continuous_cols].copy()
-            cont = cont.fillna(cont.mean())
+            nan_mask = cont.isna()  # remember original NaN positions
+            cont_filled = cont.fillna(cont.mean())  # fill for scaler fitting
             if fit:
-                scaled = self.env_scaler.fit_transform(cont)
+                scaled = self.env_scaler.fit_transform(cont_filled)
             else:
-                scaled = self.env_scaler.transform(cont)
-            parts.append(np.nan_to_num(scaled, nan=0.0).astype(np.float32))
+                scaled = self.env_scaler.transform(cont_filled)
+            scaled = scaled.astype(np.float32)
+            if nan_mask.values.any():
+                scaled[nan_mask.values] = np.nan  # restore NaN
+            parts.append(scaled)
             feature_names.extend(self._continuous_cols)
 
         if fit:

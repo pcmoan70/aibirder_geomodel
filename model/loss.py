@@ -147,6 +147,24 @@ class AssumeNegativeLoss(nn.Module):
         return self.pos_lambda * pos_loss + neg_loss
 
 
+def masked_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Mean squared error that ignores NaN positions in *target*.
+
+    Environmental feature targets may contain NaN where data was missing.
+    This function computes the MSE only over valid (non-NaN) elements so the
+    model is not penalised for predicting placeholder values.
+
+    Returns zero if there are no valid elements in the batch.
+    """
+    valid = ~torch.isnan(target)
+    if valid.all():
+        return F.mse_loss(pred, target)
+    n_valid = valid.sum()
+    if n_valid == 0:
+        return pred.new_tensor(0.0)
+    return F.mse_loss(pred[valid], target[valid])
+
+
 class MultiTaskLoss(nn.Module):
     """
     Weighted multi-task loss: species (AN, BCE, or focal) + environmental (MSE).
@@ -198,8 +216,6 @@ class MultiTaskLoss(nn.Module):
                 label_smoothing=label_smoothing,
             )
 
-        self.env_criterion = nn.MSELoss(reduction=reduction)
-
     def forward(
         self,
         predictions: Dict[str, torch.Tensor],
@@ -234,7 +250,7 @@ class MultiTaskLoss(nn.Module):
         losses: Dict[str, torch.Tensor] = {'species': species_loss, 'total': total}
 
         if compute_env_loss and 'env_pred' in predictions:
-            env_loss = self.env_criterion(predictions['env_pred'], targets['env_features'])
+            env_loss = masked_mse(predictions['env_pred'], targets['env_features'])
             losses['env'] = env_loss
             losses['total'] = total + self.env_weight * env_loss
 

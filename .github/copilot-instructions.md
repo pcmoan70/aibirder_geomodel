@@ -9,7 +9,7 @@ This project builds a spatiotemporal species occurrence prediction model for bir
 Each row represents an H3 cell and contains:
 - **h3_index**: H3 geospatial hexagonal grid cell identifier
 - **Environmental features**: Multiple geographic/environmental attributes for the cell (elevation, climate data, land cover, etc.)
-  - **Note**: Contains NaN values that are currently filled with column means (temporary workaround)
+  - May contain NaN values (handled via masked MSE loss during training)
 - **48 week columns** (week_1 through week_48): Each column contains a list of GBIF taxonKeys representing bird species observed in that cell during that specific week of the year
 
 ### GBIF TaxonKeys
@@ -70,7 +70,9 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - `encode_coordinates()`: Stores raw lat/lon (encoding done inside the model)
 - `encode_weeks()`: Stores raw week numbers (encoding done inside the model)
 - `normalize_environmental_features()`: Normalizes env features with StandardScaler
-  - **TODO**: Current implementation fills NaN values with column means — temporary workaround
+  - Categorical columns → one-hot encoded (NaN → all-zero row)
+  - Fraction columns → passed through as-is (NaN → 0)
+  - Continuous columns → StandardScaler (NaN positions preserved for masked MSE loss)
 - `build_species_vocabulary()`: Creates vocabulary of all unique GBIF taxonKeys
 - `encode_species_multilabel()`: Converts species lists to multi-label sparse format
 - `prepare_training_data()`: Complete preprocessing pipeline
@@ -133,6 +135,7 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
   - Total Loss = species_weight × species_loss + env_weight × MSE
   - Species loss: `an` (assume-negative, default), `bce`, or `focal`
   - Default weights: species=1.0, env=0.1
+  - Environmental MSE uses `masked_mse()` to skip NaN targets
 - `compute_pos_weights()`: Calculate class weights from training data
 - `focal_loss()`: Alternative loss for severe class imbalance
 
@@ -148,7 +151,10 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
   - `checkpoint_latest.pt`: Latest model state
   - `checkpoint_best.pt`: Best validation loss
 - `labels.txt`: Species vocabulary (taxonKey → scientific name → common name)
-- `training_history.json`: Per-epoch loss and LR history
+- `training_history.json`: Per-epoch loss, LR, and evaluation metrics
+- Evaluation metrics computed during validation:
+  - Mean Average Precision (mAP)
+  - Top-k recall at k=10 and k=30
 - Progress tracking with tqdm
 - GPU/CPU support with automatic device selection
 
@@ -210,6 +216,7 @@ geomodel/
 │   ├── plot_species_weeks.py   # Weekly probability charts
 │   ├── plot_range_maps.py      # Species distribution maps (static PNG or animated GIF)
 │   ├── plot_richness.py        # Species richness heatmaps
+│   ├── plot_training.py        # Training loss curves and metrics
 │   ├── plot_variable_importance.py  # Feature importance analysis
 │   └── plot_environmental.py   # Environmental feature visualization
 ├── docs/                       # MkDocs documentation
@@ -220,15 +227,7 @@ geomodel/
 
 ## Known Issues & TODOs
 
-### Data
-- **TODO**: Improve NaN handling in environmental features
-  - Current: Filling with column means (temporary workaround)
-  - Better: Use model-based imputation or handle missingness explicitly
-  - Location: `utils/data.py::normalize_environmental_features()`
-
-### Future Enhancements
-- Evaluation metrics (Precision, Recall, F1, mAP)
-- Training visualization (loss curves, prediction maps)
+*None at this time.*
 
 ## Project Goals
 - Predict which bird species are likely to occur in specific locations (H3 cells) during specific weeks of the year

@@ -69,6 +69,7 @@ class Trainer:
         self.history = {
             'train_loss': [], 'train_species_loss': [], 'train_env_loss': [],
             'val_loss': [], 'val_species_loss': [], 'val_env_loss': [],
+            'val_map': [], 'val_top10_recall': [], 'val_top30_recall': [],
             'lr': [],
         }
         self.best_val_loss = float('inf')
@@ -126,17 +127,26 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """Run a validation pass (no gradients).
+        """Run a validation pass with evaluation metrics.
 
-        Args:
-            val_loader: DataLoader yielding (inputs, targets) batches.
+        Computes loss terms and species-prediction quality metrics:
+        - **top-k recall** at k=10 and k=30: fraction of true positives
+          ranked in the model's top-k predictions.
+        - **mAP** (mean average precision): mean per-sample AP, measuring
+          how well the model ranks true positives above negatives.
 
         Returns:
-            Dict with average 'loss', 'species_loss', and 'env_loss'.
+            Dict with 'loss', 'species_loss', 'env_loss', 'map',
+            'top10_recall', and 'top30_recall'.
         """
         self.model.eval()
         total_loss = total_species = total_env = 0.0
         n_batches = 0
+
+        # Metric accumulators
+        total_hits_10 = total_hits_30 = total_positives = 0
+        ap_sum = 0.0
+        ap_count = 0
 
         for inputs, targets in tqdm(val_loader, desc=f'Epoch {self.current_epoch + 1} [Val]  '):
             lat = inputs['lat'].to(self.device, non_blocking=True)
@@ -154,8 +164,46 @@ class Trainer:
             total_env += losses['env'].item()
             n_batches += 1
 
-        return {'loss': total_loss / n_batches, 'species_loss': total_species / n_batches,
-                'env_loss': total_env / n_batches}
+            # --- Species prediction metrics ---
+            logits = outputs['species_logits'].float()
+            probs = torch.sigmoid(logits)
+            pos_mask = species_t > 0.5
+            n_pos = pos_mask.sum(dim=1)  # (B,)
+            has_pos = n_pos > 0
+
+            if has_pos.any():
+                # Top-k recall
+                for k, acc in [(10, 'hits_10'), (30, 'hits_30')]:
+                    if probs.shape[1] >= k:
+                        topk_idx = probs.topk(k, dim=1).indices
+                        topk_mask = torch.zeros_like(probs, dtype=torch.bool)
+                        topk_mask.scatter_(1, topk_idx, True)
+                        hits = (topk_mask & pos_mask)[has_pos].sum(dim=1).float()
+                        if acc == 'hits_10':
+                            total_hits_10 += hits.sum().item()
+                        else:
+                            total_hits_30 += hits.sum().item()
+                total_positives += n_pos[has_pos].sum().item()
+
+                # Per-sample average precision
+                sorted_idx = probs[has_pos].argsort(dim=1, descending=True)
+                sorted_targets = pos_mask[has_pos].float().gather(1, sorted_idx)
+                tp_cum = sorted_targets.cumsum(dim=1)
+                ranks = torch.arange(1, probs.shape[1] + 1, device=probs.device).float().unsqueeze(0)
+                precision_at_k = tp_cum / ranks
+                sample_ap = (precision_at_k * sorted_targets).sum(dim=1) / n_pos[has_pos].float()
+                ap_sum += sample_ap.sum().item()
+                ap_count += has_pos.sum().item()
+
+        metrics = {
+            'loss': total_loss / n_batches,
+            'species_loss': total_species / n_batches,
+            'env_loss': total_env / n_batches,
+            'map': ap_sum / max(ap_count, 1),
+            'top10_recall': total_hits_10 / max(total_positives, 1),
+            'top30_recall': total_hits_30 / max(total_positives, 1),
+        }
+        return metrics
 
     # -- checkpointing ----------------------------------------------------
 
@@ -231,45 +279,54 @@ class Trainer:
         print(f"  Batch size: {train_loader.batch_size}  |  Batches/epoch: {len(train_loader)}\n")
 
         start_epoch = self.current_epoch
-        for epoch in range(start_epoch, start_epoch + num_epochs):
-            self.current_epoch = epoch
-            train_m = self.train_epoch(train_loader)
-            val_m = self.validate(val_loader)
+        try:
+            for epoch in range(start_epoch, start_epoch + num_epochs):
+                self.current_epoch = epoch
+                train_m = self.train_epoch(train_loader)
+                val_m = self.validate(val_loader)
 
-            if self.scheduler is not None:
-                self.scheduler.step()
+                if self.scheduler is not None:
+                    self.scheduler.step()
 
-            lr = self.optimizer.param_groups[0]['lr']
-            self.history['lr'].append(lr)
-            for k in ('loss', 'species_loss', 'env_loss'):
-                self.history[f'train_{k}'].append(train_m[k])
-                self.history[f'val_{k}'].append(val_m[k])
+                lr = self.optimizer.param_groups[0]['lr']
+                self.history['lr'].append(lr)
+                for k in ('loss', 'species_loss', 'env_loss'):
+                    self.history[f'train_{k}'].append(train_m[k])
+                    self.history[f'val_{k}'].append(val_m[k])
+                for k in ('map', 'top10_recall', 'top30_recall'):
+                    self.history[f'val_{k}'].append(val_m[k])
 
-            print(f"\nEpoch {epoch + 1} — lr={lr:.2e}  "
-                  f"Train: {train_m['loss']:.4f} (sp={train_m['species_loss']:.4f} env={train_m['env_loss']:.4f})  "
-                  f"Val: {val_m['loss']:.4f} (sp={val_m['species_loss']:.4f} env={val_m['env_loss']:.4f})")
+                print(f"\nEpoch {epoch + 1} \u2014 lr={lr:.2e}  "
+                      f"Train: {train_m['loss']:.4f} (sp={train_m['species_loss']:.4f} env={train_m['env_loss']:.4f})  "
+                      f"Val: {val_m['loss']:.4f} (sp={val_m['species_loss']:.4f} env={val_m['env_loss']:.4f})")
+                print(f"  Metrics: mAP={val_m['map']:.4f}  "
+                      f"top-10={val_m['top10_recall']:.4f}  "
+                      f"top-30={val_m['top30_recall']:.4f}")
 
-            is_best = val_m['loss'] < self.best_val_loss
-            if is_best:
-                self.best_val_loss = val_m['loss']
-                self._epochs_no_improve = 0
-            else:
-                self._epochs_no_improve += 1
+                is_best = val_m['loss'] < self.best_val_loss
+                if is_best:
+                    self.best_val_loss = val_m['loss']
+                    self._epochs_no_improve = 0
+                else:
+                    self._epochs_no_improve += 1
 
-            if (epoch + 1) % save_every == 0 or is_best:
-                self.save_checkpoint(is_best=is_best)
+                if (epoch + 1) % save_every == 0 or is_best:
+                    self.save_checkpoint(is_best=is_best)
 
-            # Early stopping
-            if self.patience and self._epochs_no_improve >= self.patience:
-                print(f"\nEarly stopping — no improvement for {self.patience} epochs")
-                self.save_checkpoint(is_best=False)
-                break
+                # Early stopping
+                if self.patience and self._epochs_no_improve >= self.patience:
+                    print(f"\nEarly stopping \u2014 no improvement for {self.patience} epochs")
+                    self.save_checkpoint(is_best=False)
+                    break
+        except KeyboardInterrupt:
+            print(f"\n\nInterrupted at epoch {self.current_epoch + 1} \u2014 saving checkpoint and history...")
+            self.save_checkpoint(is_best=False)
 
         # Save final history
         with open(self.checkpoint_dir / 'training_history.json', 'w') as f:
             json.dump(self.history, f, indent=2)
 
-        print(f"\nTraining complete — best val loss: {self.best_val_loss:.4f}")
+        print(f"\nTraining complete \u2014 best val loss: {self.best_val_loss:.4f}")
         print(f"Checkpoints: {self.checkpoint_dir}")
 
 
@@ -298,14 +355,14 @@ def main():
                         help='Species loss function: an (assume-negative, default), bce, or focal')
     parser.add_argument('--focal_alpha', type=float, default=0.25)
     parser.add_argument('--focal_gamma', type=float, default=2.0)
-    parser.add_argument('--pos_lambda', type=float, default=32.0,
-                        help='Positive up-weighting λ for assume-negative loss (default: 32)')
-    parser.add_argument('--neg_samples', type=int, default=192,
-                        help='Number of negative species to sample per example for AN loss (default: 192, 0=all)')
-    parser.add_argument('--label_smoothing', type=float, default=0.05,
-                        help='Smooth binary targets to prevent overconfident predictions (default: 0.05, 0=off)')
-    parser.add_argument('--max_obs_per_species', type=int, default=1000,
-                        help='Cap observations per species to reduce common-species dominance (default: 1000, 0=no cap)')
+    parser.add_argument('--pos_lambda', type=float, default=16.0,
+                        help='Positive up-weighting λ for assume-negative loss (default: 16)')
+    parser.add_argument('--neg_samples', type=int, default=512,
+                        help='Number of negative species to sample per example for AN loss (default: 512, 0=all)')
+    parser.add_argument('--label_smoothing', type=float, default=0.01,
+                        help='Smooth binary targets to prevent overconfident predictions (default: 0.01, 0=off)')
+    parser.add_argument('--max_obs_per_species', type=int, default=0,
+                        help='Cap observations per species to reduce common-species dominance (default: 0, 0=no cap)')
 
     # LR schedule
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],

@@ -9,7 +9,10 @@ The `scripts/` directory contains plotting tools for analyzing model predictions
 | [Species Weeks](species-weeks.md) | Per-species weekly probability curves | Yes | No |
 | [Range Maps](range-maps.md) | Seasonal distribution maps per species (PNG or animated GIF) | Yes | No |
 | [Richness Maps](richness.md) | Species richness heatmap for a given week | Yes | No |
+| [Training Curves](training-curves.md) | Loss curves, LR schedule, mAP, recall | No | No* |
 | [Variable Importance](variable-importance.md) | Spearman correlation bar charts | Yes | Yes |
+
+\* Requires `training_history.json` from a completed training run.
 
 ## Common Options
 

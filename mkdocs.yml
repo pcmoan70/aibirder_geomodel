@@ -97,6 +97,7 @@ nav:
       - Species Weeks: plotting/species-weeks.md
       - Range Maps: plotting/range-maps.md
       - Richness Maps: plotting/richness.md
+      - Training Curves: plotting/training-curves.md
       - Variable Importance: plotting/variable-importance.md
   - API Reference:
       - model: api/model.md

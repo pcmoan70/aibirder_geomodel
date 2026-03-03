@@ -183,6 +183,10 @@ $$
 
 The environmental MSE loss regularizes the spatial embedding. Default weights: species=1.0, env=0.1.
 
+Environmental features with missing values (NaN) are excluded from the MSE
+computation via masked loss — the model is not penalised for positions where
+the ground truth is unknown.
+
 ## Training Features
 
 ### Automatic Mixed Precision (AMP)
@@ -200,9 +204,21 @@ The trainer saves:
 - `checkpoint_latest.pt` — after every save interval and on early stopping
 - `checkpoint_best.pt` — whenever validation loss improves
 - `labels.txt` — species vocabulary (taxonKey → scientific name → common name)
-- `training_history.json` — per-epoch loss and learning rate history
+- `training_history.json` — per-epoch losses, learning rate, and evaluation metrics
 
 Each checkpoint contains the full model state, optimizer state, scheduler state, AMP scaler, and species vocabulary — everything needed to resume training or run inference.
+
+### Evaluation Metrics
+
+During each validation epoch, the following metrics are computed and recorded:
+
+| Metric | Description |
+|---|---|
+| **mAP** | Mean per-sample average precision — measures how well positive species are ranked above negatives |
+| **Top-10 recall** | Fraction of true positives appearing in the model's 10 highest-probability predictions |
+| **Top-30 recall** | Fraction of true positives in the top 30 predictions |
+
+Metrics are printed after each epoch and saved in `training_history.json`. Use [`scripts/plot_training.py`](../plotting/training-curves.md) to visualise them.
 
 ## Resuming Training
 
