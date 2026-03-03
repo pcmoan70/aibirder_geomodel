@@ -73,12 +73,21 @@ class H3DataLoader:
 
     def flatten_to_samples(
         self,
+        ocean_sample_rate: float = 1.0,
+        water_threshold: float = 0.9,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[List[int]], pd.DataFrame]:
         """
         Flatten H3-cell × weeks to individual (lat, lon, week, species, env) samples.
 
         For each cell, creates 48 weekly samples (week 1–48) plus one yearly
         sample (week 0) whose species list is the union of all weeks.
+
+        Args:
+            ocean_sample_rate: Fraction of high-water cells to keep (0–1).
+                Cells whose ``water_fraction`` exceeds *water_threshold* are
+                randomly kept at this rate.  Default 1.0 (keep all).
+            water_threshold: ``water_fraction`` above which a cell is
+                considered ocean.  Default 0.9.
 
         Returns:
             lats, lons, weeks, species_lists, env_features
@@ -89,6 +98,28 @@ class H3DataLoader:
         cell_lats, cell_lons = self.h3_to_latlon(self.get_h3_cells())
 
         n_cells = len(self.gdf)
+
+        # --- Optional ocean downsampling ---
+        if ocean_sample_rate < 1.0 and 'water_fraction' in self.gdf.columns:
+            rng = np.random.default_rng(42)
+            wf = self.gdf['water_fraction'].fillna(0.0).values
+            is_ocean = wf > water_threshold
+            keep = ~is_ocean | (rng.random(n_cells) < ocean_sample_rate)
+            n_dropped = (~keep).sum()
+            if n_dropped > 0:
+                print(f"   Ocean downsampling: keeping {keep.sum():,}/{n_cells:,} cells "
+                      f"(dropped {n_dropped:,} with water_fraction > {water_threshold})")
+                cell_lats = cell_lats[keep]
+                cell_lons = cell_lons[keep]
+                env_data = env_data.iloc[keep.nonzero()[0]].reset_index(drop=True)
+                # Filter GeoDataFrame rows for iterrows below
+                gdf_iter = self.gdf.iloc[keep.nonzero()[0]]
+                n_cells = keep.sum()
+            else:
+                gdf_iter = self.gdf
+        else:
+            gdf_iter = self.gdf
+
         n_weeks = 48
         samples_per_cell = n_weeks + 1  # 48 weekly + 1 yearly
 
@@ -99,7 +130,7 @@ class H3DataLoader:
         weeks = np.tile(week_pattern, n_cells)
 
         species_lists: List = []
-        for _, row in self.gdf.iterrows():
+        for _, row in gdf_iter.iterrows():
             yearly_species: set = set()
             for w in range(1, n_weeks + 1):
                 sp = row[f'week_{w}']

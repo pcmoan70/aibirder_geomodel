@@ -363,6 +363,8 @@ def main():
                         help='Smooth binary targets to prevent overconfident predictions (default: 0.01, 0=off)')
     parser.add_argument('--max_obs_per_species', type=int, default=0,
                         help='Cap observations per species to reduce common-species dominance (default: 0, 0=no cap)')
+    parser.add_argument('--ocean_sample_rate', type=float, default=0.1,
+                        help='Fraction of ocean cells (water_fraction > 0.9) to keep (default: 0.1, 1.0=keep all)')
 
     # LR schedule
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],
@@ -416,6 +418,8 @@ def main():
     print(f"  Loss:       {loss_desc}")
     if args.max_obs_per_species > 0:
         print(f"  Obs cap:    {args.max_obs_per_species} per species")
+    if args.ocean_sample_rate < 1.0:
+        print(f"  Ocean:      keep {args.ocean_sample_rate:.0%} of high-water cells")
     print(f"  Device:     {device}")
 
     # -- Data loading & preprocessing ---
@@ -424,7 +428,9 @@ def main():
     loader.load_data()
 
     print("2. Flattening to samples...")
-    lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples()
+    lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
+        ocean_sample_rate=args.ocean_sample_rate,
+    )
 
     print("3. Preprocessing...")
     preprocessor = H3DataPreprocessor()

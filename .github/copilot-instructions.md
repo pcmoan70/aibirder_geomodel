@@ -130,7 +130,7 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 **loss.py** - Loss Functions:
 - `AssumeNegativeLoss`: Default loss — LAN-full strategy (Cole et al., 2023) for presence-only data
   - Up-weights positives by λ, samples M negatives per example
-  - Default: λ=32, M=192, label_smoothing=0.05
+  - Default: λ=16, M=512, label_smoothing=0.01
 - `MultiTaskLoss`: Weighted combination of species loss + environmental MSE
   - Total Loss = species_weight × species_loss + env_weight × MSE
   - Species loss: `an` (assume-negative, default), `bce`, or `focal`
@@ -179,7 +179,8 @@ Supports CSV output, top-k filtering, and global grid prediction with chunked ou
 1. Load H3 cell data from parquet → GeoPandas DataFrame
 2. Flatten to (cell, week) samples → Extract lat/lon, species, env features
 3. Build species vocabulary → Multi-label sparse encoding
-4. Cap observations per species (default 1000) → Reduce common-species dominance
+4. Downsample ocean cells (default: keep 10% of cells with water_fraction > 0.9)
+5. Cap observations per species (if configured) → Reduce common-species dominance
 5. Normalize environmental features → Auxiliary targets
 6. Split by location → Train/Val/Test sets
 7. Create PyTorch DataLoaders → Batched sampling

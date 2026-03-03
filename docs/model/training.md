@@ -58,10 +58,11 @@ The training script handles the full pipeline automatically:
 | `--species_loss` | `an` | Loss function: `an` (assume-negative, default), `bce`, or `focal` |
 | `--focal_alpha` | `0.25` | Focal loss alpha (only with `--species_loss focal`) |
 | `--focal_gamma` | `2.0` | Focal loss gamma |
-| `--pos_lambda` | `32.0` | Positive up-weighting λ for AN loss |
-| `--neg_samples` | `192` | Negative species to sample per example for AN loss (0 = all) |
-| `--label_smoothing` | `0.05` | Smooth binary targets to prevent overconfidence (0 = off) |
-| `--max_obs_per_species` | `1000` | Cap observations per species (0 = no cap) |
+| `--pos_lambda` | `16.0` | Positive up-weighting λ for AN loss |
+| `--neg_samples` | `512` | Negative species to sample per example for AN loss (0 = all) |
+| `--label_smoothing` | `0.01` | Smooth binary targets to prevent overconfidence (0 = off) |
+| `--max_obs_per_species` | `0` | Cap observations per species (0 = no cap) |
+| `--ocean_sample_rate` | `0.1` | Fraction of high-water cells to keep (1.0 = keep all) |
 
 ### Learning Rate Schedule
 
@@ -147,19 +148,20 @@ This is the default loss. To tune parameters:
 ```bash
 python train.py \
     --species_loss an \
-    --pos_lambda 32 \
-    --neg_samples 192 \
-    --max_obs_per_species 1000
+    --pos_lambda 16 \
+    --neg_samples 512 \
+    --label_smoothing 0.01
 ```
 
 **Recommended settings for ~13,000 species:**
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `--pos_lambda` | 32 | Balances positive/negative gradient; increase if recall too low |
-| `--neg_samples` | 192 | 0 = use all negatives (exact but slow); 192 works well for 13K species |
-| `--label_smoothing` | 0.05 | Prevents overconfident predictions; set 0 to disable |
-| `--max_obs_per_species` | 1000 | Prevents common species from dominating training |
+| `--pos_lambda` | 16 | Balances positive/negative gradient; increase if recall too low |
+| `--neg_samples` | 512 | 0 = use all negatives (exact but slow); 512 works well for 13K species |
+| `--label_smoothing` | 0.01 | Prevents overconfident predictions; set 0 to disable |
+| `--max_obs_per_species` | 0 | Cap observations per species; 0 = no cap |
+| `--ocean_sample_rate` | 0.1 | Downsample high-water cells; 1.0 = keep all |
 
 ### Observation Cap
 

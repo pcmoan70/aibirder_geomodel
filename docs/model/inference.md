@@ -24,13 +24,13 @@ Sylvia atricapilla              Eurasian Blackcap               0.9203
 |---|---|---|
 | `--lat` | required | Latitude (-90 to 90) |
 | `--lon` | required | Longitude (-180 to 180) |
-| `--week` | required | Week number (1–48) |
+| `--week` | required | Week number (1–48, or -1 for yearly) |
 | `--checkpoint` | `checkpoints/checkpoint_best.pt` | Model checkpoint |
-| `--top_k` | — | Show only the top K species |
-| `--threshold` | — | Show only species above this probability |
+| `--top_k` | `100` | Show only the top K species |
+| `--threshold` | `0.15` | Show only species above this probability |
 | `--device` | `auto` | `auto`, `cuda`, or `cpu` |
 
-If neither `--top_k` nor `--threshold` is specified, all species are shown sorted by probability.
+Results are filtered by both `--top_k` and `--threshold` (taking the intersection).
 
 ## Programmatic Usage
 
