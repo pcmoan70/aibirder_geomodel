@@ -48,7 +48,7 @@ The training script handles the full pipeline automatically:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--batch_size` | `1024` | Batch size |
+| `--batch_size` | `512` | Batch size |
 | `--num_epochs` | `50` | Maximum epochs |
 | `--lr` | `0.001` | Initial learning rate |
 | `--weight_decay` | `0.001` | AdamW (Loshchilov & Hutter, 2019) weight decay |
@@ -65,7 +65,7 @@ The training script handles the full pipeline automatically:
 | `--label_smoothing` | `0.05` | Smooth binary targets to prevent overconfidence (0 = off) |
 | `--max_obs_per_species` | `100000` | Cap observations per species (0 = no cap) |
 | `--min_obs_per_species` | `100` | Exclude species with fewer than N observations (0 = keep all) |
-| `--ocean_sample_rate` | `0.1` | Fraction of high-water cells to keep (1.0 = keep all) |
+| `--ocean_sample_rate` | `1.0` | Fraction of ocean cells (water > 90%) to keep (1.0 = keep all) |
 | `--no_yearly` | off | Exclude week-0 (yearly) samples from training |
 | `--jitter` | off | Jitter training coordinates within H3 cells each epoch |
 | `--label_freq_weight` | off | Weight positive labels by species frequency |
@@ -279,6 +279,10 @@ the ground truth is unknown.
 
 On CUDA GPUs, training automatically uses float16 for forward/backward passes (with float32 master weights). This roughly doubles throughput with negligible accuracy impact.
 
+### GPU Memory Management
+
+On CUDA devices, training configures PyTorch's memory allocator to use **expandable segments** (`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`).  This lets the allocator grow and shrink memory blocks dynamically instead of reserving large contiguous chunks upfront, reducing fragmentation and allowing the GPU to share memory more cleanly with other processes.
+
 ### Gradient Clipping
 
 Gradients are clipped to max norm 1.0 to prevent training instability from occasional large gradients.
@@ -337,6 +341,7 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 | `lr_T0` | {1, 5, 10, 20} |
 | `jitter` | {true, false} |
 | `max_obs_per_species` | {0, 500, 1000, 2000, 5000} |
+| `min_obs_per_species` | {0, 10, 50, 100, 200, 500} |
 | `no_yearly` | {true, false} |
 | `species_loss` | {asl, an, bce, focal} |
 | `asl_gamma_neg` | 1.0 → 8.0 |
@@ -346,7 +351,7 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 | `week_harmonics` | 2 → 8 (integer) |
 
 !!! note "Data-affecting parameters"
-    When `max_obs_per_species` or `no_yearly` are included in the tuning set, data is re-preprocessed each trial.  This is slower but necessary because these parameters change the training samples.
+    When `max_obs_per_species`, `min_obs_per_species`, or `no_yearly` are included in the tuning set, data is re-preprocessed each trial.  This is slower but necessary because these parameters change the training samples or vocabulary.
 
 ### Autotune CLI
 

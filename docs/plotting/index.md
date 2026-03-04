@@ -11,10 +11,13 @@ The `scripts/` directory contains plotting tools for analyzing model predictions
 | [Richness Maps](richness.md) | Species richness heatmap for a given week | Yes | Optional* |
 | [Training Curves](training-curves.md) | Loss curves, LR schedule, mAP, recall | No | No** |
 | [Variable Importance](variable-importance.md) | Spearman correlation bar charts | Yes | Yes |
+| [Environmental](environmental.md) | Environmental feature maps from H3 grid data | No | Yes*** |
 
 \* Pass `--data_path` with the training parquet to show ground truth alongside predictions.
 
 \*\* Requires `training_history.json` from a completed training run.
+
+\*\*\* Requires a GeoParquet file produced by `utils/geoutils.py` (not the combined training parquet).
 
 ## Common Options
 

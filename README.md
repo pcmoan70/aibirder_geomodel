@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/birdnet-team/geomodel/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
+  <a href=\"https://www.python.org/\"><img src=\"https://img.shields.io/badge/python-3.10+-blue.svg\" alt=\"Python 3.10+\"></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg" alt="PyTorch"></a>
   <a href="https://birdnet-team.github.io/geomodel/"><img src="https://img.shields.io/badge/docs-mkdocs-blue.svg" alt="Documentation"></a>
   <a href="https://github.com/birdnet-team/geomodel/actions/workflows/docs.yml"><img src="https://github.com/birdnet-team/geomodel/actions/workflows/docs.yml/badge.svg" alt="Docs"></a>
@@ -76,7 +76,7 @@ A multi-task neural network that learns spatial-temporal patterns from coordinat
 - **Input:** Raw (lat, lon, week) — circular encoding is handled inside the model
 - **Primary task:** Multi-label species classification (asymmetric loss)
 - **Auxiliary task:** Environmental feature regression (training only, acts as regularizer)
-- **Scalable:** ~1.5M (scale=0.5) to ~47M (scale=2.0) parameters (default scale=1.0 ≈ 7M)
+- **Scalable:** ~1.8M (scale=0.5) to ~36M (scale=2.0) parameters with ~12K species (default scale=1.0 ≈ 7M)
 
 ## Visualization
 

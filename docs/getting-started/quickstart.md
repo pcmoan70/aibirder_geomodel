@@ -55,7 +55,7 @@ This produces a combined parquet with per-week species lists and a taxonomy CSV.
 ## Stage 4 — Train
 
 ```bash
-python train.py --data_path ./outputs/combined.parquet --batch_size 1024
+python train.py --data_path ./outputs/combined.parquet
 ```
 
 Training produces checkpoints in `./checkpoints/`. See [Training](../model/training.md) for all options.

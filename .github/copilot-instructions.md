@@ -69,14 +69,13 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - Extracts environmental features and species lists
 
 **data.py** - H3DataPreprocessor class:
-- `encode_coordinates()`: Stores raw lat/lon (encoding done inside the model)
-- `encode_weeks()`: Stores raw week numbers (encoding done inside the model)
 - `normalize_environmental_features()`: Normalizes env features with StandardScaler
   - Categorical columns → one-hot encoded (NaN → all-zero row)
   - Fraction columns → passed through as-is (NaN → 0)
   - Continuous columns → StandardScaler (NaN positions preserved for masked MSE loss)
 - `build_species_vocabulary()`: Creates vocabulary of all unique GBIF taxonKeys
-- `encode_species_multilabel()`: Converts species lists to multi-label sparse format
+- `encode_species_multilabel()`: Converts species lists to multi-label dense binary matrix
+- `encode_species_sparse()`: Converts species lists to sparse index arrays (used when dense would exceed 8 GiB)
 - `prepare_training_data()`: Complete preprocessing pipeline
   - Supports `max_obs_per_species` to cap common species observations
   - Supports `min_obs_per_species` to exclude rare species (default 100)
@@ -140,9 +139,9 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 
 **Model Scaling:**
 - Continuous `model_scale` factor (default 1.0)
-- scale=0.5 → ~1.5M parameters, embed_dim=256, encoder: 2 blocks
+- scale=0.5 → ~1.8M parameters, embed_dim=256, encoder: 2 blocks
 - scale=1.0 → ~7.2M parameters, embed_dim=512, encoder: 4 blocks (default)
-- scale=2.0 → ~47M parameters, embed_dim=1024, encoder: 8 blocks
+- scale=2.0 → ~36M parameters, embed_dim=1024, encoder: 8 blocks
 
 **loss.py** - Loss Functions:
 - `asymmetric_loss()`: Default loss — ASL (Ridnik et al., 2021) for multi-label classification
@@ -196,7 +195,7 @@ python train.py \
 ### Inference (`predict.py`)
 
 Loads a checkpoint and predicts species probabilities for arbitrary (lat, lon, week) inputs.
-Supports CSV output, top-k filtering, and global grid prediction with chunked output.
+Supports top-k filtering and probability thresholding.
 
 ### Model Export (`convert.py`)
 
@@ -211,7 +210,7 @@ the PyTorch reference model.  Default format is ONNX FP16.
 2. Flatten to (cell, week) samples → Extract lat/lon, species, env features
    - `--no_yearly` excludes week-0 samples (recommended for temporal learning)
 3. Build species vocabulary → Multi-label sparse encoding
-4. Downsample ocean cells (default: keep 10% of cells with water_fraction > 0.9)
+4. Downsample ocean cells (if configured; default: keep all)
 5. Cap observations per species (if configured) → Reduce common-species dominance
 6. Normalize environmental features → Auxiliary targets
 7. Split by location → Train/Val/Test sets
