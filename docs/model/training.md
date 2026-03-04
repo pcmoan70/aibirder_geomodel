@@ -92,17 +92,22 @@ The training script handles the full pipeline automatically:
 |---|---|---|
 | `--test_size` | `0.1` | Test set fraction |
 | `--val_size` | `0.1` | Validation set fraction |
-| `--sample_fraction` | `1.0` | Fraction of training samples per epoch (0–1) |
+| `--sample_fraction` | `1.0` | Fraction of data to use (0–1) |
 
 Splitting is **location-based**: all samples from one H3 cell go to the same split, preventing spatial data leakage.  The split uses a fixed random seed (`42`) for reproducibility.
 
 #### Sample fraction
 
-When `--sample_fraction` is less than 1.0, a `FractionalRandomSampler` is used on the **training** DataLoader.  Each epoch draws a fresh random subset of training indices (e.g. `0.25` → 25% of training samples per epoch).  Key properties:
+When `--sample_fraction` is less than 1.0 it reduces the effective dataset size in two complementary ways:
 
-- **Validation and test sets are unaffected** — they always use all samples.
-- **Different subset each epoch** — the model sees different data every epoch, improving coverage over time.
-- **Deterministic** — epoch *e* uses seed `42 + e`, so results are reproducible across runs.
+- **Validation / test**: a random fraction of *locations* is sampled once (before training starts) and stays fixed, giving consistent evaluation metrics.
+- **Training**: a `FractionalRandomSampler` draws a fresh random subset of training *samples* each epoch (e.g. `0.25` → 25 % of training samples per epoch), so the model sees different data every epoch.
+
+Key properties:
+
+- **Deterministic** — the val/test location subsample uses a fixed seed (`42`); training epoch *e* uses seed `42 + e`.
+- **Different training subset each epoch** — improves coverage over time while keeping per-epoch cost low.
+- **Val/test stay consistent** — evaluation is comparable across epochs and runs.
 
 #### Coordinate jitter
 
@@ -371,9 +376,7 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 | `pos_lambda` | 1.0 → 64 (log scale) |
 | `neg_samples` | {128, 256, 512, 1024, 2048, 4096} |
 | `label_smoothing` | 0 → 0.1 |
-| `weight_decay` | 1e-5 → 1e-2 (log scale) |
 | `env_weight` | 0.01 → 1.0 (log scale) |
-| `lr_T0` | {1, 5, 10, 20} |
 | `jitter` | {true, false} |
 | `max_obs_per_species` | {0, 500, 1000, 2000, 5000} |
 | `min_obs_per_species` | {0, 10, 50, 100, 200, 500} |
@@ -384,6 +387,7 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 | `model_scale` | 0.25 → 3.0 (log scale) |
 | `coord_harmonics` | 2 → 8 (integer) |
 | `week_harmonics` | 2 → 8 (integer) |
+| `label_freq_weight` | {true, false} |
 
 !!! note "Data-affecting parameters"
     When `max_obs_per_species`, `min_obs_per_species`, or `no_yearly` are included in the tuning set, data is re-preprocessed each trial.  This is slower but necessary because these parameters change the training samples or vocabulary.

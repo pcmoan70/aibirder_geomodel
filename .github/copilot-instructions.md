@@ -84,6 +84,8 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
   - Common species (>=95th percentile) -> weight 1.0; rare (<=5th pct) -> min_weight (default 0.1)
   - Sigmoid-shaped interpolation between percentiles; stored as `self.species_freq_weights`
 - `split_data()`: Location-based train/val/test splitting to prevent data leakage
+- `subsample_by_location()`: Randomly subsample a fraction of locations (and all
+  their samples). Used to reduce val/test size before training starts.
 
 **data.py** - PyTorch Dataset:
 - `BirdSpeciesDataset`: PyTorch Dataset wrapper with sparse-to-dense conversion
@@ -96,7 +98,8 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
   - Accepts `sample_fraction` (0–1]; uses `FractionalRandomSampler` when < 1
   - Accepts `jitter_std`; applied to training set only (val is never jittered)
   - Accepts `species_freq_weights`; applied to training set only
-  - Val loader always uses all validation samples
+  - Val/test are subsampled by location once before training (consistent)
+  - Training is subsampled per-epoch via FractionalRandomSampler (varying)
 
 **geoutils.py**: Google Earth Engine feature extraction for H3 cells
 **gbifutils.py**: GBIF species occurrence data retrieval (parallel processing with multiprocessing pool)
@@ -177,7 +180,7 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - Progress tracking with tqdm
 - GPU/CPU support with automatic device selection
 - Optuna-based hyperparameter autotune (`--autotune`)
-  - Tunes: lr, batch_size, pos_lambda, neg_samples, label_smoothing, weight_decay, env_weight, lr_T0, jitter, max_obs_per_species, min_obs_per_species, no_yearly, species_loss, model_scale, coord_harmonics, week_harmonics, asl_gamma_neg, asl_clip
+  - Tunes: lr, batch_size, pos_lambda, neg_samples, label_smoothing, env_weight, jitter, max_obs_per_species, min_obs_per_species, no_yearly, species_loss, model_scale, coord_harmonics, week_harmonics, asl_gamma_neg, asl_clip, label_freq_weight
   - Bayesian optimization with TPE sampler and MedianPruner
   - `--autotune_trials` (default 50), `--autotune_epochs` (default 10)
   - Results saved to `checkpoints/autotune/autotune_results.json`

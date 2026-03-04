@@ -548,6 +548,63 @@ class H3DataPreprocessor:
 
         return species_lists, len(remove_pairs)
 
+    def subsample_by_location(
+        self,
+        inputs: Dict[str, np.ndarray],
+        targets: Dict[str, Any],
+        fraction: float = 1.0,
+        random_state: int = 42,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+        """Randomly subsample a fraction of *locations* (and all their samples).
+
+        Subsampling is location-based: unique (lat, lon) positions are
+        sampled, then all rows belonging to the selected locations are
+        retained.  This preserves the temporal structure within each
+        H3 cell and keeps the data suitable for a subsequent
+        location-based train/val/test split.
+
+        Args:
+            inputs: Dict with 'lat', 'lon', 'week' arrays.
+            targets: Dict with 'species' and 'env_features'.
+            fraction: Fraction of locations to keep (0 < fraction <= 1).
+            random_state: Random seed for reproducibility.
+
+        Returns:
+            (inputs, targets) subsets with only the selected locations.
+        """
+        if fraction >= 1.0:
+            return inputs, targets
+
+        coord_tuples = list(zip(inputs['lat'].tolist(), inputs['lon'].tolist()))
+        unique_map: Dict[tuple, int] = {}
+        loc_ids = np.array([unique_map.setdefault(c, len(unique_map))
+                            for c in coord_tuples])
+        unique_locs = np.unique(loc_ids)
+
+        rng = np.random.RandomState(random_state)
+        k = max(1, int(len(unique_locs) * fraction))
+        selected = rng.choice(unique_locs, size=k, replace=False)
+        mask = np.isin(loc_ids, selected)
+
+        def _subset(d: Dict[str, Any], m: np.ndarray) -> Dict[str, Any]:
+            out = {}
+            for key, v in d.items():
+                if isinstance(v, np.ndarray):
+                    out[key] = v[m]
+                elif isinstance(v, list):
+                    idxs = np.where(m)[0]
+                    out[key] = [v[i] for i in idxs]
+                else:
+                    out[key] = v
+            return out
+
+        sub_in = _subset(inputs, mask)
+        sub_tgt = _subset(targets, mask)
+        print(f"   Subsampled {fraction:.0%} of locations: "
+              f"{len(unique_locs):,} -> {k:,} locations, "
+              f"{len(inputs['lat']):,} -> {int(mask.sum()):,} samples")
+        return sub_in, sub_tgt
+
     def split_data(
         self,
         inputs: Dict[str, np.ndarray],
@@ -617,6 +674,34 @@ class H3DataPreprocessor:
 # ---------------------------------------------------------------------------
 # PyTorch Dataset / DataLoader
 # ---------------------------------------------------------------------------
+
+
+class FractionalRandomSampler(Sampler):
+    """Draw a deterministic random subset of training indices each epoch.
+
+    The seed changes every epoch (``42 + epoch``) so each epoch sees a
+    different subset while remaining reproducible.
+    """
+
+    def __init__(self, data_source: Dataset, fraction: float = 1.0):
+        self.data_source = data_source
+        self.fraction = fraction
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        n = len(self.data_source)
+        k = max(1, int(n * self.fraction))
+        rng = np.random.RandomState(42 + self.epoch)
+        indices = rng.choice(n, size=k, replace=False)
+        rng.shuffle(indices)
+        return iter(indices.tolist())
+
+    def __len__(self) -> int:
+        return max(1, int(len(self.data_source) * self.fraction))
+
 
 class BirdSpeciesDataset(Dataset):
     """PyTorch Dataset for bird species occurrence prediction.
@@ -708,32 +793,6 @@ class BirdSpeciesDataset(Dataset):
         )
 
 
-class FractionalRandomSampler(Sampler):
-    """Sampler that yields a random fraction of training indices each epoch.
-
-    Every call to :meth:`__iter__` (i.e. every epoch) draws a fresh random
-    subset of ``int(fraction * n)`` indices from ``range(n)``.  The subset
-    is deterministic: epoch *e* uses seed ``base_seed + e``, so results
-    are reproducible across runs.
-    """
-
-    def __init__(self, n: int, fraction: float = 1.0, seed: int = 42):
-        self.n = n
-        self.k = max(1, int(n * fraction))
-        self.seed = seed
-        self.epoch = 0
-
-    def __iter__(self):
-        g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
-        idx = torch.randperm(self.n, generator=g)[: self.k]
-        self.epoch += 1
-        return iter(idx.tolist())
-
-    def __len__(self) -> int:
-        return self.k
-
-
 def create_dataloaders(
     train_inputs: Dict[str, np.ndarray],
     train_targets: Dict[str, Any],
@@ -750,9 +809,10 @@ def create_dataloaders(
     """Create training and validation DataLoaders.
 
     Args:
-        sample_fraction: Fraction of training samples to use per epoch,
-            between 0 (exclusive) and 1 (inclusive). Each epoch draws a
-            fresh random subset.
+        sample_fraction: Fraction of training samples to use per epoch.
+            When < 1, a ``FractionalRandomSampler`` draws a different
+            random subset each epoch (seed ``42 + epoch``).  Validation
+            always uses all samples.
         jitter_std: Gaussian noise std (degrees) added to training
             coordinates each time a sample is drawn.  Validation
             coordinates are never jittered.
@@ -765,14 +825,16 @@ def create_dataloaders(
     val_ds = BirdSpeciesDataset(val_inputs, val_targets, n_species=n_species)
 
     if sample_fraction < 1.0:
-        sampler = FractionalRandomSampler(len(train_ds), sample_fraction)
-        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
-                                  num_workers=num_workers, pin_memory=pin_memory,
-                                  drop_last=True)
+        sampler = FractionalRandomSampler(train_ds, fraction=sample_fraction)
+        train_loader = DataLoader(train_ds, batch_size=batch_size,
+                                  sampler=sampler,
+                                  num_workers=num_workers,
+                                  pin_memory=pin_memory, drop_last=True)
     else:
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                  num_workers=num_workers, pin_memory=pin_memory,
-                                  drop_last=True)
+        train_loader = DataLoader(train_ds, batch_size=batch_size,
+                                  shuffle=True,
+                                  num_workers=num_workers,
+                                  pin_memory=pin_memory, drop_last=True)
 
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=pin_memory)

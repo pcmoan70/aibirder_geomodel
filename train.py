@@ -43,10 +43,10 @@ from utils.data import H3DataLoader, H3DataPreprocessor, create_dataloaders
 
 TUNABLE_PARAMS = [
     'lr', 'batch_size', 'pos_lambda', 'neg_samples',
-    'label_smoothing', 'weight_decay', 'env_weight', 'lr_T0',
+    'label_smoothing', 'env_weight',
     'jitter', 'max_obs_per_species', 'min_obs_per_species', 'no_yearly', 'species_loss',
     'model_scale', 'coord_harmonics', 'week_harmonics',
-    'asl_gamma_neg', 'asl_clip',
+    'asl_gamma_neg', 'asl_clip', 'label_freq_weight',
 ]
 
 # Params that affect data preprocessing — when tuned, data is re-processed per trial
@@ -304,6 +304,13 @@ class Trainer:
         try:
             for epoch in range(start_epoch, start_epoch + num_epochs):
                 self.current_epoch = epoch
+
+                # Update FractionalRandomSampler seed so each epoch sees a
+                # different random subset of training data.
+                sampler = getattr(train_loader, 'sampler', None)
+                if hasattr(sampler, 'set_epoch'):
+                    sampler.set_epoch(epoch)
+
                 train_m = self.train_epoch(train_loader)
                 val_m = self.validate(val_loader)
 
@@ -370,12 +377,8 @@ def _suggest_param(trial, name: str, args):
         return trial.suggest_categorical('neg_samples', [128, 256, 512, 1024, 2048, 4096])
     if name == 'label_smoothing':
         return trial.suggest_float('label_smoothing', 0.0, 0.1)
-    if name == 'weight_decay':
-        return trial.suggest_float('weight_decay', 1e-5, 1e-2, log=True)
     if name == 'env_weight':
         return trial.suggest_float('env_weight', 0.01, 1.0, log=True)
-    if name == 'lr_T0':
-        return trial.suggest_categorical('lr_T0', [1, 5, 10, 20])
     if name == 'jitter':
         return trial.suggest_categorical('jitter', [True, False])
     if name == 'max_obs_per_species':
@@ -396,6 +399,8 @@ def _suggest_param(trial, name: str, args):
         return trial.suggest_int('coord_harmonics', 2, 8)
     if name == 'week_harmonics':
         return trial.suggest_int('week_harmonics', 2, 8)
+    if name == 'label_freq_weight':
+        return trial.suggest_categorical('label_freq_weight', [True, False])
     raise ValueError(f"Unknown tunable param: {name}")
 
 
@@ -461,18 +466,22 @@ def run_autotune(args, device: torch.device):
         n_env = info['n_env_features']
         print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
 
-        # Frequency-based label weights
-        _freq_weights = None
-        if args.label_freq_weight:
-            _freq_weights = preprocessor.compute_species_freq_weights(
-                species_lists, min_weight=args.label_freq_weight_min,
-            )
+        # Pre-compute frequency-based label weights (cheap); per-trial
+        # decision whether to use them is made in the objective.
+        _freq_weights = preprocessor.compute_species_freq_weights(
+            species_lists, min_weight=args.label_freq_weight_min,
+        )
 
         print("4. Splitting data...")
         train_in, val_in, _, train_tgt, val_tgt, _ = preprocessor.split_data(
             inputs, targets, test_size=args.test_size, val_size=args.val_size,
             random_state=42, split_by_location=True,
         )
+        # Subsample val by location once; training uses FractionalRandomSampler
+        if args.sample_fraction < 1.0:
+            val_in, val_tgt = preprocessor.subsample_by_location(
+                val_in, val_tgt, fraction=args.sample_fraction, random_state=42,
+            )
         print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}")
     else:
         print("   (Data will be re-processed per trial — tuning data params)")
@@ -526,7 +535,7 @@ def run_autotune(args, device: torch.device):
             n_species = _info['n_species']
             n_env = _info['n_env_features']
             _trial_freq_weights = None
-            if args.label_freq_weight:
+            if bool(p.get('label_freq_weight', args.label_freq_weight)):
                 _trial_freq_weights = _prep.compute_species_freq_weights(
                     _sp, min_weight=args.label_freq_weight_min,
                 )
@@ -535,9 +544,14 @@ def run_autotune(args, device: torch.device):
                 val_size=args.val_size, random_state=42,
                 split_by_location=True,
             )
+            # Subsample val by location once; training uses FractionalRandomSampler
+            if args.sample_fraction < 1.0:
+                v_in, v_tgt = _prep.subsample_by_location(
+                    v_in, v_tgt, fraction=args.sample_fraction, random_state=42,
+                )
         else:
             t_in, v_in, t_tgt, v_tgt = train_in, val_in, train_tgt, val_tgt
-            _trial_freq_weights = _freq_weights
+            _trial_freq_weights = _freq_weights if bool(p.get('label_freq_weight', args.label_freq_weight)) else None
 
         # DataLoaders (batch_size may vary per trial)
         t_loader, v_loader = create_dataloaders(
@@ -604,6 +618,11 @@ def run_autotune(args, device: torch.device):
         best_map = 0.0
         for epoch in range(n_epochs):
             trainer.current_epoch = epoch
+
+            sampler = getattr(t_loader, 'sampler', None)
+            if hasattr(sampler, 'set_epoch'):
+                sampler.set_epoch(epoch)
+
             trainer.train_epoch(t_loader)
             val_m = trainer.validate(v_loader)
 
@@ -883,9 +902,16 @@ def main():
         random_state=42, split_by_location=True,
     )
     print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}  |  Test: {len(test_in['lat']):,}")
+
+    # Subsample val/test by location once (consistent throughout training).
+    # Training is subsampled per-epoch via FractionalRandomSampler instead.
     if args.sample_fraction < 1.0:
-        k = max(1, int(len(train_in['lat']) * args.sample_fraction))
-        print(f"   Sampling {args.sample_fraction:.0%} of train per epoch: ~{k:,} samples")
+        val_in, val_tgt = preprocessor.subsample_by_location(
+            val_in, val_tgt, fraction=args.sample_fraction, random_state=42,
+        )
+        test_in, test_tgt = preprocessor.subsample_by_location(
+            test_in, test_tgt, fraction=args.sample_fraction, random_state=42,
+        )
 
     print("5. Creating DataLoaders...")
     train_loader, val_loader = create_dataloaders(
