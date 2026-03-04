@@ -23,21 +23,22 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - **Spatial location**: Latitude and longitude (converted from H3 cells)
   - Uses **multi-harmonic circular encoding** for neural network compatibility
   - Each coordinate → [sin(θ), cos(θ), sin(2θ), cos(2θ), …, sin(nθ), cos(nθ)]
-  - Default `coord_harmonics=4` → 8 features per coordinate (16 total for lat+lon)
+  - Default `coord_harmonics=8` → 16 features per coordinate (32 total for lat+lon)
   - Preserves spherical continuity (e.g., -180° and 180° longitude map to same point)
-- **Temporal**: Week number (0-48; 1-48 for weekly, 0 for yearly/all-year)
+- **Temporal**: Week number (1-48)
   - Uses **multi-harmonic circular encoding** for cyclical representation
-  - Default `week_harmonics=2` → 4 features
+  - Default `week_harmonics=4` → 8 features
   - Ensures week 48 and week 1 are treated as adjacent
-  - Week 0 (yearly samples) → encoding zeroed out
+  - Temporal signal modulates spatial embedding via **FiLM conditioning**
+    (Feature-wise Linear Modulation: γ × spatial + β per residual block)
 
-**Total Input Features**: 20 (16 for coordinates + 4 for week)
+**Total Input Features**: 32 spatial (lat+lon) + 8 temporal (week FiLM)
 
 **Training Targets:**
 - **Primary target**: Species list (GBIF taxonKeys) for that location/week combination
   - Encoded as multi-label binary classification
-  - Assume-negative (AN) loss with positive up-weighting and negative sampling (default)
-  - BCE and focal loss also available via `--species_loss`
+  - Asymmetric Loss (ASL, default) with separate positive/negative focusing
+  - BCE, focal, and assume-negative (AN) loss also available via `--species_loss`
 - **Auxiliary target**: Environmental/geographic features for that cell
   - The environmental features act as a regularization signal
   - Helps the model learn better spatial representations
@@ -48,6 +49,7 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - Only predict species lists for a given location (lat/lon) and week
 - Environmental features are NOT used as input or predicted during inference
 - The model relies on learned patterns from coordinates and temporal information
+- Yearly (week 0) predictions: max of predictions across all 48 weeks
 
 ### Key Design Principles
 1. Environmental data is used during training only (as auxiliary targets, not inputs)
@@ -81,10 +83,17 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 
 **data.py** - PyTorch Dataset:
 - `BirdSpeciesDataset`: PyTorch Dataset wrapper with sparse-to-dense conversion
+  - Optional `jitter_std` (degrees) adds Gaussian noise to lat/lon on each draw
+  - Lat clamped to [-90, 90], lon wrapped at ±180°
+- `FractionalRandomSampler`: Sampler that draws a deterministic random subset of
+  training indices each epoch (seed `42 + epoch`). Used when `sample_fraction < 1`.
 - `create_dataloaders()`: Creates training and validation DataLoaders
+  - Accepts `sample_fraction` (0–1]; uses `FractionalRandomSampler` when < 1
+  - Accepts `jitter_std`; applied to training set only (val is never jittered)
+  - Val loader always uses all validation samples
 
 **geoutils.py**: Google Earth Engine feature extraction for H3 cells
-**gbifutils.py**: GBIF species occurrence data retrieval
+**gbifutils.py**: GBIF species occurrence data retrieval (parallel processing with multiprocessing pool)
 **combine.py**: Merges Earth Engine features with GBIF observations into a single parquet
 
 ### Model Architecture (`model/`)
@@ -99,10 +108,10 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 2. **ResidualBlock**: Pre-norm residual block
    - LayerNorm → GELU → Linear → LayerNorm → GELU → Dropout → Linear + skip connection
 
-3. **SpatioTemporalEncoder**: Shared encoder processing raw (lat, lon, week)
-   - Input: Raw lat, lon (degrees), week (0-48)
-   - Internal circular encoding: lat→8, lon→8, week→4 = 20 features
-   - Linear projection to embed_dim → residual blocks → LayerNorm
+3. **SpatioTemporalEncoder**: Shared encoder with FiLM temporal conditioning
+   - Spatial: lat→16, lon→16 = 32 features → Linear projection to embed_dim
+   - Temporal: week→8 features → per-block FiLM generators produce (γ, β)
+   - Residual blocks modulated by FiLM: block(x) * γ + β
    - Output: embed_dim-dimensional embedding (default 512)
 
 4. **SpeciesPredictionHead**: Multi-label classification head (primary task)
@@ -112,7 +121,7 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 
 5. **EnvironmentalPredictionHead**: Regression head (auxiliary task)
    - Residual blocks + linear output
-   - Default: 512 → residual blocks × 1 → n_env_features
+   - Default: 256 → residual blocks × 1 → n_env_features
    - Output: Predicted environmental feature values (training only)
 
 6. **BirdNETGeoModel**: Complete multi-task model
@@ -122,19 +131,23 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
    - `predict_species()`: Convenience method for binary predictions
    - `get_species_probabilities()`: Get occurrence probabilities
 
-**Model Sizes:**
-- Small: ~860K parameters, embed_dim=256, encoder: 3 blocks
-- Medium: ~3.5M parameters, embed_dim=512, encoder: 4 blocks (default)
-- Large: ~21.5M parameters, embed_dim=1024, encoder: 6 blocks
+**Model Scaling:**
+- Continuous `model_scale` factor (default 1.0)
+- scale=0.5 → ~1.5M parameters, embed_dim=256, encoder: 2 blocks
+- scale=1.0 → ~7.2M parameters, embed_dim=512, encoder: 4 blocks (default)
+- scale=2.0 → ~47M parameters, embed_dim=1024, encoder: 8 blocks
 
 **loss.py** - Loss Functions:
-- `AssumeNegativeLoss`: Default loss — LAN-full strategy (Cole et al., 2023) for presence-only data
+- `asymmetric_loss()`: Default loss — ASL (Ridnik et al., 2021) for multi-label classification
+  - Separate focusing: γ+=0 (keep all positives), γ-=4 (suppress easy negatives)
+  - Probability margin clip=0.05 discards very easy negatives
+- `AssumeNegativeLoss`: LAN-full strategy (Cole et al., 2023) for presence-only data
   - Up-weights positives by λ, samples M negatives per example
-  - Default: λ=16, M=512, label_smoothing=0.01
+  - Default: λ=8, M=1024, label_smoothing=0.05
 - `MultiTaskLoss`: Weighted combination of species loss + environmental MSE
   - Total Loss = species_weight × species_loss + env_weight × MSE
-  - Species loss: `an` (assume-negative, default), `bce`, or `focal`
-  - Default weights: species=1.0, env=0.1
+  - Species loss: `asl` (default), `bce`, `focal`, or `an` (assume-negative)
+  - Default weights: species=1.0, env=0.05
   - Environmental MSE uses `masked_mse()` to skip NaN targets
 - `compute_pos_weights()`: Calculate class weights from training data
 - `focal_loss()`: Alternative loss for severe class imbalance
@@ -146,7 +159,7 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - Automatic mixed precision (AMP) on CUDA
 - Gradient clipping (max_norm=1.0) to prevent exploding gradients
 - Linear LR warmup (3 epochs) + CosineAnnealingWarmRestarts schedule
-- Early stopping with configurable patience (default 15), based on validation mAP
+- Early stopping with configurable patience (default 10), based on validation mAP
 - Checkpoint management:
   - `checkpoint_latest.pt`: Latest model state
   - `checkpoint_best.pt`: Best validation mAP
@@ -158,16 +171,16 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - Progress tracking with tqdm
 - GPU/CPU support with automatic device selection
 - Optuna-based hyperparameter autotune (`--autotune`)
-  - Tunes: lr, batch_size, pos_lambda, neg_samples, label_smoothing, weight_decay, env_weight, lr_T0
+  - Tunes: lr, batch_size, pos_lambda, neg_samples, label_smoothing, weight_decay, env_weight, lr_T0, jitter, max_obs_per_species, no_yearly, species_loss, model_scale, coord_harmonics, week_harmonics, asl_gamma_neg, asl_clip
   - Bayesian optimization with TPE sampler and MedianPruner
-  - `--autotune_trials` (default 20), `--autotune_epochs` (default 15)
+  - `--autotune_trials` (default 50), `--autotune_epochs` (default 10)
   - Results saved to `checkpoints/autotune/autotune_results.json`
 
 **Command-line interface:**
 ```bash
 python train.py \
   --data_path outputs/combined.parquet \
-  --model_size medium \
+  --model_scale 1.0 \
   --batch_size 256 \
   --num_epochs 100 \
   --lr 0.001
@@ -189,21 +202,23 @@ the PyTorch reference model.  Default format is ONNX FP16.
 **Training:**
 1. Load H3 cell data from parquet → GeoPandas DataFrame
 2. Flatten to (cell, week) samples → Extract lat/lon, species, env features
+   - `--no_yearly` excludes week-0 samples (recommended for temporal learning)
 3. Build species vocabulary → Multi-label sparse encoding
 4. Downsample ocean cells (default: keep 10% of cells with water_fraction > 0.9)
 5. Cap observations per species (if configured) → Reduce common-species dominance
-5. Normalize environmental features → Auxiliary targets
-6. Split by location → Train/Val/Test sets
-7. Create PyTorch DataLoaders → Batched sampling
+6. Normalize environmental features → Auxiliary targets
+7. Split by location → Train/Val/Test sets
+8. Create PyTorch DataLoaders → Batched sampling
+   - `--jitter` adds Gaussian noise to training lat/lon (scale from H3 cell size)
 8. Training loop:
-   - Forward pass: raw (lat, lon, week) → circular encoding (inside model) → (species_logits, env_pred)
-   - Compute multi-task loss (AN + MSE)
+   - Forward pass: raw (lat, lon, week) → spatial encoding + FiLM temporal conditioning → (species_logits, env_pred)
+   - Compute multi-task loss (ASL + MSE)
    - Backward pass with AMP and gradient clipping
    - Update model parameters
 9. Save checkpoints periodically and when validation improves
 
 **Inference:**
-1. Accept raw (lat, lon, week) input
+1. Accept raw (lat, lon, week) input (week 1–48; week 0 = max across all 48)
 2. Forward pass through model (encoding is internal)
 3. Apply sigmoid → species probabilities
 4. Threshold or return top-k species
@@ -233,7 +248,6 @@ geomodel/
 │   ├── plot_variable_importance.py  # Feature importance analysis
 │   └── plot_environmental.py   # Environmental feature visualization
 ├── docs/                       # MkDocs documentation
-├── dev/                        # Development/debug scripts
 ├── checkpoints/                # Saved model checkpoints
 └── outputs/                    # Generated data and plots
 ```

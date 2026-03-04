@@ -28,6 +28,9 @@ class CircularEncoding(nn.Module):
         [sin(θ), cos(θ), sin(2θ), cos(2θ), …, sin(nθ), cos(nθ)]
 
     Output dimension = 2 * n_harmonics per input scalar.
+
+    Reference: Tancik et al., "Fourier Features Let Networks Learn High
+    Frequency Functions in Low Dimensional Domains" (NeurIPS 2020).
     """
 
     def __init__(self, n_harmonics: int = 1):
@@ -95,27 +98,35 @@ class ResidualBlock(nn.Module):
 
 class SpatioTemporalEncoder(nn.Module):
     """
-    Shared encoder that accepts **raw** latitude, longitude, and week number
-    and encodes them internally via multi-harmonic circular encoding before
-    projecting into *embed_dim* and passing through residual blocks.
+    Shared encoder that maps raw (lat, lon, week) to an embedding via
+    multi-harmonic circular encoding and FiLM temporal conditioning.
+
+    **Spatial** features (lat, lon) are projected into *embed_dim* and
+    processed by residual blocks.  **Temporal** features (week) are
+    encoded separately and used to generate per-block FiLM (Feature-wise
+    Linear Modulation) scale and shift parameters that modulate the
+    spatial representation.  This forces the network to actively use
+    temporal information rather than relying on a weak concatenated signal.
+
+    Reference: Perez et al., "FiLM: Visual Reasoning with a General
+    Conditioning Layer" (AAAI 2018).
 
     Inputs (all per-sample):
         lat  : float in [-90, 90]
         lon  : float in [-180, 180]
-        week : int in {0, 1, …, 48}  (0 = yearly / all-year)
+        week : int in {1, …, 48}
 
     Internal encoding produces:
         lat  → CircularEncoding(lat_rad)  → 2 * coord_harmonics features
         lon  → CircularEncoding(lon_rad)  → 2 * coord_harmonics features
         week → CircularEncoding(week_rad) → 2 * week_harmonics features
-                                             (zeroed when week == 0)
-    Total input features = 2 * (2 * coord_harmonics + week_harmonics)
+                → FiLM generators produce (γ, β) per residual block
     """
 
     def __init__(
         self,
         coord_harmonics: int = 4,
-        week_harmonics: int = 2,
+        week_harmonics: int = 4,
         embed_dim: int = 512,
         n_blocks: int = 4,
         dropout: float = 0.1,
@@ -135,17 +146,27 @@ class SpatioTemporalEncoder(nn.Module):
         self.coord_harmonics = coord_harmonics
         self.week_harmonics = week_harmonics
         self.n_weeks = n_weeks
+        self.n_blocks = n_blocks
 
         self.lat_enc = CircularEncoding(coord_harmonics)
         self.lon_enc = CircularEncoding(coord_harmonics)
         self.week_enc = CircularEncoding(week_harmonics)
 
-        input_dim = self.lat_enc.output_dim + self.lon_enc.output_dim + self.week_enc.output_dim
+        spatial_dim = self.lat_enc.output_dim + self.lon_enc.output_dim
+        week_dim = self.week_enc.output_dim
 
-        self.input_proj = nn.Linear(input_dim, embed_dim)
-        self.blocks = nn.Sequential(
-            *[ResidualBlock(embed_dim, dropout) for _ in range(n_blocks)]
+        self.input_proj = nn.Linear(spatial_dim, embed_dim)
+        self.blocks = nn.ModuleList(
+            [ResidualBlock(embed_dim, dropout) for _ in range(n_blocks)]
         )
+        # FiLM: one (γ, β) pair per residual block, generated from week encoding
+        self.film_generators = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(week_dim, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, 2 * embed_dim),  # (γ, β)
+            ) for _ in range(n_blocks)
+        ])
         self.norm = nn.LayerNorm(embed_dim)
         self.output_dim = embed_dim
 
@@ -154,7 +175,7 @@ class SpatioTemporalEncoder(nn.Module):
         Parameters:
             lat:  (batch,) raw latitude in degrees [-90, 90]
             lon:  (batch,) raw longitude in degrees [-180, 180]
-            week: (batch,) week number (1–48, or 0 for yearly)
+            week: (batch,) week number (1–48)
         """
         # Convert degrees → radians
         lat_rad = lat * (math.pi / 180.0)
@@ -167,13 +188,17 @@ class SpatioTemporalEncoder(nn.Module):
         lon_features = self.lon_enc(lon_rad)    # (batch, 2*coord_harmonics)
         week_features = self.week_enc(week_rad) # (batch, 2*week_harmonics)
 
-        # Zero out week encoding for yearly samples (week == 0)
-        yearly_mask = (week == 0).unsqueeze(1)  # (batch, 1)
-        week_features = week_features.masked_fill(yearly_mask, 0.0)
-
-        x = torch.cat([lat_features, lon_features, week_features], dim=1)
+        # Spatial projection
+        x = torch.cat([lat_features, lon_features], dim=1)
         x = self.input_proj(x)
-        x = self.blocks(x)
+
+        # FiLM-conditioned residual blocks
+        for block, film_gen in zip(self.blocks, self.film_generators):
+            film = film_gen(week_features)        # (batch, 2*embed_dim)
+            gamma, beta = film.chunk(2, dim=1)    # each (batch, embed_dim)
+            gamma = gamma + 1.0                   # centre around identity
+            x = block(x) * gamma + beta
+
         return self.norm(x)
 
 
@@ -302,7 +327,7 @@ class BirdNETGeoModel(nn.Module):
         n_species: int,
         n_env_features: int,
         coord_harmonics: int = 4,
-        week_harmonics: int = 2,
+        week_harmonics: int = 4,
         embed_dim: int = 512,
         encoder_blocks: int = 4,
         species_head_dim: int = 512,
@@ -424,37 +449,54 @@ class BirdNETGeoModel(nn.Module):
 def create_model(
     n_species: int,
     n_env_features: int,
-    model_size: str = 'medium',
-    coord_harmonics: int = 4,
-    week_harmonics: int = 2,
+    model_scale: float = 1.0,
+    coord_harmonics: int = 8,
+    week_harmonics: int = 4,
 ) -> BirdNETGeoModel:
-    """Create model with predefined size configuration."""
-    configs = {
-        'small': dict(
-            embed_dim=256, encoder_blocks=3,
-            species_head_dim=256, species_head_blocks=1, species_bottleneck=64,
-            env_head_dim=128, env_head_blocks=1,
-            dropout=0.1, species_dropout=0.15, env_dropout=0.1,
-        ),
-        'medium': dict(
-            embed_dim=512, encoder_blocks=4,
-            species_head_dim=512, species_head_blocks=2, species_bottleneck=128,
-            env_head_dim=256, env_head_blocks=1,
-            dropout=0.1, species_dropout=0.2, env_dropout=0.1,
-        ),
-        'large': dict(
-            embed_dim=1024, encoder_blocks=6,
-            species_head_dim=1024, species_head_blocks=3, species_bottleneck=256,
-            env_head_dim=512, env_head_blocks=2,
-            dropout=0.15, species_dropout=0.25, env_dropout=0.15,
-        ),
-    }
+    """Create model with a continuous size scaling factor.
 
-    if model_size not in configs:
-        raise ValueError(f"model_size must be one of {list(configs.keys())}")
+    ``model_scale=1.0`` matches the former *medium* preset
+    (embed_dim=512, 4 encoder blocks, ~7 M params with 12 K species).
+    Dimensions scale linearly; block counts are rounded to the nearest
+    integer (minimum 1).
+
+    Rough parameter-count landmarks (with 12 K species):
+
+    * 0.5  → ~1.8 M  (≈ former *small*)
+    * 1.0  → ~7.2 M  (≈ former *medium*)
+    * 2.0  → ~36 M   (≈ former *large*)
+
+    Args:
+        n_species: Number of target species.
+        n_env_features: Number of environmental features.
+        model_scale: Continuous scaling factor (default 1.0).
+        coord_harmonics: Harmonics for lat/lon encoding.
+        week_harmonics: Harmonics for week encoding.
+    """
+    # Reference dimensions at scale=1.0 (former "medium")
+    embed_dim = max(64, round(512 * model_scale / 64) * 64)
+    species_head_dim = embed_dim
+    species_bottleneck = max(32, round(128 * model_scale / 32) * 32)
+    env_head_dim = max(64, round(256 * model_scale / 64) * 64)
+
+    encoder_blocks = max(1, round(4 * model_scale))
+    species_head_blocks = max(1, round(2 * model_scale))
+    env_head_blocks = max(1, round(1 * model_scale))
+
+    # Dropout scales mildly with size
+    base_dropout = 0.1 + 0.025 * (model_scale - 1.0)
+    dropout = max(0.0, min(base_dropout, 0.3))
+    species_dropout = max(0.0, min(base_dropout + 0.1, 0.4))
+    env_dropout = max(0.0, min(base_dropout, 0.3))
 
     return BirdNETGeoModel(
         n_species=n_species, n_env_features=n_env_features,
         coord_harmonics=coord_harmonics, week_harmonics=week_harmonics,
-        **configs[model_size],
+        embed_dim=embed_dim, encoder_blocks=encoder_blocks,
+        species_head_dim=species_head_dim,
+        species_head_blocks=species_head_blocks,
+        species_bottleneck=species_bottleneck,
+        env_head_dim=env_head_dim, env_head_blocks=env_head_blocks,
+        dropout=dropout, species_dropout=species_dropout,
+        env_dropout=env_dropout,
     )

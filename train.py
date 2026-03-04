@@ -7,14 +7,14 @@ Features:
   - AdamW optimizer with linear LR warmup + CosineAnnealingWarmRestarts
   - Automatic mixed-precision (AMP) on CUDA for ~2× speed-up
   - Early stopping based on validation mAP plateau
-  - Assume-negative (AN) loss (default); BCE and focal also available
+  - Asymmetric Loss (ASL, default); BCE, focal, and assume-negative also available
   - Label smoothing and observation cap for regularization
   - Gradient clipping
   - Optuna-based hyperparameter autotune (--autotune)
 
 Usage:
     python train.py --data_path ./outputs/global_350km_ee_gbif.parquet
-    python train.py --data_path data.parquet --model_size large --num_epochs 100
+    python train.py --data_path data.parquet --model_scale 2.0 --num_epochs 100
     python train.py --resume checkpoints/checkpoint_best.pt
     python train.py --data_path data.parquet --autotune
     python train.py --data_path data.parquet --autotune lr pos_lambda --autotune_trials 30
@@ -23,6 +23,7 @@ Usage:
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -33,7 +34,7 @@ from tqdm import tqdm
 
 from model.model import create_model
 from model.loss import MultiTaskLoss
-from utils.data import H3DataLoader, H3DataPreprocessor, create_dataloaders, get_class_weights
+from utils.data import H3DataLoader, H3DataPreprocessor, create_dataloaders
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +44,15 @@ from utils.data import H3DataLoader, H3DataPreprocessor, create_dataloaders, get
 TUNABLE_PARAMS = [
     'lr', 'batch_size', 'pos_lambda', 'neg_samples',
     'label_smoothing', 'weight_decay', 'env_weight', 'lr_T0',
+    'jitter', 'max_obs_per_species', 'no_yearly', 'species_loss',
+    'model_scale', 'coord_harmonics', 'week_harmonics',
+    'asl_gamma_neg', 'asl_clip',
 ]
+
+# Params that affect data preprocessing — when tuned, data is re-processed per trial
+_DATA_PARAMS = {'max_obs_per_species', 'no_yearly'}
+
+
 
 
 class Trainer:
@@ -343,9 +352,6 @@ class Trainer:
         print(f"Checkpoints: {self.checkpoint_dir}")
 
 
-        print(f"\nTraining complete \u2014 best mAP: {self.best_val_map:.4f}")
-        print(f"Checkpoints: {self.checkpoint_dir}")
-
 
 # ---------------------------------------------------------------------------
 # Autotune — Optuna-based hyperparameter search
@@ -359,9 +365,9 @@ def _suggest_param(trial, name: str, args):
     if name == 'batch_size':
         return trial.suggest_categorical('batch_size', [128, 256, 512, 1024])
     if name == 'pos_lambda':
-        return trial.suggest_float('pos_lambda', 2.0, 64.0, log=True)
+        return trial.suggest_float('pos_lambda', 1.0, 64.0, log=True)
     if name == 'neg_samples':
-        return trial.suggest_categorical('neg_samples', [128, 256, 512, 1024, 2048])
+        return trial.suggest_categorical('neg_samples', [128, 256, 512, 1024, 2048, 4096])
     if name == 'label_smoothing':
         return trial.suggest_float('label_smoothing', 0.0, 0.1)
     if name == 'weight_decay':
@@ -369,7 +375,25 @@ def _suggest_param(trial, name: str, args):
     if name == 'env_weight':
         return trial.suggest_float('env_weight', 0.01, 1.0, log=True)
     if name == 'lr_T0':
-        return trial.suggest_categorical('lr_T0', [5, 10, 20])
+        return trial.suggest_categorical('lr_T0', [1, 5, 10, 20])
+    if name == 'jitter':
+        return trial.suggest_categorical('jitter', [True, False])
+    if name == 'max_obs_per_species':
+        return trial.suggest_categorical('max_obs_per_species', [0, 500, 1000, 2000, 5000])
+    if name == 'no_yearly':
+        return trial.suggest_categorical('no_yearly', [True, False])
+    if name == 'species_loss':
+        return trial.suggest_categorical('species_loss', ['asl', 'an', 'bce', 'focal'])
+    if name == 'asl_gamma_neg':
+        return trial.suggest_float('asl_gamma_neg', 1.0, 8.0)
+    if name == 'asl_clip':
+        return trial.suggest_float('asl_clip', 0.0, 0.2)
+    if name == 'model_scale':
+        return trial.suggest_float('model_scale', 0.25, 3.0, log=True)
+    if name == 'coord_harmonics':
+        return trial.suggest_int('coord_harmonics', 2, 8)
+    if name == 'week_harmonics':
+        return trial.suggest_int('week_harmonics', 2, 8)
     raise ValueError(f"Unknown tunable param: {name}")
 
 
@@ -405,37 +429,51 @@ def run_autotune(args, device: torch.device):
     print(f"  Objective:  validation mAP (maximize)")
     print(f"  Device:     {device}")
 
-    # -- Load data once ---------------------------------------------------
+    # -- Load data --------------------------------------------------------
     print("\n1. Loading data...")
     loader = H3DataLoader(args.data_path)
     loader.load_data()
 
-    print("2. Flattening to samples...")
-    lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
-        ocean_sample_rate=args.ocean_sample_rate,
-    )
+    # Jitter scale is fixed by H3 resolution, compute once
+    _jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
 
-    print("3. Preprocessing...")
-    preprocessor = H3DataPreprocessor()
-    inputs, targets = preprocessor.prepare_training_data(
-        lats, lons, weeks, species_lists, env_features, fit=True,
-        max_obs_per_species=args.max_obs_per_species,
-    )
-    info = preprocessor.get_preprocessing_info()
-    n_species = info['n_species']
-    n_env = info['n_env_features']
-    print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
+    # Check whether any data-affecting params are being tuned
+    tuning_data_params = bool(set(tune_params) & _DATA_PARAMS)
 
-    print("4. Splitting data...")
-    train_in, val_in, _, train_tgt, val_tgt, _ = preprocessor.split_data(
-        inputs, targets, test_size=args.test_size, val_size=args.val_size,
-        random_state=42, split_by_location=True,
-    )
-    print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}")
+    # Pre-process data once when no data-affecting params are tuned
+    if not tuning_data_params:
+        print("2. Flattening to samples...")
+        lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
+            ocean_sample_rate=args.ocean_sample_rate,
+            include_yearly=not args.no_yearly,
+        )
+        print("3. Preprocessing...")
+        preprocessor = H3DataPreprocessor()
+        inputs, targets = preprocessor.prepare_training_data(
+            lats, lons, weeks, species_lists, env_features, fit=True,
+            max_obs_per_species=args.max_obs_per_species,
+        )
+        info = preprocessor.get_preprocessing_info()
+        n_species = info['n_species']
+        n_env = info['n_env_features']
+        print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
+        print("4. Splitting data...")
+        train_in, val_in, _, train_tgt, val_tgt, _ = preprocessor.split_data(
+            inputs, targets, test_size=args.test_size, val_size=args.val_size,
+            random_state=42, split_by_location=True,
+        )
+        print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}")
+    else:
+        print("   (Data will be re-processed per trial — tuning data params)")
+        n_species = None  # resolved per trial
+        n_env = None
 
     # -- Objective --------------------------------------------------------
     def objective(trial: 'optuna.Trial') -> float:
-        # Resolve each param: suggest if tuning, else use CLI default
+        # Resolve each param: suggest if tuning, else use CLI default.
+        # Resolve species_loss first — pos_lambda and neg_samples are only
+        # relevant for the assume-negative loss and should not be tuned
+        # (or suggested to Optuna) when a different loss is selected.
         p = {}
         for name in TUNABLE_PARAMS:
             if name in tune_params:
@@ -443,32 +481,74 @@ def run_autotune(args, device: torch.device):
             else:
                 p[name] = getattr(args, name)
 
+        loss_type = str(p.get('species_loss', args.species_loss))
+        if loss_type != 'an':
+            # AN-specific params: use defaults, don't let Optuna vary them
+            p['pos_lambda'] = args.pos_lambda
+            p['neg_samples'] = args.neg_samples
+        if loss_type != 'asl':
+            # ASL-specific params: use defaults when not relevant
+            p['asl_gamma_neg'] = args.asl_gamma_neg
+            p['asl_clip'] = args.asl_clip
+
         batch_size = int(p['batch_size'])
+        use_jitter = bool(p.get('jitter', args.jitter))
+        jitter_std = _jitter_std if use_jitter else 0.0
+
+        # Re-process data when data-affecting params are tuned
+        nonlocal n_species, n_env
+        if tuning_data_params:
+            include_yearly = not bool(p.get('no_yearly', args.no_yearly))
+            max_obs = int(p.get('max_obs_per_species', args.max_obs_per_species))
+            _lats, _lons, _weeks, _sp, _env = loader.flatten_to_samples(
+                ocean_sample_rate=args.ocean_sample_rate,
+                include_yearly=include_yearly,
+            )
+            _prep = H3DataPreprocessor()
+            _inputs, _targets = _prep.prepare_training_data(
+                _lats, _lons, _weeks, _sp, _env, fit=True,
+                max_obs_per_species=max_obs,
+            )
+            _info = _prep.get_preprocessing_info()
+            n_species = _info['n_species']
+            n_env = _info['n_env_features']
+            t_in, v_in, _, t_tgt, v_tgt, _ = _prep.split_data(
+                _inputs, _targets, test_size=args.test_size,
+                val_size=args.val_size, random_state=42,
+                split_by_location=True,
+            )
+        else:
+            t_in, v_in, t_tgt, v_tgt = train_in, val_in, train_tgt, val_tgt
 
         # DataLoaders (batch_size may vary per trial)
         t_loader, v_loader = create_dataloaders(
-            train_in, train_tgt, val_in, val_tgt,
+            t_in, t_tgt, v_in, v_tgt,
             batch_size=batch_size, num_workers=args.num_workers,
             pin_memory=(device.type == 'cuda'),
             n_species=n_species,
+            sample_fraction=args.sample_fraction,
+            jitter_std=jitter_std,
         )
 
         # Fresh model
         model = create_model(
             n_species=n_species, n_env_features=n_env,
-            model_size=args.model_size,
-            coord_harmonics=args.coord_harmonics,
-            week_harmonics=args.week_harmonics,
+            model_scale=float(p.get('model_scale', args.model_scale)),
+            coord_harmonics=int(p.get('coord_harmonics', args.coord_harmonics)),
+            week_harmonics=int(p.get('week_harmonics', args.week_harmonics)),
         )
 
         criterion = MultiTaskLoss(
             species_weight=args.species_weight,
             env_weight=float(p['env_weight']),
-            species_loss=args.species_loss,
+            species_loss=str(p.get('species_loss', args.species_loss)),
             focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
             pos_lambda=float(p['pos_lambda']),
             neg_samples=int(p['neg_samples']),
             label_smoothing=float(p['label_smoothing']),
+            asl_gamma_pos=args.asl_gamma_pos,
+            asl_gamma_neg=float(p.get('asl_gamma_neg', args.asl_gamma_neg)),
+            asl_clip=float(p.get('asl_clip', args.asl_clip)),
         )
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=float(p['lr']),
@@ -529,7 +609,18 @@ def run_autotune(args, device: torch.device):
         study_name='geomodel_autotune',
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    def _after_trial(study, trial):
+        """Print best params so far after each completed trial."""
+        if trial.state != optuna.trial.TrialState.COMPLETE:
+            return
+        b = study.best_trial
+        parts = [f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                 for k, v in b.params.items()]
+        print(f"  Best so far: mAP={b.value:.4f} (trial {b.number})  {', '.join(parts)}")
+
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True,
+                   callbacks=[_after_trial])
 
     # -- Report -----------------------------------------------------------
     best = study.best_trial
@@ -572,7 +663,10 @@ def run_autotune(args, device: torch.device):
     print(f"\n  Suggested training command:")
     cmd_parts = [f"python train.py --data_path {args.data_path}"]
     for k, v in best.params.items():
-        if isinstance(v, float):
+        if isinstance(v, bool):
+            if v:
+                cmd_parts.append(f"--{k}")
+        elif isinstance(v, float):
             cmd_parts.append(f"--{k} {v:.6g}")
         else:
             cmd_parts.append(f"--{k} {v}")
@@ -588,33 +682,46 @@ def main():
     parser.add_argument('--data_path', type=str, default='./outputs/global_350km_ee_gbif.parquet')
 
     # Model
-    parser.add_argument('--model_size', type=str, default='medium', choices=['small', 'medium', 'large'])
-    parser.add_argument('--coord_harmonics', type=int, default=4,
-                        help='Number of harmonics for lat/lon circular encoding (default: 4)')
-    parser.add_argument('--week_harmonics', type=int, default=2,
-                        help='Number of harmonics for week circular encoding (default: 2)')
+    parser.add_argument('--model_scale', type=float, default=1.0,
+                        help='Model size scaling factor (1.0 ≈ 7M params, 0.5 ≈ 1.8M, 2.0 ≈ 36M)')
+    parser.add_argument('--coord_harmonics', type=int, default=8,
+                        help='Number of harmonics for lat/lon circular encoding (default: 8)')
+    parser.add_argument('--week_harmonics', type=int, default=4,
+                        help='Number of harmonics for week circular encoding (default: 4)')
 
     # Training
-    parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--num_epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--weight_decay', type=float, default=1e-3)
     parser.add_argument('--species_weight', type=float, default=1.0)
-    parser.add_argument('--env_weight', type=float, default=0.1)
-    parser.add_argument('--species_loss', type=str, default='an', choices=['bce', 'focal', 'an'],
-                        help='Species loss function: an (assume-negative, default), bce, or focal')
+    parser.add_argument('--env_weight', type=float, default=0.05)
+    parser.add_argument('--species_loss', type=str, default='asl', choices=['asl', 'bce', 'focal', 'an'],
+                        help='Species loss function: asl (asymmetric, default), bce, focal, or an')
+    parser.add_argument('--asl_gamma_pos', type=float, default=0.0,
+                        help='ASL positive focusing parameter (default: 0, no down-weighting)')
+    parser.add_argument('--asl_gamma_neg', type=float, default=4.0,
+                        help='ASL negative focusing parameter (default: 4, aggressively suppress easy negatives)')
+    parser.add_argument('--asl_clip', type=float, default=0.05,
+                        help='ASL probability margin for negatives (default: 0.05, 0=disable)')
     parser.add_argument('--focal_alpha', type=float, default=0.25)
     parser.add_argument('--focal_gamma', type=float, default=2.0)
     parser.add_argument('--pos_lambda', type=float, default=8.0,
                         help='Positive up-weighting λ for assume-negative loss (default: 8)')
     parser.add_argument('--neg_samples', type=int, default=1024,
                         help='Number of negative species to sample per example for AN loss (default: 1024, 0=all)')
-    parser.add_argument('--label_smoothing', type=float, default=0.0,
-                        help='Smooth binary targets to prevent overconfident predictions (default: 0.0, 0=off)')
-    parser.add_argument('--max_obs_per_species', type=int, default=0,
-                        help='Cap observations per species to reduce common-species dominance (default: 0, 0=no cap)')
+    parser.add_argument('--label_smoothing', type=float, default=0.05,
+                        help='Smooth binary targets to prevent overconfident predictions (default: 0.05, 0=off)')
+    parser.add_argument('--max_obs_per_species', type=int, default=50000,
+                        help='Cap observations per species to reduce common-species dominance (default: 50000, 0=no cap)')
     parser.add_argument('--ocean_sample_rate', type=float, default=0.1,
                         help='Fraction of ocean cells (water_fraction > 0.9) to keep (default: 0.1, 1.0=keep all)')
+    parser.add_argument('--no_yearly', action='store_true',
+                        help='Exclude week-0 (yearly) samples from training. '
+                             'Year-round predictions are computed by averaging all 48 weeks at inference.')
+    parser.add_argument('--jitter', action='store_true',
+                        help='Jitter training coordinates within H3 cells each epoch '
+                             '(Gaussian noise scaled to cell size, augments spatial inputs)')
 
     # LR schedule
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],
@@ -627,12 +734,14 @@ def main():
                         help='Linear LR warmup epochs before cosine schedule (default: 3, 0=off)')
 
     # Early stopping
-    parser.add_argument('--patience', type=int, default=15,
+    parser.add_argument('--patience', type=int, default=10,
                         help='Early stopping patience (0 = disabled)')
 
     # Data split
-    parser.add_argument('--test_size', type=float, default=0.2)
+    parser.add_argument('--test_size', type=float, default=0.1)
     parser.add_argument('--val_size', type=float, default=0.1)
+    parser.add_argument('--sample_fraction', type=float, default=1.0,
+                        help='Fraction of training data to use (default: 1.0 = all, 0.1 = 10%% random subset)')
 
     # Checkpoints
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
@@ -643,17 +752,18 @@ def main():
 
     # Device
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'])
-    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--num_workers', type=int, default=min(4, os.cpu_count() or 1),
+                        help='Number of DataLoader worker processes (default: min(4, CPU cores))')
 
     # Autotune
     parser.add_argument('--autotune', nargs='*', default=None, metavar='PARAM',
                         help='Run hyperparameter search. Without args: tune all. '
                              'With args: tune only the listed params. '
                              f'Available: {", ".join(TUNABLE_PARAMS)}')
-    parser.add_argument('--autotune_trials', type=int, default=20,
-                        help='Number of Optuna trials (default: 20)')
-    parser.add_argument('--autotune_epochs', type=int, default=15,
-                        help='Epochs per trial (default: 15)')
+    parser.add_argument('--autotune_trials', type=int, default=50,
+                        help='Number of Optuna trials (default: 50)')
+    parser.add_argument('--autotune_epochs', type=int, default=10,
+                        help='Epochs per trial (default: 10)')
 
     args = parser.parse_args()
 
@@ -671,12 +781,14 @@ def main():
     print("  BirdNET Geomodel Training")
     print("=" * 70)
     print(f"  Data:       {args.data_path}")
-    print(f"  Model:      {args.model_size}")
+    print(f"  Model:      scale={args.model_scale}")
     print(f"  Epochs:     {args.num_epochs}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  LR:         {args.lr}  (schedule: {args.lr_schedule}, warmup: {args.lr_warmup})")
     loss_desc = args.species_loss
-    if args.species_loss == 'an':
+    if args.species_loss == 'asl':
+        loss_desc += f"  (γ+={args.asl_gamma_pos}, γ-={args.asl_gamma_neg}, clip={args.asl_clip})"
+    elif args.species_loss == 'an':
         loss_desc += f"  (λ={args.pos_lambda}, M={args.neg_samples}, smooth={args.label_smoothing})"
     elif args.species_loss == 'focal':
         loss_desc += f"  (α={args.focal_alpha}, γ={args.focal_gamma})"
@@ -685,6 +797,8 @@ def main():
         print(f"  Obs cap:    {args.max_obs_per_species} per species")
     if args.ocean_sample_rate < 1.0:
         print(f"  Ocean:      keep {args.ocean_sample_rate:.0%} of high-water cells")
+    if args.jitter:
+        print(f"  Jitter:     enabled (Gaussian noise within H3 cells)")
     print(f"  Device:     {device}")
 
     # -- Data loading & preprocessing ---
@@ -695,7 +809,14 @@ def main():
     print("2. Flattening to samples...")
     lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
         ocean_sample_rate=args.ocean_sample_rate,
+        include_yearly=not args.no_yearly,
     )
+
+    # Coordinate jitter
+    jitter_std = 0.0
+    if args.jitter:
+        jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
+        print(f"   Coordinate jitter: ±{jitter_std:.4f}° std")
 
     print("3. Preprocessing...")
     preprocessor = H3DataPreprocessor()
@@ -715,6 +836,9 @@ def main():
         random_state=42, split_by_location=True,
     )
     print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}  |  Test: {len(test_in['lat']):,}")
+    if args.sample_fraction < 1.0:
+        k = max(1, int(len(train_in['lat']) * args.sample_fraction))
+        print(f"   Sampling {args.sample_fraction:.0%} of train per epoch: ~{k:,} samples")
 
     print("5. Creating DataLoaders...")
     train_loader, val_loader = create_dataloaders(
@@ -722,19 +846,21 @@ def main():
         batch_size=args.batch_size, num_workers=args.num_workers,
         pin_memory=(device.type == 'cuda'),
         n_species=n_species,
+        sample_fraction=args.sample_fraction,
+        jitter_std=jitter_std,
     )
 
     # -- Model ---
     print("\n6. Creating model...")
     model = create_model(
-        n_species=n_species, n_env_features=n_env, model_size=args.model_size,
+        n_species=n_species, n_env_features=n_env, model_scale=args.model_scale,
         coord_harmonics=args.coord_harmonics, week_harmonics=args.week_harmonics,
     )
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"   {args.model_size} — {total_params:,} params (~{total_params * 4 / 1024 / 1024:.1f} MB)")
+    print(f"   scale={args.model_scale} — {total_params:,} params (~{total_params * 4 / 1024 / 1024:.1f} MB)")
 
     model_config = {
-        'model_size': args.model_size,
+        'model_scale': args.model_scale,
         'n_species': n_species,
         'n_env_features': n_env,
         'coord_harmonics': args.coord_harmonics,
@@ -792,6 +918,9 @@ def main():
         focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
         pos_lambda=args.pos_lambda, neg_samples=args.neg_samples,
         label_smoothing=args.label_smoothing,
+        asl_gamma_pos=args.asl_gamma_pos,
+        asl_gamma_neg=args.asl_gamma_neg,
+        asl_clip=args.asl_clip,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,

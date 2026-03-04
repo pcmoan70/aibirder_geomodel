@@ -11,11 +11,10 @@ This trains a medium-sized model with sensible defaults. For a full training run
 ```bash
 python train.py \
     --data_path outputs/combined.parquet \
-    --model_size medium \
+    --model_scale 1.0 \
     --num_epochs 100 \
     --batch_size 256 \
-    --lr 0.001 \
-    --species_loss an
+    --lr 0.001
 ```
 
 ## Training Pipeline
@@ -23,7 +22,7 @@ python train.py \
 The training script handles the full pipeline automatically:
 
 1. **Load data** — read combined parquet file
-2. **Flatten** — expand H3 cells × 48 weeks into individual samples (plus 1 yearly sample per cell)
+2. **Flatten** — expand H3 cells × 48 weeks into individual samples
 3. **Preprocess** — build species vocabulary, normalize environmental features
 4. **Split** — location-based train/val/test split (prevents spatial data leakage)
 5. **Train** — multi-task training with checkpointing
@@ -41,34 +40,39 @@ The training script handles the full pipeline automatically:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model_size` | `medium` | `small`, `medium`, or `large` |
-| `--coord_harmonics` | `4` | Harmonics for lat/lon encoding |
-| `--week_harmonics` | `2` | Harmonics for week encoding |
+| `--model_scale` | `1.0` | Continuous scaling factor (0.5 ≈ 1.8M, 1.0 ≈ 7M, 2.0 ≈ 36M params) |
+| `--coord_harmonics` | `8` | Harmonics for lat/lon encoding |
+| `--week_harmonics` | `4` | Harmonics for week encoding |
 
 ### Training
 
 | Flag | Default | Description |
 |---|---|---|
-| `--batch_size` | `256` | Batch size |
-| `--num_epochs` | `100` | Maximum epochs |
+| `--batch_size` | `1024` | Batch size |
+| `--num_epochs` | `50` | Maximum epochs |
 | `--lr` | `0.001` | Initial learning rate |
-| `--weight_decay` | `0.0001` | AdamW weight decay |
+| `--weight_decay` | `0.001` | AdamW (Loshchilov & Hutter, 2019) weight decay |
 | `--species_weight` | `1.0` | Species loss multiplier |
-| `--env_weight` | `0.1` | Environmental loss multiplier |
-| `--species_loss` | `an` | Loss function: `an` (assume-negative, default), `bce`, or `focal` |
+| `--env_weight` | `0.05` | Environmental loss multiplier |
+| `--species_loss` | `asl` | Loss function: `asl` (asymmetric, default), `bce`, `focal`, or `an` |
+| `--asl_gamma_pos` | `0.0` | ASL positive focusing parameter (0 = no down-weighting) |
+| `--asl_gamma_neg` | `4.0` | ASL negative focusing parameter (higher = more aggressive) |
+| `--asl_clip` | `0.05` | ASL probability margin for negatives (0 = disable) |
 | `--focal_alpha` | `0.25` | Focal loss alpha (only with `--species_loss focal`) |
 | `--focal_gamma` | `2.0` | Focal loss gamma |
-| `--pos_lambda` | `16.0` | Positive up-weighting λ for AN loss |
-| `--neg_samples` | `512` | Negative species to sample per example for AN loss (0 = all) |
-| `--label_smoothing` | `0.01` | Smooth binary targets to prevent overconfidence (0 = off) |
-| `--max_obs_per_species` | `0` | Cap observations per species (0 = no cap) |
+| `--pos_lambda` | `8.0` | Positive up-weighting λ for AN loss |
+| `--neg_samples` | `1024` | Negative species to sample per example for AN loss (0 = all) |
+| `--label_smoothing` | `0.05` | Smooth binary targets to prevent overconfidence (0 = off) |
+| `--max_obs_per_species` | `50000` | Cap observations per species (0 = no cap) |
 | `--ocean_sample_rate` | `0.1` | Fraction of high-water cells to keep (1.0 = keep all) |
+| `--no_yearly` | off | Exclude week-0 (yearly) samples from training |
+| `--jitter` | off | Jitter training coordinates within H3 cells each epoch |
 
 ### Learning Rate Schedule
 
 | Flag | Default | Description |
 |---|---|---|
-| `--lr_schedule` | `cosine` | `cosine` (warm restarts) or `none` |
+| `--lr_schedule` | `cosine` | `cosine` (warm restarts; Loshchilov & Hutter, 2017) or `none` |
 | `--lr_T0` | `10` | Cosine restart period in epochs |
 | `--lr_min` | `1e-6` | Minimum learning rate |
 | `--lr_warmup` | `3` | Linear warmup epochs before cosine schedule (0 = off) |
@@ -77,16 +81,33 @@ The training script handles the full pipeline automatically:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--patience` | `15` | Stop after N epochs without mAP improvement (0 = disabled) |
+| `--patience` | `10` | Stop after N epochs without mAP improvement (0 = disabled) |
 
 ### Data Split
 
 | Flag | Default | Description |
 |---|---|---|
-| `--test_size` | `0.2` | Test set fraction |
+| `--test_size` | `0.1` | Test set fraction |
 | `--val_size` | `0.1` | Validation set fraction |
+| `--sample_fraction` | `1.0` | Fraction of training samples per epoch (0–1) |
 
-Splitting is **location-based**: all 49 samples from one H3 cell (48 weeks + 1 yearly) go to the same split, preventing spatial data leakage.
+Splitting is **location-based**: all samples from one H3 cell go to the same split, preventing spatial data leakage.  The split uses a fixed random seed (`42`) for reproducibility.
+
+#### Sample fraction
+
+When `--sample_fraction` is less than 1.0, a `FractionalRandomSampler` is used on the **training** DataLoader.  Each epoch draws a fresh random subset of training indices (e.g. `0.25` → 25% of training samples per epoch).  Key properties:
+
+- **Validation and test sets are unaffected** — they always use all samples.
+- **Different subset each epoch** — the model sees different data every epoch, improving coverage over time.
+- **Deterministic** — epoch *e* uses seed `42 + e`, so results are reproducible across runs.
+
+#### Coordinate jitter
+
+When `--jitter` is passed, Gaussian noise is added to training coordinates every time a sample is drawn.  The noise standard deviation is derived automatically from the H3 cell resolution (40 % of the average edge length in degrees), so most jittered points stay inside their originating cell.
+
+- **Validation and test sets are never jittered** — they always use exact cell centres.
+- **Each draw is independent** — the same sample receives different noise every epoch.
+- Latitude is clamped to $[-90, 90]$; longitude wraps at $\pm 180°$.
 
 ### Checkpoints
 
@@ -96,7 +117,7 @@ Splitting is **location-based**: all 49 samples from one H3 cell (48 weeks + 1 y
 | `--resume` | — | Path to checkpoint to resume training from |
 | `--save_every` | `5` | Save checkpoint every N epochs |
 | `--device` | `auto` | `auto`, `cuda`, or `cpu` |
-| `--num_workers` | `0` | DataLoader worker processes |
+| `--num_workers` | `min(4, CPUs)` | DataLoader worker processes |
 
 ## Loss Functions
 
@@ -118,7 +139,7 @@ $$
 
 Enable with `--species_loss focal`. Tune `--focal_alpha` and `--focal_gamma` as needed.
 
-### Assume-Negative Loss (Default)
+### Assume-Negative Loss
 
 For presence-only data (like GBIF observations), species not appearing in a
 checklist may still be present — they were simply not observed.  Standard BCE
@@ -143,25 +164,21 @@ $$
 where $P$ is the set of positive species, $N_M$ is a random sample of $M$
 assumed-negative species, and $\lambda$ controls positive up-weighting.
 
-This is the default loss. To tune parameters:
+Enable with `--species_loss an`:
 
 ```bash
 python train.py \
     --species_loss an \
-    --pos_lambda 16 \
-    --neg_samples 512 \
-    --label_smoothing 0.01
+    --pos_lambda 8 \
+    --neg_samples 1024 \
+    --label_smoothing 0.05
 ```
-
-**Recommended settings for ~13,000 species:**
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `--pos_lambda` | 16 | Balances positive/negative gradient; increase if recall too low |
-| `--neg_samples` | 512 | 0 = use all negatives (exact but slow); 512 works well for 13K species |
-| `--label_smoothing` | 0.01 | Prevents overconfident predictions; set 0 to disable |
-| `--max_obs_per_species` | 0 | Cap observations per species; 0 = no cap |
-| `--ocean_sample_rate` | 0.1 | Downsample high-water cells; 1.0 = keep all |
+| `--pos_lambda` | `8` | Balances positive/negative gradient; increase if recall too low |
+| `--neg_samples` | `1024` | 0 = use all negatives (exact but slow) |
+| `--label_smoothing` | `0.05` | Prevents overconfident predictions; set 0 to disable |
 
 ### Observation Cap
 
@@ -171,7 +188,11 @@ The samples themselves are kept (they may still have other species) — only the
 over-represented species labels are dropped.  This prevents ubiquitous species
 from dominating the gradient signal.
 
-### Reference
+### References
+
+> Ridnik, T., Ben-Baruch, E., Zamir, N., Noy, A., Friedman, I., Protter, M., & Zelnik-Manor, L. (2021). Asymmetric Loss For Multi-Label Classification. In *IEEE/CVF International Conference on Computer Vision* (pp. 82–91).
+
+> Lin, T.-Y., Goyal, P., Girshick, R., He, K., & Dollár, P. (2017). Focal Loss for Dense Object Detection. In *IEEE International Conference on Computer Vision* (pp. 2980–2988).
 
 > Cole, E., Van Horn, G., Lange, C., Shepard, A., Leary, P., Perona, P., Loarie, S., & Mac Aodha, O. (2023). Spatial implicit neural representations for global-scale species mapping. In *International Conference on Machine Learning* (pp. 6320–6342). PMLR.
 
@@ -183,7 +204,7 @@ $$
 \mathcal{L}_{\text{total}} = w_{\text{species}} \cdot \mathcal{L}_{\text{species}} + w_{\text{env}} \cdot \mathcal{L}_{\text{env}}
 $$
 
-The environmental MSE loss regularizes the spatial embedding. Default weights: species=1.0, env=0.1.
+The environmental MSE loss regularizes the spatial embedding. Default weights: species=1.0, env=0.05.
 
 Environmental features with missing values (NaN) are excluded from the MSE
 computation via masked loss — the model is not penalised for positions where
@@ -232,7 +253,7 @@ This loads the model, optimizer, scheduler, and scaler states and continues trai
 
 ## Hyperparameter Autotune
 
-Automatically search for optimal hyperparameters using [Optuna](https://optuna.org/) (Bayesian optimisation with TPE sampler and median pruning).
+Automatically search for optimal hyperparameters using [Optuna](https://optuna.org/) (Akiba et al., 2019; Bayesian optimisation with TPE sampler and median pruning).
 
 ```bash
 python train.py --data_path data.parquet --autotune                  # tune all params
@@ -245,19 +266,39 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 |---|---|
 | `lr` | 1e-4 → 1e-2 (log scale) |
 | `batch_size` | {128, 256, 512, 1024} |
-| `pos_lambda` | 2 → 64 (log scale) |
-| `neg_samples` | {128, 256, 512, 1024, 2048} |
+| `pos_lambda` | 1.0 → 64 (log scale) |
+| `neg_samples` | {128, 256, 512, 1024, 2048, 4096} |
 | `label_smoothing` | 0 → 0.1 |
 | `weight_decay` | 1e-5 → 1e-2 (log scale) |
 | `env_weight` | 0.01 → 1.0 (log scale) |
-| `lr_T0` | {5, 10, 20} |
+| `lr_T0` | {1, 5, 10, 20} |
+| `jitter` | {true, false} |
+| `max_obs_per_species` | {0, 500, 1000, 2000, 5000} |
+| `no_yearly` | {true, false} |
+| `species_loss` | {asl, an, bce, focal} |
+| `asl_gamma_neg` | 1.0 → 8.0 |
+| `asl_clip` | 0.0 → 0.2 |
+| `model_scale` | 0.25 → 3.0 (log scale) |
+| `coord_harmonics` | 2 → 8 (integer) |
+| `week_harmonics` | 2 → 8 (integer) |
+
+!!! note "Data-affecting parameters"
+    When `max_obs_per_species` or `no_yearly` are included in the tuning set, data is re-preprocessed each trial.  This is slower but necessary because these parameters change the training samples.
 
 ### Autotune CLI
 
 | Flag | Default | Description |
 |---|---|---|
 | `--autotune` | — | Enable autotune. Without args: tune all. With args: tune listed params only. |
-| `--autotune_trials` | `20` | Number of Optuna trials |
-| `--autotune_epochs` | `15` | Epochs per trial |
+| `--autotune_trials` | `50` | Number of Optuna trials |
+| `--autotune_epochs` | `10` | Epochs per trial |
 
 Each trial trains a fresh model and optimises towards validation mAP.  Optuna's `MedianPruner` kills unpromising trials early (after 3 warmup epochs).  Results are saved to `checkpoints/autotune/autotune_results.json`, and a suggested `train.py` command with the best parameters is printed.
+
+## References
+
+> Loshchilov, I. & Hutter, F. (2017). SGDR: Stochastic Gradient Descent with Warm Restarts. In *International Conference on Learning Representations*.
+
+> Loshchilov, I. & Hutter, F. (2019). Decoupled Weight Decay Regularization. In *International Conference on Learning Representations*.
+
+> Akiba, T., Sano, S., Yanase, T., Ohta, T., & Koyama, M. (2019). Optuna: A Next-generation Hyperparameter Optimization Framework. In *ACM SIGKDD International Conference on Knowledge Discovery & Data Mining* (pp. 2623–2631).

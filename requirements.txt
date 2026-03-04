@@ -1,16 +1,35 @@
-cartopy
-matplotlib
-pandas
-tqdm
-global-land-mask
-earthengine.api
+# Core
 numpy
-python-dotenv
-h3
+pandas
 geopandas
-shapely
 pyarrow
+shapely
+h3
 scikit-learn
+tqdm
+
+# Deep learning
 torch
-torchvision
-torchaudio
+
+# Visualization
+matplotlib
+cartopy
+Pillow
+
+# Analysis (optional — only for scripts/)
+scipy
+
+# Data collection (optional — only for building datasets)
+earthengine-api
+python-dotenv
+
+# Model export (optional — only for convert.py)
+onnx
+onnxruntime
+onnxconverter-common
+onnxscript
+onnx2tf
+tensorflow
+
+# Hyperparameter tuning (optional — only for --autotune)
+optuna

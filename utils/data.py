@@ -16,7 +16,7 @@ import torch
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 
@@ -66,6 +66,19 @@ class H3DataLoader:
         lons = np.array([c[1] for c in coords])
         return lats, lons
 
+    @staticmethod
+    def compute_jitter_std(h3_cells: np.ndarray) -> float:
+        """Compute coordinate jitter std (degrees) from H3 cell resolution.
+
+        Returns a standard deviation equal to 40 % of the average hexagon
+        edge length (converted to degrees).  With Gaussian noise at this
+        scale, ~95 % of jittered points remain inside the originating cell.
+        """
+        res = h3.get_resolution(h3_cells[0])
+        edge_km = h3.average_hexagon_edge_length(res, unit='km')
+        edge_deg = edge_km / 111.0  # approximate km → degree conversion
+        return edge_deg * 0.4
+
     def get_environmental_features(self) -> pd.DataFrame:
         """Return the environmental feature columns as a DataFrame."""
         self._require_loaded()
@@ -75,12 +88,13 @@ class H3DataLoader:
         self,
         ocean_sample_rate: float = 1.0,
         water_threshold: float = 0.9,
+        include_yearly: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[List[int]], pd.DataFrame]:
         """
         Flatten H3-cell × weeks to individual (lat, lon, week, species, env) samples.
 
-        For each cell, creates 48 weekly samples (week 1–48) plus one yearly
-        sample (week 0) whose species list is the union of all weeks.
+        For each cell, creates 48 weekly samples (week 1–48) and optionally
+        one yearly sample (week 0) whose species list is the union of all weeks.
 
         Args:
             ocean_sample_rate: Fraction of high-water cells to keep (0–1).
@@ -88,6 +102,8 @@ class H3DataLoader:
                 randomly kept at this rate.  Default 1.0 (keep all).
             water_threshold: ``water_fraction`` above which a cell is
                 considered ocean.  Default 0.9.
+            include_yearly: If True (default), include a week-0 yearly sample
+                per cell.  Set to False to train on weekly data only.
 
         Returns:
             lats, lons, weeks, species_lists, env_features
@@ -121,12 +137,14 @@ class H3DataLoader:
             gdf_iter = self.gdf
 
         n_weeks = 48
-        samples_per_cell = n_weeks + 1  # 48 weekly + 1 yearly
+        samples_per_cell = n_weeks + (1 if include_yearly else 0)
 
         lats = np.repeat(cell_lats, samples_per_cell)
         lons = np.repeat(cell_lons, samples_per_cell)
-        # Week order per cell: 1..48, 0 (yearly)
-        week_pattern = np.concatenate([np.arange(1, n_weeks + 1), [0]])
+        # Week order per cell: 1..48 (and optionally 0 for yearly)
+        week_pattern = np.arange(1, n_weeks + 1)
+        if include_yearly:
+            week_pattern = np.concatenate([week_pattern, [0]])
         weeks = np.tile(week_pattern, n_cells)
 
         species_lists: List = []
@@ -137,7 +155,8 @@ class H3DataLoader:
                 species_lists.append(sp)
                 if hasattr(sp, '__iter__'):
                     yearly_species.update(sp)
-            species_lists.append(list(yearly_species))
+            if include_yearly:
+                species_lists.append(list(yearly_species))
 
         env_features_df = pd.DataFrame(
             np.repeat(env_data.values, samples_per_cell, axis=0),
@@ -503,18 +522,23 @@ class BirdSpeciesDataset(Dataset):
     """
 
     def __init__(self, inputs: Dict[str, np.ndarray], targets: Dict[str, Any],
-                 n_species: int = 0):
+                 n_species: int = 0, jitter_std: float = 0.0):
         """Wrap preprocessed arrays as a PyTorch Dataset.
 
         Args:
             inputs: Dict with 'lat', 'lon', 'week' float32 arrays.
             targets: Dict with 'species' (dense or sparse) and 'env_features'.
             n_species: Total number of species (required when species is sparse).
+            jitter_std: Standard deviation (degrees) of Gaussian noise added
+                to lat/lon coordinates each time a sample is drawn.  Set to
+                0.0 to disable (default).  Typically derived from H3 cell
+                resolution via ``H3DataLoader.compute_jitter_std``.
         """
         self.lat = torch.from_numpy(inputs['lat']).float()
         self.lon = torch.from_numpy(inputs['lon']).float()
         self.week = torch.from_numpy(inputs['week']).float()
         self.env_features = torch.from_numpy(targets['env_features']).float()
+        self.jitter_std = jitter_std
 
         species = targets['species']
         if isinstance(species, np.ndarray):
@@ -535,6 +559,14 @@ class BirdSpeciesDataset(Dataset):
 
     def __getitem__(self, idx: int):
         """Return (inputs_dict, targets_dict) for one sample."""
+        lat = self.lat[idx]
+        lon = self.lon[idx]
+
+        if self.jitter_std > 0:
+            noise = torch.randn(2) * self.jitter_std
+            lat = (lat + noise[0]).clamp(-90.0, 90.0)
+            lon = ((lon + noise[1] + 180.0) % 360.0) - 180.0
+
         if self.species_dense is not None:
             sp = self.species_dense[idx]
         else:
@@ -544,9 +576,35 @@ class BirdSpeciesDataset(Dataset):
             if len(indices) > 0:
                 sp[indices] = 1.0
         return (
-            {'lat': self.lat[idx], 'lon': self.lon[idx], 'week': self.week[idx]},
+            {'lat': lat, 'lon': lon, 'week': self.week[idx]},
             {'species': sp, 'env_features': self.env_features[idx]},
         )
+
+
+class FractionalRandomSampler(Sampler):
+    """Sampler that yields a random fraction of training indices each epoch.
+
+    Every call to ``__iter__`` (i.e. every epoch) draws a fresh random
+    subset of ``int(fraction * n)`` indices from ``[0, n)``.  The subset
+    is deterministic: epoch *e* uses seed ``base_seed + e``, so results
+    are reproducible across runs.
+    """
+
+    def __init__(self, n: int, fraction: float = 1.0, seed: int = 42):
+        self.n = n
+        self.k = max(1, int(n * fraction))
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        idx = torch.randperm(self.n, generator=g)[: self.k]
+        self.epoch += 1
+        return iter(idx.tolist())
+
+    def __len__(self) -> int:
+        return self.k
 
 
 def create_dataloaders(
@@ -558,12 +616,32 @@ def create_dataloaders(
     num_workers: int = 0,
     pin_memory: bool = True,
     n_species: int = 0,
+    sample_fraction: float = 1.0,
+    jitter_std: float = 0.0,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Create training and validation DataLoaders."""
-    train_ds = BirdSpeciesDataset(train_inputs, train_targets, n_species=n_species)
+    """Create training and validation DataLoaders.
+
+    Args:
+        sample_fraction: Fraction of training samples to use per epoch
+            (0–1]. Each epoch draws a fresh random subset.
+        jitter_std: Gaussian noise std (degrees) added to training
+            coordinates each time a sample is drawn.  Validation
+            coordinates are never jittered.
+    """
+    train_ds = BirdSpeciesDataset(train_inputs, train_targets,
+                                  n_species=n_species, jitter_std=jitter_std)
     val_ds = BirdSpeciesDataset(val_inputs, val_targets, n_species=n_species)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=pin_memory, drop_last=True)
+
+    if sample_fraction < 1.0:
+        sampler = FractionalRandomSampler(len(train_ds), sample_fraction)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
+                                  num_workers=num_workers, pin_memory=pin_memory,
+                                  drop_last=True)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                  num_workers=num_workers, pin_memory=pin_memory,
+                                  drop_last=True)
+
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=pin_memory)
     return train_loader, val_loader

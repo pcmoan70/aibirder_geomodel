@@ -53,7 +53,7 @@ python utils/geoutils.py --km 350 --out-dir outputs/global_chunks \
     --threads 8 --combine --combined-out data/global_350km_ee.parquet --fill-missing
 
 # 2. Process GBIF archive
-python utils/gbifutils.py --gbif /path/to/gbif_archive.zip --file occurrence.csv \
+python utils/gbifutils.py --gbif /path/to/gbif_archive.zip --file occurrence.txt \
     --output ./outputs/gbif_processed.csv.gz --taxonomy taxonomy.csv
 
 # 3. Combine
@@ -61,7 +61,7 @@ python utils/combine.py --geodata data/global_350km_ee.parquet \
     --gbif ./outputs/gbif_processed.csv.gz --output ./outputs/combined.parquet
 
 # 4. Train
-python train.py --data_path ./outputs/combined.parquet --model_size medium --num_epochs 100
+python train.py --data_path ./outputs/combined.parquet --model_scale 1.0 --num_epochs 100
 
 # 5. Predict
 python predict.py --lat 50.83 --lon 12.92 --week 22
@@ -74,9 +74,9 @@ See the [documentation](https://birdnet-team.github.io/geomodel/) for detailed u
 A multi-task neural network that learns spatial-temporal patterns from coordinates alone:
 
 - **Input:** Raw (lat, lon, week) — circular encoding is handled inside the model
-- **Primary task:** Multi-label species classification (assume-negative loss)
+- **Primary task:** Multi-label species classification (asymmetric loss)
 - **Auxiliary task:** Environmental feature regression (training only, acts as regularizer)
-- **Sizes:** small (~860K), medium (~3.5M), large (~21.5M) parameters
+- **Scalable:** ~1.5M (scale=0.5) to ~47M (scale=2.0) parameters (default scale=1.0 ≈ 7M)
 
 ## Visualization
 

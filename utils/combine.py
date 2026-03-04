@@ -42,12 +42,17 @@ def estimate_gzip_rows(file_path, sample_rows=10000):
 
 
 def combine_geodata_and_gbif(geodata_path, gbif_processed_path, output_path, valid_classes):
-    """
-    Combine geographical data with processed GBIF data.
+    """Combine geographical data with processed GBIF data.
 
     Reads an H3-indexed GeoParquet and a processed GBIF CSV, maps each GBIF
     observation to its H3 cell and week, and writes a combined parquet with
     per-week species lists.
+
+    Args:
+        geodata_path (str): Path to the H3-indexed GeoParquet file.
+        gbif_processed_path (str): Path to the processed GBIF CSV (.csv.gz).
+        output_path (str): Output path for the combined parquet.
+        valid_classes (list[str]): Taxonomic classes to include.
     """
     gdf = gpd.read_parquet(geodata_path)
 
@@ -67,53 +72,63 @@ def combine_geodata_and_gbif(geodata_path, gbif_processed_path, output_path, val
 
     estimated_rows = estimate_gzip_rows(gbif_processed_path)
 
-    with gzip.open(gbif_processed_path, 'rt', encoding='utf-8') as f:
-        with tqdm(total=estimated_rows, desc="Processing GBIF data") as pbar:
-            for chunk in pd.read_csv(f, chunksize=100000, usecols=GBIF_REQUIRED_COLUMNS):
-                chunk_size = len(chunk)
+    # Pandas handles gzip natively — no need for manual gzip.open
+    reader = pd.read_csv(
+        gbif_processed_path, chunksize=500_000, usecols=GBIF_REQUIRED_COLUMNS,
+    )
+    with tqdm(total=estimated_rows, desc="Processing GBIF data") as pbar:
+        for chunk in reader:
+            chunk_size = len(chunk)
 
-                # Filter to valid classes
-                chunk = chunk[chunk['class'].isin(valid_classes_set)]
+            # Filter to valid classes
+            chunk = chunk[chunk['class'].isin(valid_classes_set)]
 
-                if not chunk.empty:
-                    # Compute H3 cells
-                    chunk = chunk.copy()
-                    chunk['h3_cell'] = [
-                        h3.latlng_to_cell(lat, lon, h3_res)
-                        for lat, lon in zip(chunk['latitude'].values, chunk['longitude'].values)
-                    ]
+            if not chunk.empty:
+                # Compute H3 cells
+                h3_cells = [
+                    h3.latlng_to_cell(lat, lon, h3_res)
+                    for lat, lon in zip(chunk['latitude'].values,
+                                        chunk['longitude'].values)
+                ]
+                chunk = chunk.assign(h3_cell=h3_cells)
 
-                    # Track missing cells (log once per cell)
-                    mask = chunk['h3_cell'].isin(valid_h3_cells)
-                    new_missing = set(chunk.loc[~mask, 'h3_cell'].unique()) - missing_cells
-                    if new_missing:
-                        logging.warning(f"{len(new_missing)} new H3 cell(s) not in geodata")
-                        missing_cells.update(new_missing)
+                # Track missing cells (log once per cell)
+                mask = chunk['h3_cell'].isin(valid_h3_cells)
+                new_missing = set(chunk.loc[~mask, 'h3_cell'].unique()) - missing_cells
+                if new_missing:
+                    logging.warning(f"{len(new_missing)} new H3 cell(s) not in geodata")
+                    missing_cells.update(new_missing)
 
-                    # Accumulate species and names
-                    matched = chunk.loc[mask]
-                    for h3_cell, week, taxon, sci_name, com_name in zip(
-                        matched['h3_cell'].values,
-                        matched['week'].values,
-                        matched['taxonKey'].values,
-                        matched['verbatimScientificName'].values,
-                        matched['commonName'].values,
+                matched = chunk.loc[mask]
+                if not matched.empty:
+                    # Accumulate species per (cell, week) via groupby
+                    for (cell, week), species in matched.groupby(
+                        ['h3_cell', 'week'],
+                    )['taxonKey'].agg(set).items():
+                        cell_week_species[(cell, int(week))] |= species
+
+                    # Batch-collect taxon names (once per unique taxonKey)
+                    taxa = matched.drop_duplicates('taxonKey')
+                    for tk, sci, com in zip(
+                        taxa['taxonKey'].values,
+                        taxa['verbatimScientificName'].values,
+                        taxa['commonName'].values,
                     ):
-                        cell_week_species[(h3_cell, int(week))].add(taxon)
-                        tk = int(taxon)
-                        if tk not in taxon_names:
-                            taxon_names[tk] = (str(sci_name), str(com_name))
+                        taxon_names.setdefault(int(tk), (str(sci), str(com)))
 
-                pbar.update(chunk_size)
+            pbar.update(chunk_size)
 
-    # Build index mapping and assign week columns
+    # Build week columns efficiently: construct plain lists, assign once
+    # (avoids slow per-cell gdf.at[] calls)
     h3_to_idx = dict(zip(gdf['h3_index'], gdf.index))
+    n_rows = len(gdf)
+
+    week_lists = {w: [[] for _ in range(n_rows)] for w in range(1, NUM_WEEKS + 1)}
+    for (h3_cell, week), species_set in cell_week_species.items():
+        week_lists[week][h3_to_idx[h3_cell]] = list(species_set)
 
     for week in range(1, NUM_WEEKS + 1):
-        gdf[f'week_{week}'] = [[] for _ in range(len(gdf))]
-
-    for (h3_cell, week), species_set in cell_week_species.items():
-        gdf.at[h3_to_idx[h3_cell], f'week_{week}'] = list(species_set)
+        gdf[f'week_{week}'] = week_lists[week]
 
     if missing_cells:
         logging.info(f"Total {len(missing_cells)} H3 cell(s) from GBIF not found in geodata")
