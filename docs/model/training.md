@@ -378,9 +378,6 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 | `label_smoothing` | 0 → 0.1 |
 | `env_weight` | 0.01 → 1.0 (log scale) |
 | `jitter` | {true, false} |
-| `max_obs_per_species` | {0, 500, 1000, 2000, 5000} |
-| `min_obs_per_species` | {0, 10, 50, 100, 200, 500} |
-| `no_yearly` | {true, false} |
 | `species_loss` | {asl, an, bce, focal} |
 | `asl_gamma_neg` | 1.0 → 8.0 |
 | `asl_clip` | 0.0 → 0.2 |
@@ -389,8 +386,9 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 | `week_harmonics` | 2 → 8 (integer) |
 | `label_freq_weight` | {true, false} |
 
-!!! note "Data-affecting parameters"
-    When `max_obs_per_species`, `min_obs_per_species`, or `no_yearly` are included in the tuning set, data is re-preprocessed each trial.  This is slower but necessary because these parameters change the training samples or vocabulary.
+The dataset is built once before tuning starts.  Data-affecting parameters
+(`--max_obs_per_species`, `--min_obs_per_species`, `--no_yearly`) are set via
+the CLI and stay fixed across all trials.
 
 ### Autotune CLI
 
