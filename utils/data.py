@@ -435,11 +435,24 @@ class H3DataPreprocessor:
     ) -> np.ndarray:
         """Compute per-species label weights based on observation frequency.
 
+        Geographic range (number of occupied cells) is treated as a proxy for
+        local abundance.  This is not ecologically exact — range and abundance
+        are different quantities — but it provides a practical approximation
+        that turns hard binary labels into soft weights, yielding well-ordered
+        ranked species lists for a given location and week.
+
         Species are weighted by how often they occur across all samples:
 
-        - \u2265 90th percentile of counts \u2192 weight 1.0 (common)
-        - \u2264 10th percentile of counts \u2192 *min_weight* (rare)
-        - In between \u2192 linear interpolation
+        - >= 95th percentile of counts -> weight 1.0 (common)
+        - <= 5th percentile of counts  -> *min_weight* (rare)
+        - In between -> sigmoid-shaped interpolation that creates a long-tail
+          distribution (most species stay near *min_weight*, only the most
+          common ramp up sharply toward 1.0)
+
+        The sigmoid shaping uses ``t' = t^3 / (t^3 + (1-t)^3)`` where
+        ``t`` is the linear 0-1 position between the 5th and 95th
+        percentile.  This keeps the mapping monotonic and smooth while
+        concentrating most of the weight mass at the upper end.
 
         The returned array has shape ``(n_species,)`` and is stored as
         ``self.species_freq_weights`` for use in the Dataset.
@@ -461,28 +474,32 @@ class H3DataPreprocessor:
             self.species_freq_weights = np.ones(n_species, dtype=np.float32)
             return self.species_freq_weights
 
-        p10 = np.percentile(nonzero, 10)
-        p90 = np.percentile(nonzero, 90)
+        p5 = np.percentile(nonzero, 5)
+        p95 = np.percentile(nonzero, 95)
 
         weights = np.ones(n_species, dtype=np.float32)
-        if p90 > p10:
+        if p95 > p5:
             for i in range(n_species):
                 c = count_arr[i]
-                if c >= p90:
+                if c >= p95:
                     weights[i] = 1.0
-                elif c <= p10:
+                elif c <= p5:
                     weights[i] = min_weight
                 else:
-                    t = (c - p10) / (p90 - p10)
+                    # Linear position in [0, 1]
+                    t = (c - p5) / (p95 - p5)
+                    # Sigmoid-shaped remapping: long tail, sharp rise at top
+                    t3 = t ** 3
+                    t = t3 / (t3 + (1.0 - t) ** 3)
                     weights[i] = min_weight + t * (1.0 - min_weight)
-        # If p90 == p10 all species have similar counts: uniform weight 1.0
+        # If p95 == p5 all species have similar counts: uniform weight 1.0
 
         self.species_freq_weights = weights
 
         # Print distribution summary
         print(f"   Freq label weights: min={weights.min():.3f}, "
               f"median={np.median(weights):.3f}, max={weights.max():.3f}  "
-              f"(p10={int(p10):,}, p90={int(p90):,} observations)")
+              f"(p5={int(p5):,}, p95={int(p95):,} observations)")
 
         return weights
 
@@ -672,7 +689,10 @@ class BirdSpeciesDataset(Dataset):
         if self.species_dense is not None:
             sp = self.species_dense[idx]
             if self.species_freq_weights is not None:
-                sp = sp * self.species_freq_weights
+                # Only weight positive labels (1s); 0s stay 0
+                mask = sp > 0
+                sp = sp.clone()
+                sp[mask] = self.species_freq_weights[mask]
         else:
             # Materialise dense vector from sparse indices
             sp = torch.zeros(self.n_species, dtype=torch.float32)

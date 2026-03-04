@@ -234,9 +234,44 @@ quantities — but it provides a practical approximation that yields
 well-ordered predictions without requiring actual abundance counts.
 
 When `--label_freq_weight` is passed, positive species labels are scaled by
-observation frequency.  Common species (≥ 90th percentile of observation
-counts) receive weight 1.0, rare species (≤ 10th percentile) receive
-`--label_freq_weight_min` (default 0.1), with linear interpolation in between.
+observation frequency.  Common species (>= 95th percentile of observation
+counts) receive weight 1.0, rare species (<= 5th percentile) receive
+`--label_freq_weight_min` (default 0.1), with a **sigmoid-shaped**
+interpolation in between that creates a long-tail distribution — most species
+stay near the minimum weight and only the most common ramp up sharply toward
+1.0.
+
+The mapping uses $t' = \frac{t^3}{t^3 + (1-t)^3}$ where $t$ is the linear
+position between the 5th and 95th percentile, then
+$w = w_{\min} + t' \cdot (1 - w_{\min})$.  Only positive labels (1s) are
+affected — zeros stay at 0, so this does **not** act as label smoothing.
+
+#### Weight curve
+
+The table below shows the resulting label weight at various positions between
+the 5th and 95th percentile (with default `min_weight=0.1`).  For example, if
+the 5th percentile is 50 observations and the 95th is 5,000, a species with
+1,025 observations sits at the 20% mark and receives weight 0.11.
+
+| Position between p5–p95 | Sigmoid $t'$ | Label weight | Category |
+|---|---|---|---|
+| 0% (≤ p5) | 0.000 | **0.10** | Rare — minimal gradient contribution |
+| 10% | 0.001 | 0.10 | Uncommon — near-minimum weight |
+| 20% | 0.015 | 0.11 | Uncommon |
+| 30% | 0.073 | 0.17 | Below average |
+| 40% | 0.229 | 0.31 | Below average |
+| 50% | 0.500 | 0.55 | Average — midpoint |
+| 60% | 0.771 | 0.79 | Above average |
+| 70% | 0.927 | 0.93 | Common |
+| 80% | 0.985 | 0.99 | Common — near-maximum weight |
+| 90% | 0.999 | 1.00 | Very common |
+| 100% (≥ p95) | 1.000 | **1.00** | Abundant — full gradient contribution |
+
+The S-shaped curve means roughly the **bottom 40% of species by frequency
+receive weights below 0.3**, while the **top 30% are effectively at full
+weight**.  This concentrates gradient signal on well-observed species whose
+labels are most reliable, while still allowing the model to learn from rarer
+species at reduced intensity.
 
 | Parameter | Default | Description |
 |---|---|---|

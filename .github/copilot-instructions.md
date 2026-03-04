@@ -81,8 +81,8 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
   - Supports `min_obs_per_species` to exclude rare species (default 100)
 - `compute_species_freq_weights()`: Per-species label weights based on observation frequency
   - Treats range (number of occupied cells) as a proxy for abundance
-  - Common species (>=90th percentile) -> weight 1.0; rare (<=10th pct) -> min_weight (default 0.1)
-  - Linear interpolation between percentiles; stored as `self.species_freq_weights`
+  - Common species (>=95th percentile) -> weight 1.0; rare (<=5th pct) -> min_weight (default 0.1)
+  - Sigmoid-shaped interpolation between percentiles; stored as `self.species_freq_weights`
 - `split_data()`: Location-based train/val/test splitting to prevent data leakage
 
 **data.py** - PyTorch Dataset:

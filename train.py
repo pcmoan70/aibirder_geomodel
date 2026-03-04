@@ -746,7 +746,8 @@ def main():
                              '(Gaussian noise scaled to cell size, augments spatial inputs)')
     parser.add_argument('--label_freq_weight', action='store_true',
                         help='Weight positive labels by species frequency '
-                             '(common=1.0, rare=min_weight, interpolated between 10th/90th percentile)')
+                             '(common=1.0, rare=min_weight, sigmoid-shaped '
+                             'interpolation between 5th/95th percentile)')
     parser.add_argument('--label_freq_weight_min', type=float, default=0.1,
                         help='Minimum label weight for rare species (default: 0.1)')
 
