@@ -90,6 +90,11 @@ python scripts/plot_range_maps.py --species "Barn Swallow" --bounds europe
 # Species richness heatmap
 python scripts/plot_richness.py --week 26
 
+# Ground truth overlay (pass training parquet to any of the above)
+python scripts/plot_species_weeks.py --lat 50.83 --lon 12.92 --data_path outputs/combined.parquet
+python scripts/plot_range_maps.py --species "Barn Swallow" --data_path outputs/combined.parquet
+python scripts/plot_richness.py --week 26 --data_path outputs/combined.parquet
+
 # Variable importance (Spearman correlations)
 python scripts/plot_variable_importance.py --species "Great Tit" --data_path data.parquet
 

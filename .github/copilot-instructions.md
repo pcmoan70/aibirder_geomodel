@@ -241,9 +241,9 @@ geomodel/
 │   ├── combine.py              # Merge EE features + GBIF observations
 │   └── regions.py              # H3 region definitions
 ├── scripts/
-│   ├── plot_species_weeks.py   # Weekly probability charts
-│   ├── plot_range_maps.py      # Species distribution maps (static PNG or animated GIF)
-│   ├── plot_richness.py        # Species richness heatmaps
+│   ├── plot_species_weeks.py   # Weekly probability charts (+ ground truth overlay via --data_path)
+│   ├── plot_range_maps.py      # Species distribution maps (static PNG or animated GIF, + GT overlay)
+│   ├── plot_richness.py        # Species richness heatmaps (+ side-by-side observed vs predicted)
 │   ├── plot_training.py        # Training loss curves and metrics
 │   ├── plot_variable_importance.py  # Feature importance analysis
 │   └── plot_environmental.py   # Environmental feature visualization
