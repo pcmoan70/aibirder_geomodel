@@ -443,37 +443,54 @@ class BirdNETGeoModel(nn.Module):
 def create_model(
     n_species: int,
     n_env_features: int,
-    model_size: str = 'medium',
+    model_scale: float = 1.0,
     coord_harmonics: int = 4,
     week_harmonics: int = 4,
 ) -> BirdNETGeoModel:
-    """Create model with predefined size configuration."""
-    configs = {
-        'small': dict(
-            embed_dim=256, encoder_blocks=3,
-            species_head_dim=256, species_head_blocks=1, species_bottleneck=64,
-            env_head_dim=128, env_head_blocks=1,
-            dropout=0.1, species_dropout=0.15, env_dropout=0.1,
-        ),
-        'medium': dict(
-            embed_dim=512, encoder_blocks=4,
-            species_head_dim=512, species_head_blocks=2, species_bottleneck=128,
-            env_head_dim=256, env_head_blocks=1,
-            dropout=0.1, species_dropout=0.2, env_dropout=0.1,
-        ),
-        'large': dict(
-            embed_dim=1024, encoder_blocks=6,
-            species_head_dim=1024, species_head_blocks=3, species_bottleneck=256,
-            env_head_dim=512, env_head_blocks=2,
-            dropout=0.15, species_dropout=0.25, env_dropout=0.15,
-        ),
-    }
+    """Create model with a continuous size scaling factor.
 
-    if model_size not in configs:
-        raise ValueError(f"model_size must be one of {list(configs.keys())}")
+    ``model_scale=1.0`` matches the former *medium* preset
+    (embed_dim=512, 4 encoder blocks, ~7 M params with 12 K species).
+    Dimensions scale linearly; block counts are rounded to the nearest
+    integer (minimum 1).
+
+    Rough parameter-count landmarks (with 12 K species):
+
+    * 0.5  → ~1.8 M  (≈ former *small*)
+    * 1.0  → ~7.2 M  (≈ former *medium*)
+    * 2.0  → ~36 M   (≈ former *large*)
+
+    Args:
+        n_species: Number of target species.
+        n_env_features: Number of environmental features.
+        model_scale: Continuous scaling factor (default 1.0).
+        coord_harmonics: Harmonics for lat/lon encoding.
+        week_harmonics: Harmonics for week encoding.
+    """
+    # Reference dimensions at scale=1.0 (former "medium")
+    embed_dim = max(64, round(512 * model_scale / 64) * 64)
+    species_head_dim = embed_dim
+    species_bottleneck = max(32, round(128 * model_scale / 32) * 32)
+    env_head_dim = max(64, round(256 * model_scale / 64) * 64)
+
+    encoder_blocks = max(1, round(4 * model_scale))
+    species_head_blocks = max(1, round(2 * model_scale))
+    env_head_blocks = max(1, round(1 * model_scale))
+
+    # Dropout scales mildly with size
+    base_dropout = 0.1 + 0.025 * (model_scale - 1.0)
+    dropout = max(0.0, min(base_dropout, 0.3))
+    species_dropout = max(0.0, min(base_dropout + 0.1, 0.4))
+    env_dropout = max(0.0, min(base_dropout, 0.3))
 
     return BirdNETGeoModel(
         n_species=n_species, n_env_features=n_env_features,
         coord_harmonics=coord_harmonics, week_harmonics=week_harmonics,
-        **configs[model_size],
+        embed_dim=embed_dim, encoder_blocks=encoder_blocks,
+        species_head_dim=species_head_dim,
+        species_head_blocks=species_head_blocks,
+        species_bottleneck=species_bottleneck,
+        env_head_dim=env_head_dim, env_head_blocks=env_head_blocks,
+        dropout=dropout, species_dropout=species_dropout,
+        env_dropout=env_dropout,
     )

@@ -14,7 +14,7 @@ Features:
 
 Usage:
     python train.py --data_path ./outputs/global_350km_ee_gbif.parquet
-    python train.py --data_path data.parquet --model_size large --num_epochs 100
+    python train.py --data_path data.parquet --model_scale 2.0 --num_epochs 100
     python train.py --resume checkpoints/checkpoint_best.pt
     python train.py --data_path data.parquet --autotune
     python train.py --data_path data.parquet --autotune lr pos_lambda --autotune_trials 30
@@ -44,7 +44,7 @@ TUNABLE_PARAMS = [
     'lr', 'batch_size', 'pos_lambda', 'neg_samples',
     'label_smoothing', 'weight_decay', 'env_weight', 'lr_T0',
     'jitter', 'max_obs_per_species', 'no_yearly', 'species_loss',
-    'model_size', 'coord_harmonics', 'week_harmonics',
+    'model_scale', 'coord_harmonics', 'week_harmonics',
 ]
 
 # Params that affect data preprocessing — when tuned, data is re-processed per trial
@@ -385,8 +385,8 @@ def _suggest_param(trial, name: str, args):
         return trial.suggest_categorical('no_yearly', [True, False])
     if name == 'species_loss':
         return trial.suggest_categorical('species_loss', ['an', 'bce', 'focal'])
-    if name == 'model_size':
-        return trial.suggest_categorical('model_size', ['small', 'medium', 'large'])
+    if name == 'model_scale':
+        return trial.suggest_float('model_scale', 0.25, 3.0, log=True)
     if name == 'coord_harmonics':
         return trial.suggest_int('coord_harmonics', 2, 8)
     if name == 'week_harmonics':
@@ -526,7 +526,7 @@ def run_autotune(args, device: torch.device):
         # Fresh model
         model = create_model(
             n_species=n_species, n_env_features=n_env,
-            model_size=str(p.get('model_size', args.model_size)),
+            model_scale=float(p.get('model_scale', args.model_scale)),
             coord_harmonics=int(p.get('coord_harmonics', args.coord_harmonics)),
             week_harmonics=int(p.get('week_harmonics', args.week_harmonics)),
         )
@@ -672,31 +672,32 @@ def main():
     parser.add_argument('--data_path', type=str, default='./outputs/global_350km_ee_gbif.parquet')
 
     # Model
-    parser.add_argument('--model_size', type=str, default='medium', choices=['small', 'medium', 'large'])
-    parser.add_argument('--coord_harmonics', type=int, default=4,
-                        help='Number of harmonics for lat/lon circular encoding (default: 4)')
+    parser.add_argument('--model_scale', type=float, default=1.0,
+                        help='Model size scaling factor (1.0 ≈ 7M params, 0.5 ≈ 1.8M, 2.0 ≈ 36M)')
+    parser.add_argument('--coord_harmonics', type=int, default=8,
+                        help='Number of harmonics for lat/lon circular encoding (default: 8)')
     parser.add_argument('--week_harmonics', type=int, default=4,
                         help='Number of harmonics for week circular encoding (default: 4)')
 
     # Training
-    parser.add_argument('--batch_size', type=int, default=512)
+    parser.add_argument('--batch_size', type=int, default=1024)
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--weight_decay', type=float, default=1e-3)
     parser.add_argument('--species_weight', type=float, default=1.0)
-    parser.add_argument('--env_weight', type=float, default=0.25)
+    parser.add_argument('--env_weight', type=float, default=0.05)
     parser.add_argument('--species_loss', type=str, default='bce', choices=['bce', 'focal', 'an'],
-                        help='Species loss function: an (cross-entropy, default), bce, or focal')
+                        help='Species loss function: bce (cross-entropy, default), bce, or focal')
     parser.add_argument('--focal_alpha', type=float, default=0.25)
     parser.add_argument('--focal_gamma', type=float, default=2.0)
     parser.add_argument('--pos_lambda', type=float, default=8.0,
                         help='Positive up-weighting λ for assume-negative loss (default: 8)')
     parser.add_argument('--neg_samples', type=int, default=1024,
                         help='Number of negative species to sample per example for AN loss (default: 1024, 0=all)')
-    parser.add_argument('--label_smoothing', type=float, default=0.01,
-                        help='Smooth binary targets to prevent overconfident predictions (default: 0.01, 0=off)')
-    parser.add_argument('--max_obs_per_species', type=int, default=5000,
-                        help='Cap observations per species to reduce common-species dominance (default: 5000, 0=no cap)')
+    parser.add_argument('--label_smoothing', type=float, default=0.05,
+                        help='Smooth binary targets to prevent overconfident predictions (default: 0.05, 0=off)')
+    parser.add_argument('--max_obs_per_species', type=int, default=50000,
+                        help='Cap observations per species to reduce common-species dominance (default: 50000, 0=no cap)')
     parser.add_argument('--ocean_sample_rate', type=float, default=0.1,
                         help='Fraction of ocean cells (water_fraction > 0.9) to keep (default: 0.1, 1.0=keep all)')
     parser.add_argument('--no_yearly', action='store_true',
@@ -721,7 +722,7 @@ def main():
                         help='Early stopping patience (0 = disabled)')
 
     # Data split
-    parser.add_argument('--test_size', type=float, default=0.2)
+    parser.add_argument('--test_size', type=float, default=0.1)
     parser.add_argument('--val_size', type=float, default=0.1)
     parser.add_argument('--sample_fraction', type=float, default=1.0,
                         help='Fraction of training data to use (default: 1.0 = all, 0.1 = 10%% random subset)')
@@ -735,7 +736,8 @@ def main():
 
     # Device
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'])
-    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--num_workers', type=int, default=min(4, os.cpu_count() or 1),
+                        help='Number of DataLoader worker processes (default: min(4, CPU cores))')
 
     # Autotune
     parser.add_argument('--autotune', nargs='*', default=None, metavar='PARAM',
@@ -763,7 +765,7 @@ def main():
     print("  BirdNET Geomodel Training")
     print("=" * 70)
     print(f"  Data:       {args.data_path}")
-    print(f"  Model:      {args.model_size}")
+    print(f"  Model:      scale={args.model_scale}")
     print(f"  Epochs:     {args.num_epochs}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  LR:         {args.lr}  (schedule: {args.lr_schedule}, warmup: {args.lr_warmup})")
@@ -833,14 +835,14 @@ def main():
     # -- Model ---
     print("\n6. Creating model...")
     model = create_model(
-        n_species=n_species, n_env_features=n_env, model_size=args.model_size,
+        n_species=n_species, n_env_features=n_env, model_scale=args.model_scale,
         coord_harmonics=args.coord_harmonics, week_harmonics=args.week_harmonics,
     )
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"   {args.model_size} — {total_params:,} params (~{total_params * 4 / 1024 / 1024:.1f} MB)")
+    print(f"   scale={args.model_scale} — {total_params:,} params (~{total_params * 4 / 1024 / 1024:.1f} MB)")
 
     model_config = {
-        'model_size': args.model_size,
+        'model_scale': args.model_scale,
         'n_species': n_species,
         'n_env_features': n_env,
         'coord_harmonics': args.coord_harmonics,

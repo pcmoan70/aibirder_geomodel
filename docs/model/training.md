@@ -11,7 +11,7 @@ This trains a medium-sized model with sensible defaults. For a full training run
 ```bash
 python train.py \
     --data_path outputs/combined.parquet \
-    --model_size medium \
+    --model_scale 1.0 \
     --num_epochs 100 \
     --batch_size 256 \
     --lr 0.001 \
@@ -41,7 +41,7 @@ The training script handles the full pipeline automatically:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model_size` | `medium` | `small`, `medium`, or `large` |
+| `--model_scale` | `1.0` | Continuous scaling factor (0.5 ≈ 1.8M, 1.0 ≈ 7M, 2.0 ≈ 36M params) |
 | `--coord_harmonics` | `4` | Harmonics for lat/lon encoding |
 | `--week_harmonics` | `4` | Harmonics for week encoding |
 
@@ -274,7 +274,7 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 | `max_obs_per_species` | {0, 500, 1000, 2000, 5000} |
 | `no_yearly` | {true, false} |
 | `species_loss` | {an, bce, focal} |
-| `model_size` | {small, medium, large} |
+| `model_scale` | 0.25 → 3.0 (log scale) |
 | `coord_harmonics` | 2 → 8 (integer) |
 | `week_harmonics` | 2 → 8 (integer) |
 

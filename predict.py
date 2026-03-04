@@ -75,7 +75,7 @@ def predict(
     model = create_model(
         n_species=model_config['n_species'],
         n_env_features=model_config['n_env_features'],
-        model_size=model_config['model_size'],
+        model_scale=model_config.get('model_scale', 1.0),
         coord_harmonics=model_config.get('coord_harmonics', 4),
         week_harmonics=model_config.get('week_harmonics', 4),
     )

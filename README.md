@@ -61,7 +61,7 @@ python utils/combine.py --geodata data/global_350km_ee.parquet \
     --gbif ./outputs/gbif_processed.csv.gz --output ./outputs/combined.parquet
 
 # 4. Train
-python train.py --data_path ./outputs/combined.parquet --model_size medium --num_epochs 100
+python train.py --data_path ./outputs/combined.parquet --model_scale 1.0 --num_epochs 100
 
 # 5. Predict
 python predict.py --lat 50.83 --lon 12.92 --week 22
