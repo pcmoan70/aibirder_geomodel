@@ -46,7 +46,8 @@ Join the H3 environmental grid with species observations:
 python utils/combine.py \
     --geodata data/global_50km_ee.parquet \
     --gbif ./outputs/gbif_processed.csv.gz \
-    --output ./outputs/combined.parquet
+    --output ./outputs/combined.parquet \
+    --workers 16
 ```
 
 This produces a combined parquet with per-week species lists and a taxonomy CSV. See [Combining Data](../pipeline/combine.md).
