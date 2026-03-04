@@ -422,7 +422,69 @@ class H3DataPreprocessor:
             'week': weeks.astype(np.float32),
         }
         targets = {'species': species_enc, 'env_features': normalized_env}
+
+        # Frequency-based label weights (computed here, applied in Dataset)
+        self.species_freq_weights = None
+
         return inputs, targets
+
+    def compute_species_freq_weights(
+        self,
+        species_lists: List[List[int]],
+        min_weight: float = 0.1,
+    ) -> np.ndarray:
+        """Compute per-species label weights based on observation frequency.
+
+        Species are weighted by how often they occur across all samples:
+
+        - \u2265 90th percentile of counts \u2192 weight 1.0 (common)
+        - \u2264 10th percentile of counts \u2192 *min_weight* (rare)
+        - In between \u2192 linear interpolation
+
+        The returned array has shape ``(n_species,)`` and is stored as
+        ``self.species_freq_weights`` for use in the Dataset.
+        """
+        from collections import Counter
+
+        counts: Counter = Counter()
+        for sl in species_lists:
+            for sid in sl:
+                if sid in self.species_to_idx:
+                    counts[self.species_to_idx[sid]] += 1
+
+        n_species = len(self.species_vocab)
+        count_arr = np.array([counts.get(i, 0) for i in range(n_species)],
+                             dtype=np.float64)
+
+        nonzero = count_arr[count_arr > 0]
+        if len(nonzero) == 0:
+            self.species_freq_weights = np.ones(n_species, dtype=np.float32)
+            return self.species_freq_weights
+
+        p10 = np.percentile(nonzero, 10)
+        p90 = np.percentile(nonzero, 90)
+
+        weights = np.ones(n_species, dtype=np.float32)
+        if p90 > p10:
+            for i in range(n_species):
+                c = count_arr[i]
+                if c >= p90:
+                    weights[i] = 1.0
+                elif c <= p10:
+                    weights[i] = min_weight
+                else:
+                    t = (c - p10) / (p90 - p10)
+                    weights[i] = min_weight + t * (1.0 - min_weight)
+        # If p90 == p10 all species have similar counts: uniform weight 1.0
+
+        self.species_freq_weights = weights
+
+        # Print distribution summary
+        print(f"   Freq label weights: min={weights.min():.3f}, "
+              f"median={np.median(weights):.3f}, max={weights.max():.3f}  "
+              f"(p10={int(p10):,}, p90={int(p90):,} observations)")
+
+        return weights
 
     def _cap_observations(
         self,
@@ -552,7 +614,8 @@ class BirdSpeciesDataset(Dataset):
     """
 
     def __init__(self, inputs: Dict[str, np.ndarray], targets: Dict[str, Any],
-                 n_species: int = 0, jitter_std: float = 0.0):
+                 n_species: int = 0, jitter_std: float = 0.0,
+                 species_freq_weights: Optional[np.ndarray] = None):
         """Wrap preprocessed arrays as a PyTorch Dataset.
 
         Args:
@@ -563,12 +626,21 @@ class BirdSpeciesDataset(Dataset):
                 to lat/lon coordinates each time a sample is drawn.  Set to
                 0.0 to disable (default).  Typically derived from H3 cell
                 resolution via ``H3DataLoader.compute_jitter_std``.
+            species_freq_weights: Optional 1-D array of per-species label
+                weights.  When provided, positive labels use the weight
+                instead of 1.0.
         """
         self.lat = torch.from_numpy(inputs['lat']).float()
         self.lon = torch.from_numpy(inputs['lon']).float()
         self.week = torch.from_numpy(inputs['week']).float()
         self.env_features = torch.from_numpy(targets['env_features']).float()
         self.jitter_std = jitter_std
+
+        # Per-species label weights (frequency-based)
+        if species_freq_weights is not None:
+            self.species_freq_weights = torch.from_numpy(species_freq_weights).float()
+        else:
+            self.species_freq_weights = None
 
         species = targets['species']
         if isinstance(species, np.ndarray):
@@ -599,12 +671,17 @@ class BirdSpeciesDataset(Dataset):
 
         if self.species_dense is not None:
             sp = self.species_dense[idx]
+            if self.species_freq_weights is not None:
+                sp = sp * self.species_freq_weights
         else:
             # Materialise dense vector from sparse indices
             sp = torch.zeros(self.n_species, dtype=torch.float32)
             indices = self.species_sparse[idx]
             if len(indices) > 0:
-                sp[indices] = 1.0
+                if self.species_freq_weights is not None:
+                    sp[indices] = self.species_freq_weights[indices]
+                else:
+                    sp[indices] = 1.0
         return (
             {'lat': lat, 'lon': lon, 'week': self.week[idx]},
             {'species': sp, 'env_features': self.env_features[idx]},
@@ -614,8 +691,8 @@ class BirdSpeciesDataset(Dataset):
 class FractionalRandomSampler(Sampler):
     """Sampler that yields a random fraction of training indices each epoch.
 
-    Every call to ``__iter__`` (i.e. every epoch) draws a fresh random
-    subset of ``int(fraction * n)`` indices from ``[0, n)``.  The subset
+    Every call to :meth:`__iter__` (i.e. every epoch) draws a fresh random
+    subset of ``int(fraction * n)`` indices from ``range(n)``.  The subset
     is deterministic: epoch *e* uses seed ``base_seed + e``, so results
     are reproducible across runs.
     """
@@ -648,18 +725,23 @@ def create_dataloaders(
     n_species: int = 0,
     sample_fraction: float = 1.0,
     jitter_std: float = 0.0,
+    species_freq_weights: Optional[np.ndarray] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
     Args:
-        sample_fraction: Fraction of training samples to use per epoch
-            (0–1]. Each epoch draws a fresh random subset.
+        sample_fraction: Fraction of training samples to use per epoch,
+            between 0 (exclusive) and 1 (inclusive). Each epoch draws a
+            fresh random subset.
         jitter_std: Gaussian noise std (degrees) added to training
             coordinates each time a sample is drawn.  Validation
             coordinates are never jittered.
+        species_freq_weights: Optional per-species label weights.
+            Applied to training set only; validation uses binary labels.
     """
     train_ds = BirdSpeciesDataset(train_inputs, train_targets,
-                                  n_species=n_species, jitter_std=jitter_std)
+                                  n_species=n_species, jitter_std=jitter_std,
+                                  species_freq_weights=species_freq_weights)
     val_ds = BirdSpeciesDataset(val_inputs, val_targets, n_species=n_species)
 
     if sample_fraction < 1.0:

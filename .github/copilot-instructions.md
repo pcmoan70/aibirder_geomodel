@@ -80,17 +80,23 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - `prepare_training_data()`: Complete preprocessing pipeline
   - Supports `max_obs_per_species` to cap common species observations
   - Supports `min_obs_per_species` to exclude rare species (default 100)
+- `compute_species_freq_weights()`: Per-species label weights based on observation frequency
+  - Treats range (number of occupied cells) as a proxy for abundance
+  - Common species (>=90th percentile) -> weight 1.0; rare (<=10th pct) -> min_weight (default 0.1)
+  - Linear interpolation between percentiles; stored as `self.species_freq_weights`
 - `split_data()`: Location-based train/val/test splitting to prevent data leakage
 
 **data.py** - PyTorch Dataset:
 - `BirdSpeciesDataset`: PyTorch Dataset wrapper with sparse-to-dense conversion
   - Optional `jitter_std` (degrees) adds Gaussian noise to lat/lon on each draw
+  - Optional `species_freq_weights` applies per-species label weights (training only)
   - Lat clamped to [-90, 90], lon wrapped at ±180°
 - `FractionalRandomSampler`: Sampler that draws a deterministic random subset of
   training indices each epoch (seed `42 + epoch`). Used when `sample_fraction < 1`.
 - `create_dataloaders()`: Creates training and validation DataLoaders
   - Accepts `sample_fraction` (0–1]; uses `FractionalRandomSampler` when < 1
   - Accepts `jitter_std`; applied to training set only (val is never jittered)
+  - Accepts `species_freq_weights`; applied to training set only
   - Val loader always uses all validation samples
 
 **geoutils.py**: Google Earth Engine feature extraction for H3 cells

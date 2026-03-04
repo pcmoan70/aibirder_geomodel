@@ -460,6 +460,14 @@ def run_autotune(args, device: torch.device):
         n_species = info['n_species']
         n_env = info['n_env_features']
         print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
+
+        # Frequency-based label weights
+        _freq_weights = None
+        if args.label_freq_weight:
+            _freq_weights = preprocessor.compute_species_freq_weights(
+                species_lists, min_weight=args.label_freq_weight_min,
+            )
+
         print("4. Splitting data...")
         train_in, val_in, _, train_tgt, val_tgt, _ = preprocessor.split_data(
             inputs, targets, test_size=args.test_size, val_size=args.val_size,
@@ -517,6 +525,11 @@ def run_autotune(args, device: torch.device):
             _info = _prep.get_preprocessing_info()
             n_species = _info['n_species']
             n_env = _info['n_env_features']
+            _trial_freq_weights = None
+            if args.label_freq_weight:
+                _trial_freq_weights = _prep.compute_species_freq_weights(
+                    _sp, min_weight=args.label_freq_weight_min,
+                )
             t_in, v_in, _, t_tgt, v_tgt, _ = _prep.split_data(
                 _inputs, _targets, test_size=args.test_size,
                 val_size=args.val_size, random_state=42,
@@ -524,6 +537,7 @@ def run_autotune(args, device: torch.device):
             )
         else:
             t_in, v_in, t_tgt, v_tgt = train_in, val_in, train_tgt, val_tgt
+            _trial_freq_weights = _freq_weights
 
         # DataLoaders (batch_size may vary per trial)
         t_loader, v_loader = create_dataloaders(
@@ -533,6 +547,7 @@ def run_autotune(args, device: torch.device):
             n_species=n_species,
             sample_fraction=args.sample_fraction,
             jitter_std=jitter_std,
+            species_freq_weights=_trial_freq_weights,
         )
 
         # Fresh model
@@ -729,6 +744,11 @@ def main():
     parser.add_argument('--jitter', action='store_true',
                         help='Jitter training coordinates within H3 cells each epoch '
                              '(Gaussian noise scaled to cell size, augments spatial inputs)')
+    parser.add_argument('--label_freq_weight', action='store_true',
+                        help='Weight positive labels by species frequency '
+                             '(common=1.0, rare=min_weight, interpolated between 10th/90th percentile)')
+    parser.add_argument('--label_freq_weight_min', type=float, default=0.1,
+                        help='Minimum label weight for rare species (default: 0.1)')
 
     # LR schedule
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],
@@ -808,6 +828,8 @@ def main():
         print(f"  Ocean:      keep {args.ocean_sample_rate:.0%} of high-water cells")
     if args.jitter:
         print(f"  Jitter:     enabled (Gaussian noise within H3 cells)")
+    if args.label_freq_weight:
+        print(f"  Freq weight: enabled (min={args.label_freq_weight_min})")
     print(f"  Device:     {device}")
 
     # -- Data loading & preprocessing ---
@@ -840,6 +862,13 @@ def main():
     n_env = info['n_env_features']
     print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
 
+    # Frequency-based label weights (computed from original species_lists)
+    freq_weights = None
+    if args.label_freq_weight:
+        freq_weights = preprocessor.compute_species_freq_weights(
+            species_lists, min_weight=args.label_freq_weight_min,
+        )
+
     print("4. Splitting data...")
     train_in, val_in, test_in, train_tgt, val_tgt, test_tgt = preprocessor.split_data(
         inputs, targets, test_size=args.test_size, val_size=args.val_size,
@@ -858,6 +887,7 @@ def main():
         n_species=n_species,
         sample_fraction=args.sample_fraction,
         jitter_std=jitter_std,
+        species_freq_weights=freq_weights,
     )
 
     # -- Model ---

@@ -68,6 +68,8 @@ The training script handles the full pipeline automatically:
 | `--ocean_sample_rate` | `0.1` | Fraction of high-water cells to keep (1.0 = keep all) |
 | `--no_yearly` | off | Exclude week-0 (yearly) samples from training |
 | `--jitter` | off | Jitter training coordinates within H3 cells each epoch |
+| `--label_freq_weight` | off | Weight positive labels by species frequency |
+| `--label_freq_weight_min` | `0.1` | Minimum label weight for rare species |
 
 ### Learning Rate Schedule
 
@@ -216,6 +218,38 @@ fewer than the specified number of samples are excluded from the vocabulary
 entirely.  This removes extremely rare species that the model cannot
 meaningfully learn from small sample counts and reduces the output dimension.
 Set to 0 to keep all species regardless of observation count.
+
+### Label Frequency Weighting
+
+Our training data contains only hard presence/absence labels (1s and 0s) — a
+species was either observed at a location/week or it was not.  However, for
+producing useful ranked species lists the model should ideally score common
+species higher than rare ones.  Label frequency weighting addresses this by
+treating **geographic range as a proxy for local abundance**: a species observed
+across many cells is likely more common at any given location than one recorded
+in only a handful of cells.
+
+This is not ecologically exact — range and local abundance are different
+quantities — but it provides a practical approximation that yields
+well-ordered predictions without requiring actual abundance counts.
+
+When `--label_freq_weight` is passed, positive species labels are scaled by
+observation frequency.  Common species (≥ 90th percentile of observation
+counts) receive weight 1.0, rare species (≤ 10th percentile) receive
+`--label_freq_weight_min` (default 0.1), with linear interpolation in between.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--label_freq_weight` | off | Enable frequency-based label weighting |
+| `--label_freq_weight_min` | `0.1` | Minimum weight assigned to rare species |
+
+```bash
+python train.py --label_freq_weight --label_freq_weight_min 0.1
+```
+
+!!! note
+    Label frequency weighting applies to the **training set only** — validation
+    uses standard binary labels for unbiased evaluation.
 
 ### References
 
