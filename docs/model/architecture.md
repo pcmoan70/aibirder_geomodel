@@ -59,7 +59,7 @@ graph TD
 
 Raw coordinates and week numbers are poor inputs for neural networks — the model wouldn't know that longitude -180° and +180° are the same place, or that week 48 is adjacent to week 1.
 
-**Circular encoding** solves this by mapping each value to sine/cosine pairs at multiple harmonics:
+**Circular encoding** solves this by mapping each value to sine/cosine pairs at multiple harmonics (Tancik et al., 2020):
 
 $$
 \text{encode}(\theta) = [\sin(\theta), \cos(\theta), \sin(2\theta), \cos(2\theta), \ldots, \sin(n\theta), \cos(n\theta)]
@@ -75,7 +75,7 @@ Year-round predictions (week 0) are computed at inference time as the **max** ac
 
 ### Shared Encoder (`SpatioTemporalEncoder`)
 
-The encoder maps spatial coordinates into a rich embedding, **modulated by temporal information** via FiLM (Feature-wise Linear Modulation):
+The encoder maps spatial coordinates into a rich embedding, **modulated by temporal information** via FiLM (Feature-wise Linear Modulation; Perez et al., 2018):
 
 1. **Spatial projection**: Concatenated lat+lon circular features → Linear to `embed_dim` (default 512)
 2. **Residual blocks** — each block applies LayerNorm → GELU → Linear → LayerNorm → GELU → Dropout → Linear with a skip connection
@@ -127,3 +127,9 @@ The "+ species" part scales with the number of species in the vocabulary (bottle
 
 !!! tip "Choosing harmonics"
     The default values (4 coordinate, 4 week) work well for global models. Higher harmonics add capacity for finer-grained patterns but increase input dimensionality and risk overfitting on small datasets.
+
+## References
+
+> Perez, E., Strub, F., de Vries, H., Dumoulin, V., & Courville, A. (2018). FiLM: Visual Reasoning with a General Conditioning Layer. In *AAAI Conference on Artificial Intelligence* (pp. 3942–3951).
+
+> Tancik, M., Srinivasan, P.P., Mildenhall, B., Fridovich-Keil, S., Raber, N., Barron, J.T., & Ng, R. (2020). Fourier Features Let Networks Learn High Frequency Functions in Low Dimensional Domains. In *Advances in Neural Information Processing Systems* (pp. 7537–7547).

@@ -28,6 +28,9 @@ class CircularEncoding(nn.Module):
         [sin(θ), cos(θ), sin(2θ), cos(2θ), …, sin(nθ), cos(nθ)]
 
     Output dimension = 2 * n_harmonics per input scalar.
+
+    Reference: Tancik et al., "Fourier Features Let Networks Learn High
+    Frequency Functions in Low Dimensional Domains" (NeurIPS 2020).
     """
 
     def __init__(self, n_harmonics: int = 1):
@@ -104,6 +107,9 @@ class SpatioTemporalEncoder(nn.Module):
     Linear Modulation) scale and shift parameters that modulate the
     spatial representation.  This forces the network to actively use
     temporal information rather than relying on a weak concatenated signal.
+
+    Reference: Perez et al., "FiLM: Visual Reasoning with a General
+    Conditioning Layer" (AAAI 2018).
 
     Inputs (all per-sample):
         lat  : float in [-90, 90]

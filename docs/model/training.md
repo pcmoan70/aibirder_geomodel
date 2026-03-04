@@ -51,7 +51,7 @@ The training script handles the full pipeline automatically:
 | `--batch_size` | `1024` | Batch size |
 | `--num_epochs` | `50` | Maximum epochs |
 | `--lr` | `0.001` | Initial learning rate |
-| `--weight_decay` | `0.001` | AdamW weight decay |
+| `--weight_decay` | `0.001` | AdamW (Loshchilov & Hutter, 2019) weight decay |
 | `--species_weight` | `1.0` | Species loss multiplier |
 | `--env_weight` | `0.05` | Environmental loss multiplier |
 | `--species_loss` | `asl` | Loss function: `asl` (asymmetric, default), `bce`, `focal`, or `an` |
@@ -72,7 +72,7 @@ The training script handles the full pipeline automatically:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--lr_schedule` | `cosine` | `cosine` (warm restarts) or `none` |
+| `--lr_schedule` | `cosine` | `cosine` (warm restarts; Loshchilov & Hutter, 2017) or `none` |
 | `--lr_T0` | `10` | Cosine restart period in epochs |
 | `--lr_min` | `1e-6` | Minimum learning rate |
 | `--lr_warmup` | `3` | Linear warmup epochs before cosine schedule (0 = off) |
@@ -196,6 +196,8 @@ from dominating the gradient signal.
 
 > Ridnik, T., Ben-Baruch, E., Zamir, N., Noy, A., Friedman, I., Protter, M., & Zelnik-Manor, L. (2021). Asymmetric Loss For Multi-Label Classification. In *IEEE/CVF International Conference on Computer Vision* (pp. 82–91).
 
+> Lin, T.-Y., Goyal, P., Girshick, R., He, K., & Dollár, P. (2017). Focal Loss for Dense Object Detection. In *IEEE International Conference on Computer Vision* (pp. 2980–2988).
+
 > Cole, E., Van Horn, G., Lange, C., Shepard, A., Leary, P., Perona, P., Loarie, S., & Mac Aodha, O. (2023). Spatial implicit neural representations for global-scale species mapping. In *International Conference on Machine Learning* (pp. 6320–6342). PMLR.
 
 ### Multi-Task Weighting
@@ -255,7 +257,7 @@ This loads the model, optimizer, scheduler, and scaler states and continues trai
 
 ## Hyperparameter Autotune
 
-Automatically search for optimal hyperparameters using [Optuna](https://optuna.org/) (Bayesian optimisation with TPE sampler and median pruning).
+Automatically search for optimal hyperparameters using [Optuna](https://optuna.org/) (Akiba et al., 2019; Bayesian optimisation with TPE sampler and median pruning).
 
 ```bash
 python train.py --data_path data.parquet --autotune                  # tune all params
@@ -296,3 +298,11 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 | `--autotune_epochs` | `10` | Epochs per trial |
 
 Each trial trains a fresh model and optimises towards validation mAP.  Optuna's `MedianPruner` kills unpromising trials early (after 3 warmup epochs).  Results are saved to `checkpoints/autotune/autotune_results.json`, and a suggested `train.py` command with the best parameters is printed.
+
+## References
+
+> Loshchilov, I. & Hutter, F. (2017). SGDR: Stochastic Gradient Descent with Warm Restarts. In *International Conference on Learning Representations*.
+
+> Loshchilov, I. & Hutter, F. (2019). Decoupled Weight Decay Regularization. In *International Conference on Learning Representations*.
+
+> Akiba, T., Sano, S., Yanase, T., Ohta, T., & Koyama, M. (2019). Optuna: A Next-generation Hyperparameter Optimization Framework. In *ACM SIGKDD International Conference on Knowledge Discovery & Data Mining* (pp. 2623–2631).
