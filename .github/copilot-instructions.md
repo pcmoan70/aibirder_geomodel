@@ -181,13 +181,18 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - Automatic mixed precision (AMP) on CUDA
 - Gradient clipping (max_norm=1.0) to prevent exploding gradients
 - Linear LR warmup (3 epochs) + CosineAnnealingLR schedule (single decay, no restarts)
-- Early stopping with configurable patience (default 10), based on validation mAP
+- Early stopping with configurable patience (default 10), based on validation **GeoScore**
 - Checkpoint management:
   - `checkpoint_latest.pt`: Latest model state
-  - `checkpoint_best.pt`: Best validation mAP
+  - `checkpoint_best.pt`: Best validation GeoScore
 - `labels.txt`: Species vocabulary (taxonKey → scientific name → common name)
 - `training_history.json`: Per-epoch loss, LR, and evaluation metrics
 - Evaluation metrics computed during validation:
+  - **GeoScore**: composite quality metric (primary optimisation target)
+    - Weighted sum of mAP (0.25), F1@10% (0.20), list-ratio@10% log-symmetric (0.15),
+      watchlist mean AP (0.20), mAP density ratio (0.10), 1 − pred-density corr (0.10)
+    - Missing components excluded, weights renormalised
+    - Used for early stopping, best-checkpoint selection, and Optuna autotune
   - Mean Average Precision (mAP)
   - Top-k recall at k=10 and k=30
   - F1, precision, recall at probability thresholds 5%, 10%, 25%

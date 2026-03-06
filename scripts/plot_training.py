@@ -97,13 +97,18 @@ def plot_training(
 
     # --- Metrics (if available) ---
     if has_metrics:
-        # mAP
+        # GeoScore + mAP
         ax = axes[ax_idx]; ax_idx += 1
-        ax.plot(epochs, history['val_map'], color='tab:green', linewidth=1.5)
-        ax.set_title('Validation mAP', fontweight='bold')
+        ax.plot(epochs, history['val_map'], color='tab:green', linewidth=1.5,
+                label='mAP')
+        if 'val_geoscore' in history and len(history['val_geoscore']) > 0:
+            ax.plot(epochs, history['val_geoscore'], color='tab:purple',
+                    linewidth=2, label='GeoScore')
+        ax.set_title('Validation mAP & GeoScore', fontweight='bold')
         ax.set_xlabel('Epoch')
-        ax.set_ylabel('mAP')
+        ax.set_ylabel('Score')
         ax.set_ylim(0, 1)
+        ax.legend()
         ax.grid(True, alpha=0.3)
 
         # Top-k recall

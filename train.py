@@ -6,7 +6,7 @@ Pipeline: load parquet → preprocess → train multi-task model → save checkp
 Features:
   - AdamW optimizer with linear LR warmup + CosineAnnealingLR (single decay, no restarts)
   - Automatic mixed-precision (AMP) on CUDA for ~2× speed-up
-  - Early stopping based on validation mAP plateau
+  - Early stopping based on GeoScore (composite quality metric)
   - Asymmetric Loss (ASL, default); BCE, focal, and assume-negative also available
   - Label smoothing and observation cap for regularization
   - Gradient clipping
@@ -27,7 +27,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -160,6 +160,80 @@ WATCHLIST_SPECIES: Dict[int, str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# GeoScore — composite quality metric
+# ---------------------------------------------------------------------------
+
+# Component weights: (metric_key, weight, transform)
+# Transforms convert raw values to a [0, 1] quality score where higher = better.
+_GEOSCORE_COMPONENTS: List[Tuple[str, float]] = [
+    ('map',                0.25),   # Ranking quality (mAP, already 0-1)
+    ('f1_10',              0.20),   # Practical species-list quality
+    ('list_ratio_10',      0.15),   # List-length calibration (transformed below)
+    ('watchlist_mean_ap',  0.20),   # Restricted-range / endemic species
+    ('map_density_ratio',  0.10),   # Bias robustness: sparse vs dense
+    ('pred_density_corr',  0.10),   # Decorrelation from observer effort
+]
+
+
+def compute_geoscore(metrics: Dict[str, float]) -> float:
+    """Compute the GeoScore composite quality metric.
+
+    GeoScore collapses the validation metrics into a single 0–1 value
+    that balances ranking quality, classification performance,
+    list-length calibration, endemic-species coverage, and observation-
+    bias robustness.
+
+    Components (with default weights, renormalized when any are missing):
+
+    ============================  ======  ========================================
+    Component                     Weight  Meaning
+    ============================  ======  ========================================
+    mAP                            0.25   Ranking quality (higher = better)
+    F1 @ 10 %                      0.20   Species-list quality at 10 % threshold
+    List-ratio @ 10 % (log-sym)    0.15   ``max(0, 1 − |ln(LR)|)``; perfect = 1
+    Watchlist mean AP               0.20   Restricted-range species coverage
+    mAP density ratio               0.10   ``mAP_sparse / mAP_dense``; 1 = unbiased
+    1 − pred-density corr           0.10   ``max(0, 1 − r)``; 0 correlation = best
+    ============================  ======  ========================================
+
+    When a component is unavailable (NaN or missing), its weight is
+    redistributed proportionally among the remaining components.
+
+    Args:
+        metrics: Dict returned by ``Trainer.validate()``.
+
+    Returns:
+        GeoScore in [0, 1].
+    """
+    scored: List[Tuple[float, float]] = []  # (value, weight)
+
+    for key, weight in _GEOSCORE_COMPONENTS:
+        raw = metrics.get(key, float('nan'))
+        if raw is None or math.isnan(raw):
+            continue
+
+        # Transform to 0-1 quality score
+        if key == 'list_ratio_10':
+            # Log-symmetric penalty: perfect list ratio = 1.0 → score 1.0
+            # Over- or under-prediction reduces score symmetrically
+            val = max(0.0, 1.0 - abs(math.log(max(raw, 1e-8))))
+        elif key == 'pred_density_corr':
+            # Decorrelation: lower correlation → higher quality
+            val = max(0.0, 1.0 - abs(raw))
+        else:
+            # mAP, F1, watchlist AP, density ratio: already 0-1
+            val = float(raw)
+
+        scored.append((val, weight))
+
+    if not scored:
+        return 0.0
+
+    total_weight = sum(w for _, w in scored)
+    return sum(v * w for v, w in scored) / total_weight
+
+
 class Trainer:
     """Training loop with validation, checkpointing, LR scheduling, AMP, and early stopping."""
 
@@ -214,6 +288,7 @@ class Trainer:
             'val_list_ratio_5': [], 'val_list_ratio_10': [], 'val_list_ratio_25': [],
             'val_map_sparse': [], 'val_map_dense': [], 'val_map_density_ratio': [],
             'val_pred_density_corr': [],
+            'val_geoscore': [],
             'lr': [],
         }
         # Holdout region metrics (populated only when holdout_loader is set)
@@ -229,7 +304,7 @@ class Trainer:
         if self.watchlist_indices:
             self.history['val_watchlist_mean_ap'] = []
 
-        self.best_val_map = 0.0
+        self.best_geoscore = 0.0
         self.current_epoch = 0
         self._epochs_no_improve = 0
 
@@ -521,6 +596,9 @@ class Trainer:
             valid_aps = [v for v in wl_aps.values() if not math.isnan(v)]
             metrics['watchlist_mean_ap'] = sum(valid_aps) / max(len(valid_aps), 1) if valid_aps else float('nan')
 
+        # GeoScore composite metric
+        metrics['geoscore'] = compute_geoscore(metrics)
+
         return metrics
 
     # -- checkpointing ----------------------------------------------------
@@ -538,7 +616,7 @@ class Trainer:
             'epoch': self.current_epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'best_val_map': self.best_val_map,
+            'best_geoscore': self.best_geoscore,
             'history': self.history,
             'model_config': self.model_config,
             'species_vocab': self.species_vocab,
@@ -551,7 +629,7 @@ class Trainer:
         torch.save(checkpoint, self.checkpoint_dir / 'checkpoint_latest.pt')
         if is_best:
             torch.save(checkpoint, self.checkpoint_dir / 'checkpoint_best.pt')
-            print(f"  Saved best model (mAP: {self.best_val_map:.4f})")
+            print(f"  Saved best model (GeoScore: {self.best_geoscore:.4f})")
 
     def load_checkpoint(self, checkpoint_path: Path):
         """Restore training state from a checkpoint file.
@@ -575,7 +653,7 @@ class Trainer:
         self.model.load_state_dict(ckpt['model_state_dict'])
         self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         self.current_epoch = ckpt['epoch']
-        self.best_val_map = ckpt.get('best_val_map', 0.0)
+        self.best_geoscore = ckpt.get('best_geoscore', ckpt.get('best_val_map', 0.0))
         self.history = ckpt['history']
         self.model_config = ckpt.get('model_config', {})
         self.species_vocab = ckpt.get('species_vocab', {})
@@ -630,6 +708,7 @@ class Trainer:
                 for k in ('map_sparse', 'map_dense', 'map_density_ratio',
                            'pred_density_corr'):
                     self.history[f'val_{k}'].append(val_m.get(k, float('nan')))
+                self.history['val_geoscore'].append(val_m.get('geoscore', float('nan')))
 
                 # Watchlist per-species AP history
                 for tk in self.watchlist_indices:
@@ -677,10 +756,12 @@ class Trainer:
                 if holdout_m is not None:
                     print(f"  Holdout: mAP={holdout_m['map']:.4f}  "
                           f"F1@10%={holdout_m.get('f1_10', 0):.4f}")
+                _gs = val_m.get('geoscore', float('nan'))
+                print(f"  GeoScore: {_gs:.4f}")
 
-                is_best = val_m['map'] > self.best_val_map
+                is_best = _gs > self.best_geoscore
                 if is_best:
-                    self.best_val_map = val_m['map']
+                    self.best_geoscore = _gs
                     self._epochs_no_improve = 0
                 else:
                     self._epochs_no_improve += 1
@@ -705,7 +786,7 @@ class Trainer:
         with open(self.checkpoint_dir / 'training_history.json', 'w') as f:
             json.dump(self.history, f, indent=2)
 
-        print(f"\nTraining complete \u2014 best mAP: {self.best_val_map:.4f}")
+        print(f"\nTraining complete \u2014 best GeoScore: {self.best_geoscore:.4f}")
         print(f"Checkpoints: {self.checkpoint_dir}")
 
 
@@ -942,8 +1023,8 @@ def run_autotune(args, device: torch.device):
             patience=0,  # no early stopping within trials — Optuna prunes
         )
 
-        # Train for n_epochs, report mAP after each epoch for pruning
-        best_map = 0.0
+        # Train for n_epochs, report GeoScore after each epoch for pruning
+        best_geoscore = 0.0
         epoch_history = []
         for epoch in range(n_epochs):
             trainer.current_epoch = epoch
@@ -959,8 +1040,8 @@ def run_autotune(args, device: torch.device):
             if scheduler is not None:
                 scheduler.step()
 
-            val_map = val_m['map']
-            best_map = max(best_map, val_map)
+            val_gs = val_m.get('geoscore', val_m['map'])
+            best_geoscore = max(best_geoscore, val_gs)
 
             epoch_history.append({
                 'epoch': epoch,
@@ -971,6 +1052,7 @@ def run_autotune(args, device: torch.device):
                 'val_species_loss': val_m['species_loss'],
                 'val_env_loss': val_m['env_loss'],
                 'val_map': val_m['map'],
+                'val_geoscore': val_gs,
                 'val_top10_recall': val_m['top10_recall'],
                 'val_top30_recall': val_m['top30_recall'],
                 'val_f1_5': val_m['f1_5'],
@@ -982,12 +1064,12 @@ def run_autotune(args, device: torch.device):
             })
             trial.set_user_attr('epoch_history', epoch_history)
 
-            trial.report(val_map, epoch)
+            trial.report(val_gs, epoch)
 
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-        return best_map
+        return best_geoscore
 
     # -- Run study --------------------------------------------------------
     print(f"\n{'=' * 70}")
@@ -1007,7 +1089,7 @@ def run_autotune(args, device: torch.device):
         b = study.best_trial
         parts = [f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
                  for k, v in b.params.items()]
-        print(f"  Best so far: mAP={b.value:.4f} (trial {b.number})  {', '.join(parts)}")
+        print(f"  Best so far: GeoScore={b.value:.4f} (trial {b.number})  {', '.join(parts)}")
 
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True,
                    callbacks=[_after_trial],
@@ -1018,7 +1100,7 @@ def run_autotune(args, device: torch.device):
     print(f"\n{'=' * 70}")
     print(f"  Autotune Complete")
     print(f"{'=' * 70}")
-    print(f"  Best mAP:   {best.value:.4f}  (trial {best.number})")
+    print(f"  Best GeoScore:   {best.value:.4f}  (trial {best.number})")
     print(f"\n  Best hyperparameters:")
     for k, v in best.params.items():
         if isinstance(v, float):
@@ -1031,7 +1113,7 @@ def run_autotune(args, device: torch.device):
     results_dir.mkdir(parents=True, exist_ok=True)
     results_path = results_dir / 'autotune_results.json'
     results = {
-        'best_map': best.value,
+        'best_geoscore': best.value,
         'best_params': best.params,
         'n_trials': n_trials,
         'epochs_per_trial': n_epochs,

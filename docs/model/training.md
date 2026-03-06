@@ -79,11 +79,52 @@ The training script handles the full pipeline automatically:
 | `--lr_min` | `1e-6` | Minimum learning rate |
 | `--lr_warmup` | `3` | Linear warmup epochs before cosine schedule (0 = off) |
 
+### GeoScore — Composite Quality Metric
+
+GeoScore combines validation metrics into a single 0–1 value.
+It is the **primary optimization target**: early stopping, best-checkpoint
+selection, and Optuna autotune all maximise GeoScore.
+
+$$
+\text{GeoScore} = \frac{\sum_{i} w_i \cdot s_i}{\sum_{i} w_i}
+$$
+
+where each $s_i$ is a component score normalised to $[0, 1]$ (higher = better):
+
+| Component | Key | Weight | Transform |
+|---|---|---|---|
+| Ranking quality | `mAP` | 0.25 | as-is |
+| Classification quality | `F1 @ 10%` | 0.20 | as-is |
+| List-length calibration | `list_ratio @ 10%` | 0.15 | $\max(0,\; 1 - |\ln(\text{LR})|)$ |
+| Endemic species | `watchlist_mean_ap` | 0.20 | as-is |
+| Density robustness | `mAP_density_ratio` | 0.10 | as-is (sparse / dense) |
+| Decorrelation | `pred_density_corr` | 0.10 | $\max(0,\; 1 - |r|)$ |
+
+!!! info "Why a composite metric?"
+
+    Optimising mAP alone can push the model toward over-predicting species
+    (inflating recall at the cost of precision) or ignoring rare/endemic
+    species.  GeoScore guards against this by explicitly rewarding:
+
+    - **List calibration** — the log-symmetric penalty ensures predicted
+      species lists are close in length to observed lists.
+    - **Endemic coverage** — watchlist AP prevents the model from focusing
+      exclusively on common species.
+    - **Bias robustness** — density ratio and decorrelation penalise
+      models that merely mirror observer effort patterns.
+
+!!! tip "Missing components"
+
+    When a component is unavailable (e.g. no watchlist species in the
+    vocabulary, or no observation-density data), its weight is
+    redistributed proportionally among the remaining components.
+    GeoScore is always comparable across runs.
+
 ### Early Stopping
 
 | Flag | Default | Description |
 |---|---|---|
-| `--patience` | `10` | Stop after N epochs without mAP improvement (0 = disabled) |
+| `--patience` | `10` | Stop after N epochs without GeoScore improvement (0 = disabled) |
 
 ### Data Split
 
