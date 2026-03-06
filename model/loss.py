@@ -255,13 +255,13 @@ class MultiTaskLoss(nn.Module):
         env_weight: float = 0.1,
         pos_weight: Optional[torch.Tensor] = None,
         species_loss: str = 'asl',
-        focal_alpha: float = 0.25,
+        focal_alpha: float = 0.5,
         focal_gamma: float = 2.0,
-        pos_lambda: float = 8.0,
+        pos_lambda: float = 4.0,
         neg_samples: int = 1024,
         label_smoothing: float = 0.05,
         asl_gamma_pos: float = 0.0,
-        asl_gamma_neg: float = 4.0,
+        asl_gamma_neg: float = 2.0,
         asl_clip: float = 0.05,
         reduction: str = 'mean',
     ):
@@ -271,13 +271,13 @@ class MultiTaskLoss(nn.Module):
             env_weight: Multiplier for environmental loss.
             pos_weight: Positive-class weights for BCE mode (ignored for focal/an/asl).
             species_loss: 'asl' (asymmetric, default), 'bce', 'focal', or 'an'.
-            focal_alpha: Alpha for focal loss.
+            focal_alpha: Alpha for focal loss (default 0.5 = neutral).
             focal_gamma: Gamma for focal loss.
-            pos_lambda: λ for assume-negative loss (positive up-weighting).
+            pos_lambda: λ for assume-negative loss (positive up-weighting, default 4).
             neg_samples: M for assume-negative loss (negative species to sample).
             label_smoothing: Smooth binary targets (AN loss only, 0 = off).
             asl_gamma_pos: ASL focusing parameter for positive species (default 0).
-            asl_gamma_neg: ASL focusing parameter for negative species (default 4).
+            asl_gamma_neg: ASL focusing parameter for negative species (default 2).
             asl_clip: ASL probability margin for negatives (default 0.05).
         """
         super().__init__()

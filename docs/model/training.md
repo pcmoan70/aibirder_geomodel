@@ -192,23 +192,67 @@ where $p_i = \sigma(z_i)$ and $p_m = \max(p_i - m,\, 0)$ is the probability afte
 | `--asl_gamma_neg` | `2.0` | Negative focusing — higher suppresses easy negatives more |
 | `--asl_clip` | `0.05` | Hard probability margin for negatives (0 = disable) |
 
+!!! info "Why γ-=2 instead of 4?"
+    The original ASL paper uses γ-=4 for ImageNet-scale multi-label classification
+    where the positive/negative imbalance is less extreme.  In our setting
+    (10K species, >99.9% negatives per sample) the imbalance is far more
+    severe, and aggressive negative suppression with γ-=4 can cause the model
+    to under-predict rare species.  **γ-=2 is a conservative default** that
+    still down-weights easy negatives while preserving enough gradient signal
+    from moderately-confident negatives.  The ablation study (A10) tests
+    γ-∈{2, 4, 6} to find the best trade-off.
+
 ### BCE
 
-Standard binary cross-entropy with logits. Enable with `--species_loss bce`.
+Standard binary cross-entropy with logits.  Enable with `--species_loss bce`.
 
 $$
 \mathcal{L}_{\text{BCE}} = -\frac{1}{N} \sum_{i} \left[ y_i \log(\sigma(z_i)) + (1-y_i) \log(1-\sigma(z_i)) \right]
 $$
 
+BCE treats every positive and negative label equally — no focusing, no
+re-weighting.  This makes it the simplest baseline and often achieves the
+best raw **mAP** (ranking quality) because it does not distort the gradient
+landscape.  However, the lack of negative suppression means the model
+receives overwhelmingly more gradient from the >99.9% negative labels,
+which can lead to:
+
+- **Over-prediction** — inflated species lists (list-ratio >> 1.0)
+- **Poor calibration** — probabilities not well-separated between present/absent species
+- **Rare species neglect** — endemic or restricted-range species drowned out by common-species negatives
+
 ### Focal Loss
 
-Down-weights easy negatives and up-weights hard positives. Useful when species occur very rarely (>99% of labels are 0).
+Focal loss (Lin et al., 2017) down-weights easy examples and
+up-weights hard ones.  Originally designed for single-label object detection,
+it applies here as a multi-label variant where each species is an independent
+binary classification.
 
 $$
 \mathcal{L}_{\text{focal}} = -\alpha_t (1 - p_t)^\gamma \log(p_t)
 $$
 
-Enable with `--species_loss focal`. Tune `--focal_alpha` and `--focal_gamma` as needed.
+where $\alpha_t$ is the class-weighting factor and $\gamma$ is the focusing
+parameter.  At $\gamma=0$ focal loss collapses to weighted BCE.
+
+The key parameter is **`--focal_alpha`** which controls the weight given to
+the positive class:
+
+| `focal_alpha` | Positive weight | Negative weight | Effect |
+|---|---|---|---|
+| 0.25 | 0.25 | 0.75 | Down-weights positives — **harmful** when positives are already rare |
+| 0.50 | 0.50 | 0.50 | Neutral — lets `focal_gamma` handle all re-weighting (default) |
+| 0.75 | 0.75 | 0.25 | Up-weights positives — can help if recall is too low |
+
+!!! info "Why alpha=0.5 instead of 0.25?"
+    The original focal loss paper uses α=0.25 for COCO object detection where
+    foreground/background imbalance is ~1:3.  In our setting each species
+    occurs in <0.1% of samples, so down-weighting the already-rare positive
+    class with α=0.25 starves the model of positive gradient.  **α=0.5
+    (neutral)** lets the focusing parameter γ handle the imbalance alone,
+    which is the safer default for extreme multi-label problems.
+
+Enable with `--species_loss focal`.  Tune `--focal_alpha` and `--focal_gamma` as needed.
 
 ### Assume-Negative Loss
 
@@ -234,6 +278,14 @@ $$
 
 where $P$ is the set of positive species, $N_M$ is a random sample of $M$
 assumed-negative species, and $\lambda$ controls positive up-weighting.
+
+!!! info "Why λ=4 instead of 8?"
+    The SINR paper uses λ=8 for the iNaturalist domain where positive labels
+    are rarer and more uncertain.  Our training data includes structured
+    checklists (eBird) with higher detection reliability, so strong positive
+    up-weighting can amplify false positives.  **λ=4 is a conservative
+    default** that balances positive/negative gradients without over-correcting.
+    Increase if recall is too low; the ablation autotune searches 1–64.
 
 Enable with `--species_loss an`:
 
