@@ -83,6 +83,12 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
   - Treats range (number of occupied cells) as a proxy for abundance
   - Common species (>=95th percentile) -> weight 1.0; rare (<=5th pct) -> min_weight (default 0.1)
   - Sigmoid-shaped interpolation between percentiles; stored as `self.species_freq_weights`
+- `compute_obs_density()`: Per-sample observation density (total species detections
+  at each location across all weeks). Serves as a proxy for observer effort.
+  Stored in `inputs['obs_density']` and used for density-stratified validation metrics.
+- `mask_regions()`: Split data into in-region (holdout) and out-of-region (train)
+  subsets by geographic bounding boxes. Returns (outside_inputs, outside_targets,
+  inside_inputs, inside_targets).
 - `split_data()`: Location-based train/val/test splitting to prevent data leakage
 - `subsample_by_location()`: Randomly subsample a fraction of locations (and all
   their samples). Preserves temporal structure within each H3 cell.
@@ -106,6 +112,10 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 **geoutils.py**: Google Earth Engine feature extraction for H3 cells
 **gbifutils.py**: GBIF species occurrence data retrieval (parallel processing with multiprocessing pool)
 **combine.py**: Merges Earth Engine features with GBIF observations into a single parquet
+**regions.py**: Holdout region definitions and resolution
+- `HOLDOUT_REGIONS` dict: 5 well-surveyed regions (us_northwest, benelux, uk, california, japan)
+  as (lon_min, lat_min, lon_max, lat_max) bounding boxes
+- `resolve_holdout_regions(names)`: Resolves region name strings to bbox tuples
 
 ### Model Architecture (`model/`)
 
@@ -151,11 +161,11 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 
 **loss.py** - Loss Functions:
 - `asymmetric_loss()`: Default loss — ASL (Ridnik et al., 2021) for multi-label classification
-  - Separate focusing: γ+=0 (keep all positives), γ-=4 (suppress easy negatives)
+  - Separate focusing: γ+=0 (keep all positives), γ-=2 (suppress easy negatives)
   - Probability margin clip=0.05 discards very easy negatives
 - `AssumeNegativeLoss`: LAN-full strategy (Cole et al., 2023) for presence-only data
   - Up-weights positives by λ, samples M negatives per example
-  - Default: λ=8, M=1024, label_smoothing=0.05
+  - Default: λ=4, M=1024, label_smoothing=0.05
 - `MultiTaskLoss`: Weighted combination of species loss + environmental MSE
   - Total Loss = species_weight × species_loss + env_weight × MSE
   - Species loss: `asl` (default), `bce`, `focal`, or `an` (assume-negative)
@@ -184,6 +194,9 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
   - List-ratio and mean list length at the same thresholds
   - Per-species AP for 18 endemic/restricted-range watchlist species
     (Hawaiian, NZ, Galápagos, other), with watchlist mean AP
+  - Density-stratified mAP (sparse/dense quartiles by observation density)
+  - Prediction-density correlation (Pearson r between obs density and predicted count)
+  - Holdout region metrics (mAP, F1@10% on held-out geographic regions)
 - `WATCHLIST_SPECIES` dict in train.py maps taxonKeys to common names
 - Progress tracking with tqdm
 - GPU/CPU support with automatic device selection
@@ -200,7 +213,8 @@ python train.py \
   --model_scale 1.0 \
   --batch_size 256 \
   --num_epochs 100 \
-  --lr 0.001
+  --lr 0.001 \
+  --holdout_regions us_northwest benelux  # optional: mask regions from training
 ```
 
 ### Inference (`predict.py`)

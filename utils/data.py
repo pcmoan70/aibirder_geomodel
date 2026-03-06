@@ -362,6 +362,105 @@ class H3DataPreprocessor:
             sparse.append(np.array(indices, dtype=np.int32))
         return sparse
 
+    # -- Observation density -----------------------------------------------
+
+    @staticmethod
+    def compute_obs_density(
+        inputs: Dict[str, np.ndarray],
+        species_lists: List[List[int]],
+    ) -> np.ndarray:
+        """Compute per-sample observation density for density-stratified evaluation.
+
+        For each unique location (lat, lon), sums the total number of species
+        detections across all samples at that location.  Each sample is then
+        assigned its location's total density.  This serves as a proxy for
+        observer effort / survey intensity.
+
+        A well-surveyed H3 cell (e.g. Central Park, NYC) will have a high
+        density value; a poorly surveyed cell (e.g. rural Siberia) will have
+        a low value.  During validation the density is used to stratify
+        metrics — a model that generalises well should have similar mAP in
+        dense and sparse strata.
+
+        Args:
+            inputs: Dict with 'lat', 'lon' float32 arrays.
+            species_lists: Per-sample lists of taxonKeys (before encoding).
+
+        Returns:
+            Float32 array of shape ``(n_samples,)`` with per-location density.
+        """
+        lats = inputs['lat']
+        lons = inputs['lon']
+
+        # Sum species detections per location
+        loc_density: Dict[tuple, float] = {}
+        for i, (lat, lon) in enumerate(zip(lats, lons)):
+            key = (float(lat), float(lon))
+            sl = species_lists[i]
+            n = len(sl) if hasattr(sl, '__len__') else 0
+            loc_density[key] = loc_density.get(key, 0) + n
+
+        # Assign back to each sample
+        density = np.array(
+            [loc_density[(float(lat), float(lon))] for lat, lon in zip(lats, lons)],
+            dtype=np.float32,
+        )
+        return density
+
+    # -- Region masking ---------------------------------------------------
+
+    @staticmethod
+    def mask_regions(
+        inputs: Dict[str, np.ndarray],
+        targets: Dict[str, Any],
+        regions: List[Tuple[float, float, float, float]],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """Split data into outside-region and inside-region subsets.
+
+        Samples whose (lat, lon) falls inside any of the given bounding boxes
+        are moved to the "inside" subset; the rest stay in "outside".  This
+        enables region hold-out experiments: train on the outside subset and
+        evaluate spatial generalisation on the inside (held-out) subset.
+
+        Args:
+            inputs:  Dict with 'lat', 'lon', 'week' (and optionally
+                     'obs_density') arrays.
+            targets: Dict with 'species' and 'env_features'.
+            regions: List of ``(lon_min, lat_min, lon_max, lat_max)`` bboxes.
+
+        Returns:
+            ``(inputs_outside, targets_outside, inputs_inside, targets_inside)``
+        """
+        lats = inputs['lat']
+        lons = inputs['lon']
+
+        inside = np.zeros(len(lats), dtype=bool)
+        for lon_min, lat_min, lon_max, lat_max in regions:
+            inside |= (
+                (lats >= lat_min) & (lats <= lat_max)
+                & (lons >= lon_min) & (lons <= lon_max)
+            )
+        outside = ~inside
+
+        def _subset(d: Dict[str, Any], mask: np.ndarray) -> Dict[str, Any]:
+            out = {}
+            for k, v in d.items():
+                if isinstance(v, np.ndarray):
+                    out[k] = v[mask]
+                elif isinstance(v, list):
+                    idxs = np.where(mask)[0]
+                    out[k] = [v[i] for i in idxs]
+                else:
+                    out[k] = v
+            return out
+
+        return (
+            _subset(inputs, outside),
+            _subset(targets, outside),
+            _subset(inputs, inside),
+            _subset(targets, inside),
+        )
+
     # -- Full pipeline ----------------------------------------------------
 
     # Heuristic: if dense matrix would exceed this many bytes, use sparse
@@ -422,6 +521,11 @@ class H3DataPreprocessor:
             'week': weeks.astype(np.float32),
         }
         targets = {'species': species_enc, 'env_features': normalized_env}
+
+        # Observation density for density-stratified evaluation
+        inputs['obs_density'] = self.compute_obs_density(
+            inputs, species_lists,
+        )
 
         # Frequency-based label weights (computed here, applied in Dataset)
         self.species_freq_weights = None
@@ -759,6 +863,12 @@ class BirdSpeciesDataset(Dataset):
         self.env_features = torch.from_numpy(targets['env_features']).float()
         self.jitter_std = jitter_std
 
+        # Observation density (optional, for density-stratified eval)
+        if 'obs_density' in inputs:
+            self.obs_density = torch.from_numpy(inputs['obs_density']).float()
+        else:
+            self.obs_density = None
+
         # Per-species label weights (frequency-based)
         if species_freq_weights is not None:
             self.species_freq_weights = torch.from_numpy(species_freq_weights).float()
@@ -798,15 +908,21 @@ class BirdSpeciesDataset(Dataset):
                 mask = sp > 0
                 sp = sp.clone()
                 sp[mask] = self.species_freq_weights[mask]
+            inp = {'lat': lat, 'lon': lon, 'week': self.week[idx]}
+            if self.obs_density is not None:
+                inp['obs_density'] = self.obs_density[idx]
             return (
-                {'lat': lat, 'lon': lon, 'week': self.week[idx]},
+                inp,
                 {'species': sp, 'env_features': self.env_features[idx]},
             )
         else:
             # Return raw sparse indices — dense vector is built in collate_fn
             indices = self.species_sparse[idx]
+            inp = {'lat': lat, 'lon': lon, 'week': self.week[idx]}
+            if self.obs_density is not None:
+                inp['obs_density'] = self.obs_density[idx]
             return (
-                {'lat': lat, 'lon': lon, 'week': self.week[idx]},
+                inp,
                 {'species_indices': indices, 'env_features': self.env_features[idx]},
             )
 
@@ -831,6 +947,11 @@ def _make_sparse_collate_fn(
         week = torch.stack([inp['week'] for inp in inputs_list])
         env = torch.stack([tgt['env_features'] for tgt in targets_list])
 
+        inp = {'lat': lat, 'lon': lon, 'week': week}
+        # Observation density (optional, for density-stratified eval)
+        if 'obs_density' in inputs_list[0]:
+            inp['obs_density'] = torch.stack([i['obs_density'] for i in inputs_list])
+
         # Build dense species matrix from sparse indices
         B = len(batch)
         species = torch.zeros(B, n_species, dtype=torch.float32)
@@ -844,7 +965,7 @@ def _make_sparse_collate_fn(
                     species[i, idx_t] = 1.0
 
         return (
-            {'lat': lat, 'lon': lon, 'week': week},
+            inp,
             {'species': species, 'env_features': env},
         )
 

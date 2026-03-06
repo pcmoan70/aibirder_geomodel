@@ -37,6 +37,7 @@ from tqdm import tqdm
 from model.model import create_model
 from model.loss import MultiTaskLoss
 from utils.data import H3DataLoader, H3DataPreprocessor, create_dataloaders
+from utils.regions import HOLDOUT_REGIONS, resolve_holdout_regions
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +176,7 @@ class Trainer:
         patience: int = 10,
         log_interval: int = 10,
         watchlist: Optional[Dict[int, str]] = None,
+        holdout_loader: Optional[DataLoader] = None,
     ):
         self.model = model.to(device)
         self.criterion = criterion
@@ -193,6 +195,9 @@ class Trainer:
 
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+        # Optional holdout DataLoader for region hold-out evaluation
+        self.holdout_loader = holdout_loader
+
         # Resolve watchlist taxonKeys to model column indices
         self.watchlist: Dict[int, str] = watchlist or {}
         s2i = self.species_vocab.get('species_to_idx', {})
@@ -207,8 +212,17 @@ class Trainer:
             'val_map': [], 'val_top10_recall': [], 'val_top30_recall': [],
             'val_f1_5': [], 'val_f1_10': [], 'val_f1_25': [],
             'val_list_ratio_5': [], 'val_list_ratio_10': [], 'val_list_ratio_25': [],
+            'val_map_sparse': [], 'val_map_dense': [], 'val_map_density_ratio': [],
+            'val_pred_density_corr': [],
             'lr': [],
         }
+        # Holdout region metrics (populated only when holdout_loader is set)
+        if self.holdout_loader is not None:
+            self.history['holdout_map'] = []
+            self.history['holdout_f1_10'] = []
+            self.history['holdout_map_sparse'] = []
+            self.history['holdout_map_dense'] = []
+            self.history['holdout_pred_density_corr'] = []
         # Per-species AP history for watchlist species
         for tk in self.watchlist_indices:
             self.history[f'val_ap_{tk}'] = []
@@ -287,11 +301,15 @@ class Trainer:
           thresholds.
         - **list ratio** and **mean list length** at the same thresholds.
         - **Per-species AP** for watchlist species (endemic/restricted-range).
+        - **Density-stratified mAP**: mAP split by observation density
+          quartile (sparse vs dense regions), plus the ratio between them.
+        - **Prediction-density correlation**: Pearson r between observation
+          density and number of predicted species at 10% threshold.
 
         Returns:
             Dict with loss terms, mAP, top-k recall, per-threshold
             F1 / precision / recall / list-ratio / mean-list-length,
-            and per-species AP for watchlist species.
+            per-species AP for watchlist species, and density metrics.
         """
         self.model.eval()
         total_loss = total_species = total_env = 0.0
@@ -316,6 +334,14 @@ class Trainer:
         wl_scores: Dict[int, list] = {tk: [] for tk in self.watchlist_indices}
         wl_labels: Dict[int, list] = {tk: [] for tk in self.watchlist_indices}
 
+        # Density-stratified metric accumulators
+        # Collect per-sample AP and obs_density for post-loop stratification
+        all_sample_ap: list = []        # per-sample AP (only for samples with positives)
+        all_sample_density: list = []   # obs_density for those same samples
+        all_pred_counts_10: list = []   # n_predicted@10% for ALL samples
+        all_density_all: list = []      # obs_density for ALL samples
+        _has_density = False
+
         _tqdm_off = os.environ.get('TQDM_DISABLE', '').strip() in ('1', 'true', 'True')
         if _tqdm_off:
             print(f'Epoch {self.current_epoch + 1} [Val]   {len(val_loader)} batches ...', flush=True)
@@ -326,6 +352,11 @@ class Trainer:
             week = inputs['week'].to(self.device, non_blocking=True)
             species_t = targets['species'].to(self.device, non_blocking=True)
             env_t = targets['env_features'].to(self.device, non_blocking=True)
+
+            # Observation density (optional — present when data pipeline includes it)
+            batch_density = inputs.get('obs_density')  # CPU tensor or None
+            if batch_density is not None:
+                _has_density = True
 
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 outputs = self.model(lat, lon, week, return_env=True)
@@ -367,6 +398,11 @@ class Trainer:
                 ap_sum += sample_ap.sum().item()
                 ap_count += has_pos.sum().item()
 
+                # Collect per-sample AP + density for stratification
+                all_sample_ap.append(sample_ap.cpu())
+                if batch_density is not None:
+                    all_sample_density.append(batch_density[has_pos.cpu()])
+
             # --- F1 and list-length ratio at multiple thresholds ---
             for t in THRESHOLDS:
                 pred_mask_t = probs > t
@@ -383,6 +419,12 @@ class Trainer:
                     ratios = pred_counts / true_counts
                     thresh_lr_sum[t] += ratios.sum().item()
                     thresh_lr_count[t] += has_pos.sum().item()
+
+            # --- Prediction-density correlation accumulators ---
+            if batch_density is not None:
+                pred_count_10 = (probs > 0.10).sum(dim=1).float().cpu()
+                all_pred_counts_10.append(pred_count_10)
+                all_density_all.append(batch_density)
 
             # --- Watchlist per-species scores ---
             if self.watchlist_indices:
@@ -420,6 +462,42 @@ class Trainer:
             metrics[f'recall_{pct}'] = rec
             metrics[f'list_ratio_{pct}'] = thresh_lr_sum[t] / max(thresh_lr_count[t], 1)
             metrics[f'mean_list_len_{pct}'] = thresh_list_len_sum[t] / max(thresh_list_len_count[t], 1)
+
+        # --- Density-stratified mAP ---
+        if _has_density and all_sample_ap and all_sample_density:
+            cat_ap = torch.cat(all_sample_ap)
+            cat_density = torch.cat(all_sample_density)
+            # Split into quartiles by observation density
+            q25 = torch.quantile(cat_density, 0.25).item()
+            q75 = torch.quantile(cat_density, 0.75).item()
+            sparse_mask = cat_density <= q25
+            dense_mask = cat_density >= q75
+            if sparse_mask.any():
+                metrics['map_sparse'] = cat_ap[sparse_mask].mean().item()
+            else:
+                metrics['map_sparse'] = float('nan')
+            if dense_mask.any():
+                metrics['map_dense'] = cat_ap[dense_mask].mean().item()
+            else:
+                metrics['map_dense'] = float('nan')
+            # Ratio: higher = more robust to observation bias
+            if not math.isnan(metrics['map_sparse']) and not math.isnan(metrics['map_dense']) and metrics['map_dense'] > 0:
+                metrics['map_density_ratio'] = metrics['map_sparse'] / metrics['map_dense']
+            else:
+                metrics['map_density_ratio'] = float('nan')
+
+        # --- Prediction-density correlation ---
+        if _has_density and all_pred_counts_10 and all_density_all:
+            cat_pred = torch.cat(all_pred_counts_10)
+            cat_dens = torch.cat(all_density_all)
+            # Pearson correlation
+            if cat_pred.std() > 0 and cat_dens.std() > 0:
+                vp = cat_pred - cat_pred.mean()
+                vd = cat_dens - cat_dens.mean()
+                r = (vp * vd).sum() / (vp.norm() * vd.norm() + 1e-8)
+                metrics['pred_density_corr'] = r.item()
+            else:
+                metrics['pred_density_corr'] = float('nan')
 
         # --- Watchlist per-species AP ---
         if self.watchlist_indices:
@@ -548,6 +626,11 @@ class Trainer:
                           'list_ratio_5', 'list_ratio_10', 'list_ratio_25'):
                     self.history[f'val_{k}'].append(val_m[k])
 
+                # Density-stratified metrics
+                for k in ('map_sparse', 'map_dense', 'map_density_ratio',
+                           'pred_density_corr'):
+                    self.history[f'val_{k}'].append(val_m.get(k, float('nan')))
+
                 # Watchlist per-species AP history
                 for tk in self.watchlist_indices:
                     key = f'val_ap_{tk}'
@@ -556,6 +639,16 @@ class Trainer:
                     self.history['val_watchlist_mean_ap'].append(
                         val_m.get('watchlist_mean_ap', float('nan'))
                     )
+
+                # --- Holdout region evaluation ---
+                holdout_m = None
+                if self.holdout_loader is not None:
+                    holdout_m = self.validate(self.holdout_loader)
+                    for k in ('map', 'f1_10', 'map_sparse', 'map_dense',
+                              'pred_density_corr'):
+                        hk = f'holdout_{k}'
+                        if hk in self.history:
+                            self.history[hk].append(holdout_m.get(k, float('nan')))
 
                 print(f"\nEpoch {epoch + 1} \u2014 lr={lr:.2e}  "
                       f"Train: {train_m['loss']:.4f} (sp={train_m['species_loss']:.4f} env={train_m['env_loss']:.4f})  "
@@ -569,10 +662,21 @@ class Trainer:
                 print(f"  Ratio:  5%={val_m['list_ratio_5']:.2f}  "
                       f"10%={val_m['list_ratio_10']:.2f}  "
                       f"25%={val_m['list_ratio_25']:.2f}")
+                # Density-stratified metrics
+                _ms = val_m.get('map_sparse', float('nan'))
+                _md = val_m.get('map_dense', float('nan'))
+                _mr = val_m.get('map_density_ratio', float('nan'))
+                _pc = val_m.get('pred_density_corr', float('nan'))
+                if not math.isnan(_ms):
+                    print(f"  Bias:   mAP_sparse={_ms:.4f}  mAP_dense={_md:.4f}  "
+                          f"ratio={_mr:.4f}  pred\u2013density r={_pc:.4f}")
                 if self.watchlist_indices:
                     wl_ap = val_m.get('watchlist_mean_ap', float('nan'))
                     print(f"  Watchlist: mean AP={wl_ap:.4f}  "
                           f"({len(self.watchlist_indices)} species tracked)")
+                if holdout_m is not None:
+                    print(f"  Holdout: mAP={holdout_m['map']:.4f}  "
+                          f"F1@10%={holdout_m.get('f1_10', 0):.4f}")
 
                 is_best = val_m['map'] > self.best_val_map
                 if is_best:
@@ -992,8 +1096,10 @@ def main():
                         help='ASL negative focusing parameter (default: 2, higher=more focus on hard negatives)')
     parser.add_argument('--asl_clip', type=float, default=0.05,
                         help='ASL probability margin for negatives (default: 0.05, 0=disable)')
-    parser.add_argument('--focal_alpha', type=float, default=0.25)
-    parser.add_argument('--focal_gamma', type=float, default=2.0)
+    parser.add_argument('--focal_alpha', type=float, default=0.5,
+                        help='Focal loss alpha: weight for positive class (default: 0.5, neutral)')
+    parser.add_argument('--focal_gamma', type=float, default=2.0,
+                        help='Focal loss gamma: focusing parameter (default: 2.0)')
     parser.add_argument('--pos_lambda', type=float, default=4.0,
                         help='Positive up-weighting λ for assume-negative loss (default: 4)')
     parser.add_argument('--neg_samples', type=int, default=1024,
@@ -1036,6 +1142,13 @@ def main():
     parser.add_argument('--val_size', type=float, default=0.1)
     parser.add_argument('--sample_fraction', type=float, default=1.0,
                         help='Fraction of locations to keep (default: 1.0 = all, 0.1 = 10%% random subset, subsampled once)')
+
+    # Region hold-out (spatial generalisation evaluation)
+    parser.add_argument('--holdout_regions', nargs='*', default=None, metavar='REGION',
+                        help='Hold out well-surveyed regions from training for spatial '
+                             'generalisation evaluation. Samples inside the regions are '
+                             'removed from training and evaluated separately. '
+                             f'Available: {", ".join(sorted(HOLDOUT_REGIONS.keys()))}')
 
     # Checkpoints
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
@@ -1106,6 +1219,8 @@ def main():
         print(f"  Freq weight: enabled (min={args.label_freq_weight_min})")
     if args.sample_fraction < 1.0:
         print(f"  Sample fraction: {args.sample_fraction} (subsampled by location once)")
+    if args.holdout_regions:
+        print(f"  Holdout:    {', '.join(args.holdout_regions)}")
     print(f"  Device:     {device}")
 
     # -- Data loading & preprocessing ---
@@ -1184,6 +1299,19 @@ def main():
     del test_in, test_tgt
     gc.collect()
 
+    # -- Region hold-out ---
+    holdout_bboxes = resolve_holdout_regions(args.holdout_regions) if args.holdout_regions else []
+    holdout_in = holdout_tgt = None
+    if holdout_bboxes:
+        region_names = ', '.join(args.holdout_regions)
+        # Mask holdout regions out of the training set
+        train_in, train_tgt, holdout_in, holdout_tgt = preprocessor.mask_regions(
+            train_in, train_tgt, holdout_bboxes,
+        )
+        n_holdout = len(holdout_in['lat'])
+        print(f"   Holdout regions ({region_names}): {n_holdout:,} samples removed from training")
+        print(f"   Train after holdout: {len(train_in['lat']):,}")
+
     # Verify watchlist species survived subsampling / splitting
     _check_watchlist_coverage(
         WATCHLIST_SPECIES, preprocessor.species_to_idx,
@@ -1199,9 +1327,26 @@ def main():
         jitter_std=jitter_std,
         species_freq_weights=freq_weights,
     )
+
+    # Create holdout DataLoader if regions were masked
+    holdout_loader = None
+    if holdout_in is not None and len(holdout_in['lat']) > 0:
+        from utils.data import BirdSpeciesDataset, _make_sparse_collate_fn
+        holdout_ds = BirdSpeciesDataset(holdout_in, holdout_tgt, n_species=n_species)
+        _is_sparse = holdout_ds.species_sparse is not None
+        holdout_collate = _make_sparse_collate_fn(n_species) if _is_sparse else None
+        holdout_loader = DataLoader(
+            holdout_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=(device.type == 'cuda'),
+            persistent_workers=(args.num_workers > 0),
+            collate_fn=holdout_collate,
+        )
+        print(f"   Holdout DataLoader: {len(holdout_ds):,} samples")
+
     # Numpy source arrays now live as tensors inside the Dataset.
     # Dicts were cleared by create_dataloaders; drop remaining refs.
     del train_in, train_tgt, val_in, val_tgt, freq_weights
+    del holdout_in, holdout_tgt
     gc.collect()
 
     # -- Model ---
@@ -1305,6 +1450,7 @@ def main():
         species_vocab=species_vocab,
         patience=args.patience,
         watchlist=WATCHLIST_SPECIES,
+        holdout_loader=holdout_loader,
     )
 
     if args.resume:

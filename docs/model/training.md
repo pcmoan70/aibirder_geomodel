@@ -56,11 +56,11 @@ The training script handles the full pipeline automatically:
 | `--env_weight` | `0.1` | Environmental loss multiplier |
 | `--species_loss` | `asl` | Loss function: `asl` (asymmetric, default), `bce`, `focal`, or `an` |
 | `--asl_gamma_pos` | `0.0` | ASL positive focusing parameter (0 = no down-weighting) |
-| `--asl_gamma_neg` | `4.0` | ASL negative focusing parameter (higher = more aggressive) |
+| `--asl_gamma_neg` | `2.0` | ASL negative focusing parameter (higher = more aggressive) |
 | `--asl_clip` | `0.05` | ASL probability margin for negatives (0 = disable) |
-| `--focal_alpha` | `0.25` | Focal loss alpha (only with `--species_loss focal`) |
+| `--focal_alpha` | `0.5` | Focal loss alpha (weight for positive class; only with `--species_loss focal`) |
 | `--focal_gamma` | `2.0` | Focal loss gamma |
-| `--pos_lambda` | `8.0` | Positive up-weighting λ for AN loss |
+| `--pos_lambda` | `4.0` | Positive up-weighting λ for AN loss |
 | `--neg_samples` | `1024` | Negative species to sample per example for AN loss (0 = all) |
 | `--label_smoothing` | `0.05` | Smooth binary targets to prevent overconfidence (0 = off) |
 | `--max_obs_per_species` | `100000` | Cap observations per species (0 = no cap) |
@@ -113,6 +113,53 @@ When `--jitter` is passed, Gaussian noise is added to training coordinates every
 - **Each draw is independent** — the same sample receives different noise every epoch.
 - Latitude is clamped to $[-90, 90]$; longitude wraps at $\pm 180°$.
 
+### Region Hold-Out (Observation Bias Evaluation)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--holdout_regions` | — | Space-separated region names to mask from training and evaluate separately |
+
+GBIF observation data is heavily biased toward densely populated areas.
+The `--holdout_regions` flag removes well-surveyed geographic regions from
+the training set and creates a separate held-out evaluation set.  The model
+must predict species in these regions using only surrounding data.
+
+Available regions:
+
+| Name | Area | Bounding Box (lon_min, lat_min, lon_max, lat_max) |
+|---|---|---|
+| `us_northwest` | Oregon, Washington | (-125.0, 42.0, -116.5, 49.0) |
+| `benelux` | Belgium, Netherlands, Luxembourg | (2.5, 49.5, 7.2, 53.6) |
+| `uk` | United Kingdom | (-8.2, 49.9, 1.8, 58.7) |
+| `california` | California | (-124.5, 32.5, -114.1, 42.0) |
+| `japan` | Japan | (129.5, 30.0, 145.8, 45.5) |
+
+```bash
+# Hold out US Northwest from training
+python train.py --data_path data.parquet --holdout_regions us_northwest
+
+# Hold out multiple regions
+python train.py --data_path data.parquet --holdout_regions us_northwest benelux
+```
+
+Holdout metrics (mAP, F1\@10%, density-stratified mAP) are reported per epoch
+and saved in `training_history.json`.
+
+#### Density-Stratified Metrics
+
+Independently of region hold-out, every validation epoch computes
+**density-stratified mAP**: validation samples are split into quartiles by
+per-location observation density (total species detections across all weeks).
+A bias-robust model shows a **smaller gap** between mAP in the sparse
+quartile (Q1) and the dense quartile (Q4).
+
+| Metric | Description |
+|---|---|
+| **mAP\_sparse** | mAP for bottom-25% density locations |
+| **mAP\_dense** | mAP for top-25% density locations |
+| **mAP density ratio** | sparse / dense (higher = more robust, 1.0 = no bias) |
+| **pred–density _r_** | Pearson correlation between obs density and predicted species count (lower = less biased) |
+
 ### Checkpoints
 
 | Flag | Default | Description |
@@ -142,7 +189,7 @@ where $p_i = \sigma(z_i)$ and $p_m = \max(p_i - m,\, 0)$ is the probability afte
 | Parameter | Default | Notes |
 |---|---|---|
 | `--asl_gamma_pos` | `0.0` | Positive focusing — 0 keeps all positive gradient |
-| `--asl_gamma_neg` | `4.0` | Negative focusing — higher suppresses easy negatives more |
+| `--asl_gamma_neg` | `2.0` | Negative focusing — higher suppresses easy negatives more |
 | `--asl_clip` | `0.05` | Hard probability margin for negatives (0 = disable) |
 
 ### BCE
@@ -193,14 +240,14 @@ Enable with `--species_loss an`:
 ```bash
 python train.py \
     --species_loss an \
-    --pos_lambda 8 \
+    --pos_lambda 4 \
     --neg_samples 1024 \
     --label_smoothing 0.05
 ```
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `--pos_lambda` | `8` | Balances positive/negative gradient; increase if recall too low |
+| `--pos_lambda` | `4` | Balances positive/negative gradient; increase if recall too low |
 | `--neg_samples` | `1024` | 0 = use all negatives (exact but slow) |
 | `--label_smoothing` | `0.05` | Prevents overconfident predictions; set 0 to disable |
 
@@ -352,6 +399,10 @@ During each validation epoch, the following metrics are computed and recorded:
 | **Mean list length @ 5% / 10% / 25%** | Average number of species predicted above the threshold |
 | **Watchlist mean AP** | Mean average precision across 18 endemic/restricted-range watchlist species |
 | **Per-species AP** | Individual AP for each watchlist species |
+| **mAP sparse** | mAP for bottom-25% observation density locations |
+| **mAP dense** | mAP for top-25% observation density locations |
+| **mAP density ratio** | sparse/dense ratio (1.0 = no observation bias effect) |
+| **pred–density _r_** | Pearson correlation between obs density and predicted species count |
 
 Metrics are printed after each epoch and saved in `training_history.json`. Use [`scripts/plot_training.py`](../plotting/training-curves.md) to visualise them.
 

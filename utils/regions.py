@@ -4,7 +4,7 @@ Expose a small set of pragmatic bounding boxes for common large regions
 and a helper to resolve a CLI-style bounds argument (either 4 floats or
 a region name) into a (lon_min, lat_min, lon_max, lat_max) tuple.
 """
-from typing import Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # Region bounding boxes (lon_min, lat_min, lon_max, lat_max)
 REGION_BOUNDS = {
@@ -32,6 +32,19 @@ REGION_BOUNDS = {
 }
 
 
+# Well-surveyed regions suitable for spatial generalisation testing.
+# These can be held out from training and used to evaluate how well
+# the model predicts species in regions it has never seen.
+# Keys are usable as --holdout_regions arguments.
+HOLDOUT_REGIONS: Dict[str, Tuple[float, float, float, float]] = {
+    'us_northwest': (-125.0, 42.0, -116.5, 49.0),   # Oregon + Washington
+    'benelux':      (2.5, 49.5, 7.2, 53.6),          # Belgium, Netherlands, Luxembourg
+    'uk':           (-8.2, 49.9, 1.8, 58.7),          # Great Britain
+    'california':   (-124.5, 32.5, -114.1, 42.0),     # California
+    'japan':        (129.5, 30.0, 145.8, 45.5),        # Japan
+}
+
+
 def resolve_bounds_arg(b: Optional[Sequence[str]]) -> Optional[Tuple[float, float, float, float]]:
     """Resolve a CLI-style bounds argument to a bbox tuple.
 
@@ -55,3 +68,35 @@ def resolve_bounds_arg(b: Optional[Sequence[str]]) -> Optional[Tuple[float, floa
         except (TypeError, ValueError):
             return None
     return None
+
+
+def resolve_holdout_regions(
+    names: Optional[List[str]],
+) -> List[Tuple[float, float, float, float]]:
+    """Resolve a list of holdout region names to bounding-box tuples.
+
+    Each name is looked up in :data:`HOLDOUT_REGIONS` (case-insensitive).
+    Unknown names are printed as warnings and skipped.
+
+    Args:
+        names: List of region name strings (e.g. ``['us_northwest', 'benelux']``).
+
+    Returns:
+        List of ``(lon_min, lat_min, lon_max, lat_max)`` bounding boxes.
+    """
+    if not names:
+        return []
+    bboxes: List[Tuple[float, float, float, float]] = []
+    for name in names:
+        key = name.strip().lower()
+        bbox = HOLDOUT_REGIONS.get(key)
+        if bbox is None:
+            import warnings
+            warnings.warn(
+                f"Unknown holdout region '{name}'. "
+                f"Available: {', '.join(sorted(HOLDOUT_REGIONS.keys()))}",
+                stacklevel=2,
+            )
+        else:
+            bboxes.append(bbox)
+    return bboxes
