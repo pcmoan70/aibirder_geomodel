@@ -206,7 +206,7 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - Progress tracking with tqdm
 - GPU/CPU support with automatic device selection
 - Optuna-based hyperparameter autotune (`--autotune`)
-  - Tunes: lr, batch_size, pos_lambda, neg_samples, label_smoothing, env_weight, jitter, species_loss, model_scale, coord_harmonics, week_harmonics, asl_gamma_neg, asl_clip, label_freq_weight
+  - Tunes: pos_lambda, neg_samples, label_smoothing, env_weight, jitter, species_loss, model_scale, coord_harmonics, week_harmonics, asl_gamma_neg, asl_clip, focal_alpha, focal_gamma, label_freq_weight, label_freq_weight_min
   - Bayesian optimization with TPE sampler and MedianPruner
   - `--autotune_trials` (default 50), `--autotune_epochs` (default 10)
   - Results saved to `checkpoints/autotune/autotune_results.json`

@@ -45,11 +45,13 @@ from utils.regions import HOLDOUT_REGIONS, resolve_holdout_regions
 # ---------------------------------------------------------------------------
 
 TUNABLE_PARAMS = [
-    'lr', 'batch_size', 'pos_lambda', 'neg_samples',
+    'pos_lambda', 'neg_samples',
     'label_smoothing', 'env_weight',
     'jitter', 'species_loss',
     'model_scale', 'coord_harmonics', 'week_harmonics',
-    'asl_gamma_neg', 'asl_clip', 'label_freq_weight',
+    'asl_gamma_neg', 'asl_clip',
+    'focal_alpha', 'focal_gamma',
+    'label_freq_weight', 'label_freq_weight_min',
 ]
 
 
@@ -798,10 +800,6 @@ class Trainer:
 def _suggest_param(trial, name: str, args):
     """Suggest a value for *name* using the Optuna trial, falling back to CLI default."""
     import optuna
-    if name == 'lr':
-        return trial.suggest_float('lr', 1e-4, 1e-2, log=True)
-    if name == 'batch_size':
-        return trial.suggest_categorical('batch_size', [128, 256, 512, 1024])
     if name == 'pos_lambda':
         return trial.suggest_float('pos_lambda', 1.0, 64.0, log=True)
     if name == 'neg_samples':
@@ -824,8 +822,14 @@ def _suggest_param(trial, name: str, args):
         return trial.suggest_int('coord_harmonics', 2, 8)
     if name == 'week_harmonics':
         return trial.suggest_int('week_harmonics', 2, 8)
+    if name == 'focal_alpha':
+        return trial.suggest_float('focal_alpha', 0.1, 0.9)
+    if name == 'focal_gamma':
+        return trial.suggest_float('focal_gamma', 0.5, 5.0)
     if name == 'label_freq_weight':
         return trial.suggest_categorical('label_freq_weight', [True, False])
+    if name == 'label_freq_weight_min':
+        return trial.suggest_float('label_freq_weight_min', 0.01, 0.5, log=True)
     raise ValueError(f"Unknown tunable param: {name}")
 
 
@@ -834,7 +838,8 @@ def run_autotune(args, device: torch.device):
 
     Data is loaded once and reused across all trials.  Each trial builds a
     fresh model+optimizer, trains for ``--autotune_epochs`` epochs, and reports
-    best validation mAP.  Optuna's MedianPruner kills unpromising trials early.
+    best validation GeoScore.  Optuna's MedianPruner kills unpromising trials
+    early.
     """
     try:
         import optuna
@@ -858,7 +863,7 @@ def run_autotune(args, device: torch.device):
     print(f"  Tuning:     {', '.join(tune_params)}")
     print(f"  Trials:     {n_trials}")
     print(f"  Epochs:     {n_epochs} per trial")
-    print(f"  Objective:  validation mAP (maximize)")
+    print(f"  Objective:  GeoScore (maximize)")
     print(f"  Device:     {device}")
 
     # -- Load data --------------------------------------------------------
@@ -899,9 +904,13 @@ def run_autotune(args, device: torch.device):
 
     # Pre-compute frequency-based label weights (cheap); per-trial
     # decision whether to use them is made in the objective.
+    # When label_freq_weight_min is tuned, we keep species_lists and
+    # recompute weights per trial with different min_weight values.
+    _tune_freq_min = 'label_freq_weight_min' in tune_params
     _freq_weights = preprocessor.compute_species_freq_weights(
         species_lists, min_weight=args.label_freq_weight_min,
     )
+    _species_lists_ref = species_lists if _tune_freq_min else None
 
     # Free species_lists — no longer needed after vocab + weights
     del species_lists
@@ -954,14 +963,28 @@ def run_autotune(args, device: torch.device):
             # ASL-specific params: use defaults when not relevant
             p['asl_gamma_neg'] = args.asl_gamma_neg
             p['asl_clip'] = args.asl_clip
+        if loss_type != 'focal':
+            # Focal-specific params: use defaults when not relevant
+            p['focal_alpha'] = args.focal_alpha
+            p['focal_gamma'] = args.focal_gamma
 
-        batch_size = int(p['batch_size'])
+        batch_size = int(p.get('batch_size', args.batch_size))
         use_jitter = bool(p.get('jitter', args.jitter))
         jitter_std = _jitter_std if use_jitter else 0.0
 
         # Use pre-built dataset; decide per-trial whether to apply freq weights
         t_in, v_in, t_tgt, v_tgt = train_in, val_in, train_tgt, val_tgt
-        _trial_freq_weights = _freq_weights if bool(p.get('label_freq_weight', args.label_freq_weight)) else None
+        use_freq_wt = bool(p.get('label_freq_weight', args.label_freq_weight))
+        if use_freq_wt and _tune_freq_min and _species_lists_ref is not None:
+            # Recompute with trial-specific min_weight
+            _trial_freq_weights = preprocessor.compute_species_freq_weights(
+                _species_lists_ref,
+                min_weight=float(p.get('label_freq_weight_min', args.label_freq_weight_min)),
+            )
+        elif use_freq_wt:
+            _trial_freq_weights = _freq_weights
+        else:
+            _trial_freq_weights = None
 
         # DataLoaders (batch_size may vary per trial)
         t_loader, v_loader = create_dataloaders(
@@ -985,7 +1008,8 @@ def run_autotune(args, device: torch.device):
             species_weight=args.species_weight,
             env_weight=float(p['env_weight']),
             species_loss=str(p.get('species_loss', args.species_loss)),
-            focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
+            focal_alpha=float(p.get('focal_alpha', args.focal_alpha)),
+            focal_gamma=float(p.get('focal_gamma', args.focal_gamma)),
             pos_lambda=float(p['pos_lambda']),
             neg_samples=int(p['neg_samples']),
             label_smoothing=float(p['label_smoothing']),
@@ -994,7 +1018,7 @@ def run_autotune(args, device: torch.device):
             asl_clip=float(p.get('asl_clip', args.asl_clip)),
         )
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=float(p['lr']),
+            model.parameters(), lr=float(p.get('lr', args.lr)),
             weight_decay=args.weight_decay,
         )
 
@@ -1164,7 +1188,7 @@ def main():
                         help='Number of harmonics for week circular encoding (default: 4)')
 
     # Training
-    parser.add_argument('--batch_size', type=int, default=512)
+    parser.add_argument('--batch_size', type=int, default=1024)
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=1e-3)
@@ -1188,8 +1212,8 @@ def main():
                         help='Number of negative species to sample per example for AN loss (default: 1024, 0=all)')
     parser.add_argument('--label_smoothing', type=float, default=0.05,
                         help='Smooth binary targets to prevent overconfident predictions (default: 0.05, 0=off)')
-    parser.add_argument('--max_obs_per_species', type=int, default=100000,
-                        help='Cap observations per species to reduce common-species dominance (default: 100000, 0=no cap)')
+    parser.add_argument('--max_obs_per_species', type=int, default=0,
+                        help='Cap observations per species to reduce common-species dominance (default: 0, 0=no cap)')
     parser.add_argument('--min_obs_per_species', type=int, default=100,
                         help='Exclude species with fewer than N observations (default: 100, 0=keep all)')
     parser.add_argument('--ocean_sample_rate', type=float, default=1.0,
@@ -1249,10 +1273,10 @@ def main():
                         help='Run hyperparameter search. Without args: tune all. '
                              'With args: tune only the listed params. '
                              f'Available: {", ".join(TUNABLE_PARAMS)}')
-    parser.add_argument('--autotune_trials', type=int, default=50,
-                        help='Number of Optuna trials (default: 50)')
-    parser.add_argument('--autotune_epochs', type=int, default=10,
-                        help='Epochs per trial (default: 10)')
+    parser.add_argument('--autotune_trials', type=int, default=30,
+                        help='Number of Optuna trials (default: 30)')
+    parser.add_argument('--autotune_epochs', type=int, default=15,
+                        help='Epochs per trial (default: 15)')
 
     args = parser.parse_args()
 
