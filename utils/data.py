@@ -549,14 +549,14 @@ class H3DataPreprocessor:
 
         - >= 95th percentile of counts -> weight 1.0 (common)
         - <= 5th percentile of counts  -> *min_weight* (rare)
-        - In between -> sigmoid-shaped interpolation that creates a long-tail
-          distribution (most species stay near *min_weight*, only the most
-          common ramp up sharply toward 1.0)
+        - In between -> log-scale sigmoid interpolation that spreads
+          weights naturally across the wide dynamic range of observation
+          counts
 
-        The sigmoid shaping uses ``t' = t^3 / (t^3 + (1-t)^3)`` where
-        ``t`` is the linear 0-1 position between the 5th and 95th
-        percentile.  This keeps the mapping monotonic and smooth while
-        concentrating most of the weight mass at the upper end.
+        The position between p5 and p95 is computed in log-space (natural
+        for count distributions spanning orders of magnitude), then passed
+        through a sigmoid ``t' = t^3 / (t^3 + (1-t)^3)`` for smooth
+        S-shaped remapping.
 
         The returned array has shape ``(n_species,)`` and is stored as
         ``self.species_freq_weights`` for use in the Dataset.
@@ -583,6 +583,8 @@ class H3DataPreprocessor:
 
         weights = np.ones(n_species, dtype=np.float32)
         if p95 > p5:
+            log_p5 = np.log(p5)
+            log_span = np.log(p95) - log_p5
             for i in range(n_species):
                 c = count_arr[i]
                 if c >= p95:
@@ -590,9 +592,9 @@ class H3DataPreprocessor:
                 elif c <= p5:
                     weights[i] = min_weight
                 else:
-                    # Linear position in [0, 1]
-                    t = (c - p5) / (p95 - p5)
-                    # Sigmoid-shaped remapping: long tail, sharp rise at top
+                    # Log-scale position in [0, 1] — natural for count data
+                    t = (np.log(c) - log_p5) / log_span
+                    # Sigmoid-shaped remapping: smooth S-curve
                     t3 = t ** 3
                     t = t3 / (t3 + (1.0 - t) ** 3)
                     weights[i] = min_weight + t * (1.0 - min_weight)
@@ -761,15 +763,21 @@ class H3DataPreprocessor:
         self,
         inputs: Dict[str, np.ndarray],
         targets: Dict[str, Any],
-        test_size: float = 0.2,
         val_size: float = 0.1,
         random_state: int = 42,
         split_by_location: bool = True,
+        **kwargs,
     ) -> Tuple:
-        """Split into train/val/test (optionally grouped by location to prevent leakage).
+        """Split into train/val (optionally grouped by location to prevent leakage).
 
         Handles both dense ndarray and sparse list-of-arrays species targets.
+
+        Returns:
+            (train_inputs, val_inputs, train_targets, val_targets)
         """
+        # Accept (and ignore) legacy test_size kwarg for backward compat
+        _ = kwargs.pop('test_size', None)
+
         n_samples = len(inputs['lat'])
         indices = np.arange(n_samples)
 
@@ -779,21 +787,15 @@ class H3DataPreprocessor:
             loc_ids = np.array([unique_map.setdefault(c, len(unique_map)) for c in coord_tuples])
             unique_locs = np.unique(loc_ids)
 
-            locs_train, locs_test = train_test_split(
-                unique_locs, test_size=test_size, random_state=random_state
-            )
             locs_train, locs_val = train_test_split(
-                locs_train, test_size=val_size / (1 - test_size), random_state=random_state
+                unique_locs, test_size=val_size, random_state=random_state
             )
             train_mask = np.isin(loc_ids, locs_train)
             val_mask = np.isin(loc_ids, locs_val)
-            test_mask = np.isin(loc_ids, locs_test)
         else:
-            idx_temp, idx_test = train_test_split(indices, test_size=test_size, random_state=random_state)
-            idx_train, idx_val = train_test_split(idx_temp, test_size=val_size / (1 - test_size), random_state=random_state)
+            idx_train, idx_val = train_test_split(indices, test_size=val_size, random_state=random_state)
             train_mask = np.isin(indices, idx_train)
             val_mask = np.isin(indices, idx_val)
-            test_mask = np.isin(indices, idx_test)
 
         def _split_dict(d: Dict[str, Any], mask: np.ndarray) -> Dict[str, Any]:
             out = {}
@@ -809,8 +811,8 @@ class H3DataPreprocessor:
             return out
 
         return (
-            _split_dict(inputs, train_mask), _split_dict(inputs, val_mask), _split_dict(inputs, test_mask),
-            _split_dict(targets, train_mask), _split_dict(targets, val_mask), _split_dict(targets, test_mask),
+            _split_dict(inputs, train_mask), _split_dict(inputs, val_mask),
+            _split_dict(targets, train_mask), _split_dict(targets, val_mask),
         )
 
     def get_preprocessing_info(self) -> Dict[str, Any]:

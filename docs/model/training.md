@@ -24,7 +24,7 @@ The training script handles the full pipeline automatically:
 1. **Load data** — read combined parquet file
 2. **Flatten** — expand H3 cells × 48 weeks into individual samples
 3. **Preprocess** — build species vocabulary, normalize environmental features
-4. **Split** — location-based train/val/test split (prevents spatial data leakage)
+4. **Split** — location-based train/val split (prevents spatial data leakage)
 5. **Train** — multi-task training with checkpointing
 
 ## CLI Reference
@@ -93,12 +93,13 @@ where each $s_i$ is a component score normalised to $[0, 1]$ (higher = better):
 
 | Component | Key | Weight | Transform |
 |---|---|---|---|
-| Ranking quality | `mAP` | 0.25 | as-is |
+| Ranking quality | `mAP` | 0.20 | as-is |
 | Classification quality | `F1 @ 10%` | 0.20 | as-is |
 | List-length calibration | `list_ratio @ 10%` | 0.15 | $\max(0,\; 1 - |\ln(\text{LR})|)$ |
-| Endemic species | `watchlist_mean_ap` | 0.20 | as-is |
-| Density robustness | `mAP_density_ratio` | 0.10 | as-is (sparse / dense) |
-| Decorrelation | `pred_density_corr` | 0.10 | $\max(0,\; 1 - |r|)$ |
+| Endemic species | `watchlist_mean_ap` | 0.10 | as-is |
+| Geographic generalisation | `holdout_map` | 0.10 | as-is (out-of-region mAP) |
+| Density robustness | `mAP_density_ratio` | 0.20 | as-is (sparse / dense) |
+| Decorrelation | `pred_density_corr` | 0.05 | $\max(0,\; 1 - |r|)$ |
 
 !!! info "Why a composite metric?"
 
@@ -112,6 +113,9 @@ where each $s_i$ is a component score normalised to $[0, 1]$ (higher = better):
       exclusively on common species.
     - **Bias robustness** — density ratio and decorrelation penalise
       models that merely mirror observer effort patterns.
+    - **Geographic generalisation** — holdout mAP measures performance
+      on geographically held-out regions, rewarding models that
+      extrapolate beyond their training distribution.
 
 !!! tip "Missing components"
 
@@ -130,7 +134,6 @@ where each $s_i$ is a component score normalised to $[0, 1]$ (higher = better):
 
 | Flag | Default | Description |
 |---|---|---|
-| `--test_size` | `0.1` | Test set fraction |
 | `--val_size` | `0.1` | Validation set fraction |
 | `--sample_fraction` | `1.0` | Fraction of locations to keep (0–1) |
 
@@ -138,7 +141,7 @@ Splitting is **location-based**: all samples from one H3 cell go to the same spl
 
 #### Sample fraction
 
-When `--sample_fraction` is less than 1.0 it reduces the effective dataset size by subsampling a random fraction of *locations* once before training starts.  All splits (train, validation, test) are subsampled the same way.
+When `--sample_fraction` is less than 1.0 it reduces the effective dataset size by subsampling a random fraction of *locations* once before training starts.  Both train and validation splits are subsampled the same way.
 
 Key properties:
 
@@ -377,42 +380,47 @@ well-ordered predictions without requiring actual abundance counts.
 When `--label_freq_weight` is passed, positive species labels are scaled by
 observation frequency.  Common species (>= 95th percentile of observation
 counts) receive weight 1.0, rare species (<= 5th percentile) receive
-`--label_freq_weight_min` (default 0.1), with a **sigmoid-shaped**
-interpolation in between that creates a long-tail distribution — most species
-stay near the minimum weight and only the most common ramp up sharply toward
-1.0.
+`--label_freq_weight_min` (default 0.1), with a **log-scale sigmoid**
+interpolation in between.
 
-The mapping uses $t' = \frac{t^3}{t^3 + (1-t)^3}$ where $t$ is the linear
-position between the 5th and 95th percentile, then
-$w = w_{\min} + t' \cdot (1 - w_{\min})$.  Only positive labels (1s) are
-affected — zeros stay at 0, so this does **not** act as label smoothing.
+The position between the 5th and 95th percentile is computed in **log-space**,
+which is natural for count data spanning orders of magnitude (e.g. p5=132,
+p95=35,843).  A linear interpolation would collapse 90%+ of species to the
+minimum weight; log-scale spreads them evenly across the full range.
+
+The mapping uses $t = \frac{\ln c - \ln p_5}{\ln p_{95} - \ln p_5}$ (log-scale
+position), then applies a sigmoid $t' = \frac{t^3}{t^3 + (1-t)^3}$ for smooth
+S-shaped remapping, and finally $w = w_{\min} + t' \cdot (1 - w_{\min})$.
+Only positive labels (1s) are affected — zeros stay at 0, so this does **not**
+act as label smoothing.
 
 #### Weight curve
 
-The table below shows the resulting label weight at various positions between
-the 5th and 95th percentile (with default `min_weight=0.1`).  For example, if
-the 5th percentile is 50 observations and the 95th is 5,000, a species with
-1,025 observations sits at the 20% mark and receives weight 0.11.
+The table below shows the resulting label weight at various **log-scale**
+positions between the 5th and 95th percentile (with default `min_weight=0.1`).
+For example, if p5=132 and p95=35,843, a species with 2,175 observations sits
+at the geometric midpoint (50% log-scale) and receives weight 0.55.
 
-| Position between p5–p95 | Sigmoid $t'$ | Label weight | Category |
+| Log-scale position between p5–p95 | Sigmoid $t'$ | Label weight | Category |
 |---|---|---|---|
 | 0% (≤ p5) | 0.000 | **0.10** | Rare — minimal gradient contribution |
 | 10% | 0.001 | 0.10 | Uncommon — near-minimum weight |
 | 20% | 0.015 | 0.11 | Uncommon |
 | 30% | 0.073 | 0.17 | Below average |
 | 40% | 0.229 | 0.31 | Below average |
-| 50% | 0.500 | 0.55 | Average — midpoint |
+| 50% | 0.500 | 0.55 | Average — geometric midpoint |
 | 60% | 0.771 | 0.79 | Above average |
 | 70% | 0.927 | 0.93 | Common |
 | 80% | 0.985 | 0.99 | Common — near-maximum weight |
 | 90% | 0.999 | 1.00 | Very common |
 | 100% (≥ p95) | 1.000 | **1.00** | Abundant — full gradient contribution |
 
-The S-shaped curve means roughly the **bottom 40% of species by frequency
-receive weights below 0.3**, while the **top 30% are effectively at full
-weight**.  This concentrates gradient signal on well-observed species whose
-labels are most reliable, while still allowing the model to learn from rarer
-species at reduced intensity.
+Because position is computed in log-space, the **geometric midpoint** between
+p5 and p95 maps to weight 0.55 (not the arithmetic midpoint).  This ensures a
+meaningful spread of weights even when counts span two or more orders of
+magnitude.  The S-shaped sigmoid still concentrates gradient signal on
+well-observed species while allowing the model to learn from rarer species at
+reduced intensity.
 
 | Parameter | Default | Description |
 |---|---|---|

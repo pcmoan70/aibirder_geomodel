@@ -169,12 +169,13 @@ WATCHLIST_SPECIES: Dict[int, str] = {
 # Component weights: (metric_key, weight, transform)
 # Transforms convert raw values to a [0, 1] quality score where higher = better.
 _GEOSCORE_COMPONENTS: List[Tuple[str, float]] = [
-    ('map',                0.25),   # Ranking quality (mAP, already 0-1)
+    ('map',                0.20),   # Ranking quality (mAP, already 0-1)
     ('f1_10',              0.20),   # Practical species-list quality
     ('list_ratio_10',      0.15),   # List-length calibration (transformed below)
-    ('watchlist_mean_ap',  0.20),   # Restricted-range / endemic species
-    ('map_density_ratio',  0.10),   # Bias robustness: sparse vs dense
-    ('pred_density_corr',  0.10),   # Decorrelation from observer effort
+    ('watchlist_mean_ap',  0.10),   # Restricted-range / endemic species
+    ('holdout_map',        0.10),   # Geographic generalisation (out-of-region mAP)
+    ('map_density_ratio',  0.20),   # Bias robustness: sparse vs dense
+    ('pred_density_corr',  0.05),   # Decorrelation from observer effort
 ]
 
 
@@ -191,12 +192,13 @@ def compute_geoscore(metrics: Dict[str, float]) -> float:
     ============================  ======  ========================================
     Component                     Weight  Meaning
     ============================  ======  ========================================
-    mAP                            0.25   Ranking quality (higher = better)
+    mAP                            0.20   Ranking quality (higher = better)
     F1 @ 10 %                      0.20   Species-list quality at 10 % threshold
     List-ratio @ 10 % (log-sym)    0.15   ``max(0, 1 − |ln(LR)|)``; perfect = 1
-    Watchlist mean AP               0.20   Restricted-range species coverage
-    mAP density ratio               0.10   ``mAP_sparse / mAP_dense``; 1 = unbiased
-    1 − pred-density corr           0.10   ``max(0, 1 − r)``; 0 correlation = best
+    Watchlist mean AP               0.10   Restricted-range species coverage
+    Holdout mAP                     0.10   Geographic generalisation (out-of-region)
+    mAP density ratio               0.20   ``mAP_sparse / mAP_dense``; 1 = unbiased
+    1 − pred-density corr           0.05   ``max(0, 1 − r)``; 0 correlation = best
     ============================  ======  ========================================
 
     When a component is unavailable (NaN or missing), its weight is
@@ -730,6 +732,10 @@ class Trainer:
                         hk = f'holdout_{k}'
                         if hk in self.history:
                             self.history[hk].append(holdout_m.get(k, float('nan')))
+                    # Inject holdout mAP into val metrics and recompute GeoScore
+                    val_m['holdout_map'] = holdout_m.get('map', float('nan'))
+                    val_m['geoscore'] = compute_geoscore(val_m)
+                    self.history['val_geoscore'][-1] = val_m['geoscore']
 
                 print(f"\nEpoch {epoch + 1} \u2014 lr={lr:.2e}  "
                       f"Train: {train_m['loss']:.4f} (sp={train_m['species_loss']:.4f} env={train_m['env_loss']:.4f})  "
@@ -917,12 +923,12 @@ def run_autotune(args, device: torch.device):
     gc.collect()
 
     print("4. Splitting data...")
-    train_in, val_in, _, train_tgt, val_tgt, _ = preprocessor.split_data(
-        inputs, targets, test_size=args.test_size, val_size=args.val_size,
+    train_in, val_in, train_tgt, val_tgt = preprocessor.split_data(
+        inputs, targets, val_size=args.val_size,
         random_state=42, split_by_location=True,
     )
 
-    # Free unsplit data — now in train/val/test subsets
+    # Free unsplit data — now in train/val subsets
     del inputs, targets
     gc.collect()
     # Subsample all splits once by location
@@ -1244,7 +1250,6 @@ def main():
                         help='Early stopping patience (0 = disabled)')
 
     # Data split
-    parser.add_argument('--test_size', type=float, default=0.1)
     parser.add_argument('--val_size', type=float, default=0.1)
     parser.add_argument('--sample_fraction', type=float, default=1.0,
                         help='Fraction of locations to keep (default: 1.0 = all, 0.1 = 10%% random subset, subsampled once)')
@@ -1379,13 +1384,13 @@ def main():
     gc.collect()
 
     print("4. Splitting data...")
-    train_in, val_in, test_in, train_tgt, val_tgt, test_tgt = preprocessor.split_data(
-        inputs, targets, test_size=args.test_size, val_size=args.val_size,
+    train_in, val_in, train_tgt, val_tgt = preprocessor.split_data(
+        inputs, targets, val_size=args.val_size,
         random_state=42, split_by_location=True,
     )
-    print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}  |  Test: {len(test_in['lat']):,}")
+    print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}")
 
-    # Free unsplit data — now in train/val/test subsets
+    # Free unsplit data — now in train/val subsets
     del inputs, targets
     gc.collect()
 
@@ -1397,13 +1402,6 @@ def main():
         val_in, val_tgt = preprocessor.subsample_by_location(
             val_in, val_tgt, fraction=args.sample_fraction, random_state=42,
         )
-        test_in, test_tgt = preprocessor.subsample_by_location(
-            test_in, test_tgt, fraction=args.sample_fraction, random_state=42,
-        )
-
-    # Free test split — not used during training
-    del test_in, test_tgt
-    gc.collect()
 
     # -- Region hold-out ---
     holdout_bboxes = resolve_holdout_regions(args.holdout_regions) if args.holdout_regions else []

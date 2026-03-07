@@ -82,14 +82,14 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - `compute_species_freq_weights()`: Per-species label weights based on observation frequency
   - Treats range (number of occupied cells) as a proxy for abundance
   - Common species (>=95th percentile) -> weight 1.0; rare (<=5th pct) -> min_weight (default 0.1)
-  - Sigmoid-shaped interpolation between percentiles; stored as `self.species_freq_weights`
+  - Log-scale sigmoid interpolation between percentiles; stored as `self.species_freq_weights`
 - `compute_obs_density()`: Per-sample observation density (total species detections
   at each location across all weeks). Serves as a proxy for observer effort.
   Stored in `inputs['obs_density']` and used for density-stratified validation metrics.
 - `mask_regions()`: Split data into in-region (holdout) and out-of-region (train)
   subsets by geographic bounding boxes. Returns (outside_inputs, outside_targets,
   inside_inputs, inside_targets).
-- `split_data()`: Location-based train/val/test splitting to prevent data leakage
+- `split_data()`: Location-based train/val splitting to prevent data leakage
 - `subsample_by_location()`: Randomly subsample a fraction of locations (and all
   their samples). Preserves temporal structure within each H3 cell.
 - `subsample_by_samples()`: Randomly subsample a fraction of individual
@@ -189,8 +189,9 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - `training_history.json`: Per-epoch loss, LR, and evaluation metrics
 - Evaluation metrics computed during validation:
   - **GeoScore**: composite quality metric (primary optimisation target)
-    - Weighted sum of mAP (0.25), F1@10% (0.20), list-ratio@10% log-symmetric (0.15),
-      watchlist mean AP (0.20), mAP density ratio (0.10), 1 − pred-density corr (0.10)
+    - Weighted sum of mAP (0.20), F1@10% (0.20), list-ratio@10% log-symmetric (0.15),
+      watchlist mean AP (0.10), holdout mAP (0.10), mAP density ratio (0.20),
+      1 − pred-density corr (0.05)
     - Missing components excluded, weights renormalised
     - Used for early stopping, best-checkpoint selection, and Optuna autotune
   - Mean Average Precision (mAP)
@@ -247,7 +248,7 @@ numerical stability.  Pass `--fp16_io` to convert I/O tensors to FP16 as well.
 4. Downsample ocean cells (if configured; default: keep all)
 5. Cap observations per species (if configured) → Reduce common-species dominance
 6. Normalize environmental features → Auxiliary targets
-7. Split by location → Train/Val/Test sets
+7. Split by location → Train/Val sets
 8. Create PyTorch DataLoaders → Batched sampling
    - `--jitter` adds Gaussian noise to training lat/lon (scale from H3 cell size)
 8. Training loop:
