@@ -81,29 +81,42 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
   - Supports `min_obs_per_species` to exclude rare species (default 100)
 - `compute_species_freq_weights()`: Per-species label weights based on observation frequency
   - Treats range (number of occupied cells) as a proxy for abundance
-  - Common species (>=95th percentile) -> weight 1.0; rare (<=5th pct) -> min_weight (default 0.1)
-  - Sigmoid-shaped interpolation between percentiles; stored as `self.species_freq_weights`
-- `split_data()`: Location-based train/val/test splitting to prevent data leakage
+  - Common species (>=pct_hi percentile, default 99) -> weight 1.0; rare (<=pct_lo, default 10) -> min_weight (default 0.1)
+  - `pct_lo` / `pct_hi` configurable via CLI (`--label_freq_weight_pct_lo`, `--label_freq_weight_pct_hi`)
+  - Log-scale sigmoid interpolation between percentiles; stored as `self.species_freq_weights`
+- `compute_obs_density()`: Per-sample observation density (total species detections
+  at each location across all weeks). Serves as a proxy for observer effort.
+  Stored in `inputs['obs_density']` and used for density-stratified validation metrics.
+- `mask_regions()`: Split data into in-region (holdout) and out-of-region (train)
+  subsets by geographic bounding boxes. Returns (outside_inputs, outside_targets,
+  inside_inputs, inside_targets).
+- `split_data()`: Location-based train/val splitting to prevent data leakage
 - `subsample_by_location()`: Randomly subsample a fraction of locations (and all
-  their samples). Used to reduce val/test size before training starts.
+  their samples). Preserves temporal structure within each H3 cell.
+- `subsample_by_samples()`: Randomly subsample a fraction of individual
+  week@location rows. Used when dropping entire locations is undesirable
+  (e.g. small islands with endemic species).
 
 **data.py** - PyTorch Dataset:
 - `BirdSpeciesDataset`: PyTorch Dataset wrapper with sparse-to-dense conversion
   - Optional `jitter_std` (degrees) adds Gaussian noise to lat/lon on each draw
   - Optional `species_freq_weights` applies per-species label weights (training only)
   - Lat clamped to [-90, 90], lon wrapped at ±180°
-- `FractionalRandomSampler`: Sampler that draws a deterministic random subset of
-  training indices each epoch (seed `42 + epoch`). Used when `sample_fraction < 1`.
+  - Sparse path returns raw index arrays; dense vector built in batch collate_fn
 - `create_dataloaders()`: Creates training and validation DataLoaders
-  - Accepts `sample_fraction` (0–1]; uses `FractionalRandomSampler` when < 1
   - Accepts `jitter_std`; applied to training set only (val is never jittered)
   - Accepts `species_freq_weights`; applied to training set only
-  - Val/test are subsampled by location once before training (consistent)
-  - Training is subsampled per-epoch via FractionalRandomSampler (varying)
+  - Uses custom `collate_fn` for sparse species (builds dense tensor per batch)
+  - `persistent_workers=True` when `num_workers > 0`
+  - Callers subsample by location before calling (see `subsample_by_location`)
 
 **geoutils.py**: Google Earth Engine feature extraction for H3 cells
 **gbifutils.py**: GBIF species occurrence data retrieval (parallel processing with multiprocessing pool)
 **combine.py**: Merges Earth Engine features with GBIF observations into a single parquet
+**regions.py**: Holdout region definitions and resolution
+- `HOLDOUT_REGIONS` dict: 5 well-surveyed regions (us_northwest, benelux, uk, california, japan)
+  as (lon_min, lat_min, lon_max, lat_max) bounding boxes
+- `resolve_holdout_regions(names)`: Resolves region name strings to bbox tuples
 
 ### Model Architecture (`model/`)
 
@@ -115,7 +128,8 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
    - Output dim = 2 × n_harmonics per scalar
 
 2. **ResidualBlock**: Pre-norm residual block
-   - LayerNorm → GELU → Linear → LayerNorm → GELU → Dropout → Linear + skip connection
+   - LayerNorm(eps=1e-4) → GELU → Linear → LayerNorm(eps=1e-4) → GELU → Dropout → Linear + skip connection
+   - eps=1e-4 keeps epsilon above the FP16 min-normal (~6e-5) for quantisation safety
 
 3. **SpatioTemporalEncoder**: Shared encoder with FiLM temporal conditioning
    - Spatial: lat→16, lon→16 = 32 features → Linear projection to embed_dim
@@ -148,11 +162,11 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 
 **loss.py** - Loss Functions:
 - `asymmetric_loss()`: Default loss — ASL (Ridnik et al., 2021) for multi-label classification
-  - Separate focusing: γ+=0 (keep all positives), γ-=4 (suppress easy negatives)
+  - Separate focusing: γ+=0 (keep all positives), γ-=2 (suppress easy negatives)
   - Probability margin clip=0.05 discards very easy negatives
 - `AssumeNegativeLoss`: LAN-full strategy (Cole et al., 2023) for presence-only data
   - Up-weights positives by λ, samples M negatives per example
-  - Default: λ=8, M=1024, label_smoothing=0.05
+  - Default: λ=4, M=1024, label_smoothing=0.05
 - `MultiTaskLoss`: Weighted combination of species loss + environmental MSE
   - Total Loss = species_weight × species_loss + env_weight × MSE
   - Species loss: `asl` (default), `bce`, `focal`, or `an` (assume-negative)
@@ -167,20 +181,34 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - Complete training loop with validation
 - Automatic mixed precision (AMP) on CUDA
 - Gradient clipping (max_norm=1.0) to prevent exploding gradients
-- Linear LR warmup (3 epochs) + CosineAnnealingWarmRestarts schedule
-- Early stopping with configurable patience (default 10), based on validation mAP
+- Linear LR warmup (3 epochs) + CosineAnnealingLR schedule (single decay, no restarts)
+- Early stopping with configurable patience (default 10), based on validation **GeoScore**
 - Checkpoint management:
   - `checkpoint_latest.pt`: Latest model state
-  - `checkpoint_best.pt`: Best validation mAP
+  - `checkpoint_best.pt`: Best validation GeoScore
 - `labels.txt`: Species vocabulary (taxonKey → scientific name → common name)
 - `training_history.json`: Per-epoch loss, LR, and evaluation metrics
 - Evaluation metrics computed during validation:
+  - **GeoScore**: composite quality metric (primary optimisation target)
+    - Weighted sum of mAP (0.20), F1@10% (0.20), list-ratio@10% log-symmetric (0.15),
+      watchlist mean AP (0.10), holdout mAP (0.10), mAP density ratio (0.20),
+      1 − pred-density corr (0.05)
+    - Missing components excluded, weights renormalised
+    - Used for early stopping, best-checkpoint selection, and Optuna autotune
   - Mean Average Precision (mAP)
   - Top-k recall at k=10 and k=30
+  - F1, precision, recall at probability thresholds 5%, 10%, 25%
+  - List-ratio and mean list length at the same thresholds
+  - Per-species AP for 18 endemic/restricted-range watchlist species
+    (Hawaiian, NZ, Galápagos, other), with watchlist mean AP
+  - Density-stratified mAP (sparse/dense quartiles by observation density)
+  - Prediction-density correlation (Pearson r between obs density and predicted count)
+  - Holdout region metrics (mAP, F1@10% on held-out geographic regions)
+- `WATCHLIST_SPECIES` dict in train.py maps taxonKeys to common names
 - Progress tracking with tqdm
 - GPU/CPU support with automatic device selection
 - Optuna-based hyperparameter autotune (`--autotune`)
-  - Tunes: lr, batch_size, pos_lambda, neg_samples, label_smoothing, env_weight, jitter, max_obs_per_species, min_obs_per_species, no_yearly, species_loss, model_scale, coord_harmonics, week_harmonics, asl_gamma_neg, asl_clip, label_freq_weight
+  - Tunes: pos_lambda, neg_samples, label_smoothing, env_weight, jitter, species_loss, model_scale, coord_harmonics, week_harmonics, asl_gamma_neg, asl_clip, focal_alpha, focal_gamma, label_freq_weight, label_freq_weight_min, label_freq_weight_pct_lo, label_freq_weight_pct_hi
   - Bayesian optimization with TPE sampler and MedianPruner
   - `--autotune_trials` (default 50), `--autotune_epochs` (default 10)
   - Results saved to `checkpoints/autotune/autotune_results.json`
@@ -192,7 +220,8 @@ python train.py \
   --model_scale 1.0 \
   --batch_size 256 \
   --num_epochs 100 \
-  --lr 0.001
+  --lr 0.001 \
+  --holdout_regions us_northwest benelux  # optional: mask regions from training
 ```
 
 ### Inference (`predict.py`)
@@ -206,6 +235,10 @@ Converts a PyTorch checkpoint to portable inference formats (ONNX, TFLite, TF Sa
 with FP16 and INT8 quantisation options.  Each conversion is automatically validated against
 the PyTorch reference model.  Default format is ONNX FP16.
 
+By default, ONNX FP16 exports keep model inputs/outputs in FP32 (`keep_io_fp32=True`)
+while converting internal weights to FP16.  LayerNormalization is also kept in FP32 for
+numerical stability.  Pass `--fp16_io` to convert I/O tensors to FP16 as well.
+
 ### Data Flow
 
 **Training:**
@@ -216,7 +249,7 @@ the PyTorch reference model.  Default format is ONNX FP16.
 4. Downsample ocean cells (if configured; default: keep all)
 5. Cap observations per species (if configured) → Reduce common-species dominance
 6. Normalize environmental features → Auxiliary targets
-7. Split by location → Train/Val/Test sets
+7. Split by location → Train/Val sets
 8. Create PyTorch DataLoaders → Batched sampling
    - `--jitter` adds Gaussian noise to training lat/lon (scale from H3 cell size)
 8. Training loop:
@@ -256,6 +289,11 @@ geomodel/
 │   ├── plot_training.py        # Training loss curves and metrics
 │   ├── plot_variable_importance.py  # Feature importance analysis
 │   └── plot_environmental.py   # Environmental feature visualization
+├── report/
+│   ├── ablation.md             # Ablation study plan, hypotheses, and results
+│   ├── run_ablation.sh         # Run all ablation experiments sequentially
+│   ├── collect_ablation_results.py  # Collect ablation results into Markdown/CSV tables
+│   └── ablation/               # Ablation experiment checkpoints and logs
 ├── docs/                       # MkDocs documentation
 ├── checkpoints/                # Saved model checkpoints
 └── outputs/                    # Generated data and plots

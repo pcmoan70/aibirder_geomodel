@@ -1,3 +1,6 @@
+# Exclude report dir
+report/
+
 # Exclude export outputs
 exports/
 

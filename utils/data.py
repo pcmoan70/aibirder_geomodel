@@ -16,7 +16,7 @@ import torch
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 
@@ -362,6 +362,105 @@ class H3DataPreprocessor:
             sparse.append(np.array(indices, dtype=np.int32))
         return sparse
 
+    # -- Observation density -----------------------------------------------
+
+    @staticmethod
+    def compute_obs_density(
+        inputs: Dict[str, np.ndarray],
+        species_lists: List[List[int]],
+    ) -> np.ndarray:
+        """Compute per-sample observation density for density-stratified evaluation.
+
+        For each unique location (lat, lon), sums the total number of species
+        detections across all samples at that location.  Each sample is then
+        assigned its location's total density.  This serves as a proxy for
+        observer effort / survey intensity.
+
+        A well-surveyed H3 cell (e.g. Central Park, NYC) will have a high
+        density value; a poorly surveyed cell (e.g. rural Siberia) will have
+        a low value.  During validation the density is used to stratify
+        metrics — a model that generalises well should have similar mAP in
+        dense and sparse strata.
+
+        Args:
+            inputs: Dict with 'lat', 'lon' float32 arrays.
+            species_lists: Per-sample lists of taxonKeys (before encoding).
+
+        Returns:
+            Float32 array of shape ``(n_samples,)`` with per-location density.
+        """
+        lats = inputs['lat']
+        lons = inputs['lon']
+
+        # Sum species detections per location
+        loc_density: Dict[tuple, float] = {}
+        for i, (lat, lon) in enumerate(zip(lats, lons)):
+            key = (float(lat), float(lon))
+            sl = species_lists[i]
+            n = len(sl) if hasattr(sl, '__len__') else 0
+            loc_density[key] = loc_density.get(key, 0) + n
+
+        # Assign back to each sample
+        density = np.array(
+            [loc_density[(float(lat), float(lon))] for lat, lon in zip(lats, lons)],
+            dtype=np.float32,
+        )
+        return density
+
+    # -- Region masking ---------------------------------------------------
+
+    @staticmethod
+    def mask_regions(
+        inputs: Dict[str, np.ndarray],
+        targets: Dict[str, Any],
+        regions: List[Tuple[float, float, float, float]],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """Split data into outside-region and inside-region subsets.
+
+        Samples whose (lat, lon) falls inside any of the given bounding boxes
+        are moved to the "inside" subset; the rest stay in "outside".  This
+        enables region hold-out experiments: train on the outside subset and
+        evaluate spatial generalisation on the inside (held-out) subset.
+
+        Args:
+            inputs:  Dict with 'lat', 'lon', 'week' (and optionally
+                     'obs_density') arrays.
+            targets: Dict with 'species' and 'env_features'.
+            regions: List of ``(lon_min, lat_min, lon_max, lat_max)`` bboxes.
+
+        Returns:
+            ``(inputs_outside, targets_outside, inputs_inside, targets_inside)``
+        """
+        lats = inputs['lat']
+        lons = inputs['lon']
+
+        inside = np.zeros(len(lats), dtype=bool)
+        for lon_min, lat_min, lon_max, lat_max in regions:
+            inside |= (
+                (lats >= lat_min) & (lats <= lat_max)
+                & (lons >= lon_min) & (lons <= lon_max)
+            )
+        outside = ~inside
+
+        def _subset(d: Dict[str, Any], mask: np.ndarray) -> Dict[str, Any]:
+            out = {}
+            for k, v in d.items():
+                if isinstance(v, np.ndarray):
+                    out[k] = v[mask]
+                elif isinstance(v, list):
+                    idxs = np.where(mask)[0]
+                    out[k] = [v[i] for i in idxs]
+                else:
+                    out[k] = v
+            return out
+
+        return (
+            _subset(inputs, outside),
+            _subset(targets, outside),
+            _subset(inputs, inside),
+            _subset(targets, inside),
+        )
+
     # -- Full pipeline ----------------------------------------------------
 
     # Heuristic: if dense matrix would exceed this many bytes, use sparse
@@ -423,6 +522,11 @@ class H3DataPreprocessor:
         }
         targets = {'species': species_enc, 'env_features': normalized_env}
 
+        # Observation density for density-stratified evaluation
+        inputs['obs_density'] = self.compute_obs_density(
+            inputs, species_lists,
+        )
+
         # Frequency-based label weights (computed here, applied in Dataset)
         self.species_freq_weights = None
 
@@ -432,6 +536,8 @@ class H3DataPreprocessor:
         self,
         species_lists: List[List[int]],
         min_weight: float = 0.1,
+        pct_lo: float = 10.0,
+        pct_hi: float = 99.0,
     ) -> np.ndarray:
         """Compute per-species label weights based on observation frequency.
 
@@ -443,16 +549,24 @@ class H3DataPreprocessor:
 
         Species are weighted by how often they occur across all samples:
 
-        - >= 95th percentile of counts -> weight 1.0 (common)
-        - <= 5th percentile of counts  -> *min_weight* (rare)
-        - In between -> sigmoid-shaped interpolation that creates a long-tail
-          distribution (most species stay near *min_weight*, only the most
-          common ramp up sharply toward 1.0)
+        - >= *pct_hi* percentile of counts -> weight 1.0 (common)
+        - <= *pct_lo* percentile of counts -> *min_weight* (rare)
+        - In between -> log-scale sigmoid interpolation that spreads
+          weights naturally across the wide dynamic range of observation
+          counts
 
-        The sigmoid shaping uses ``t' = t^3 / (t^3 + (1-t)^3)`` where
-        ``t`` is the linear 0-1 position between the 5th and 95th
-        percentile.  This keeps the mapping monotonic and smooth while
-        concentrating most of the weight mass at the upper end.
+        Args:
+            species_lists: Per-sample species occurrence lists.
+            min_weight: Floor weight for rare species.
+            pct_lo: Lower percentile threshold (species at or below get
+                *min_weight*).  Default 10.
+            pct_hi: Upper percentile threshold (species at or above get
+                weight 1.0).  Default 99.
+
+        The position between *pct_lo* and *pct_hi* is computed in log-space
+        (natural for count distributions spanning orders of magnitude), then
+        passed through a sigmoid ``t' = t^3 / (t^3 + (1-t)^3)`` for smooth
+        S-shaped remapping.
 
         The returned array has shape ``(n_species,)`` and is stored as
         ``self.species_freq_weights`` for use in the Dataset.
@@ -474,32 +588,34 @@ class H3DataPreprocessor:
             self.species_freq_weights = np.ones(n_species, dtype=np.float32)
             return self.species_freq_weights
 
-        p5 = np.percentile(nonzero, 5)
-        p95 = np.percentile(nonzero, 95)
+        p_lo = np.percentile(nonzero, pct_lo)
+        p_hi = np.percentile(nonzero, pct_hi)
 
         weights = np.ones(n_species, dtype=np.float32)
-        if p95 > p5:
+        if p_hi > p_lo:
+            log_lo = np.log(p_lo)
+            log_span = np.log(p_hi) - log_lo
             for i in range(n_species):
                 c = count_arr[i]
-                if c >= p95:
+                if c >= p_hi:
                     weights[i] = 1.0
-                elif c <= p5:
+                elif c <= p_lo:
                     weights[i] = min_weight
                 else:
-                    # Linear position in [0, 1]
-                    t = (c - p5) / (p95 - p5)
-                    # Sigmoid-shaped remapping: long tail, sharp rise at top
+                    # Log-scale position in [0, 1] — natural for count data
+                    t = (np.log(c) - log_lo) / log_span
+                    # Sigmoid-shaped remapping: smooth S-curve
                     t3 = t ** 3
                     t = t3 / (t3 + (1.0 - t) ** 3)
                     weights[i] = min_weight + t * (1.0 - min_weight)
-        # If p95 == p5 all species have similar counts: uniform weight 1.0
+        # If p_hi == p_lo all species have similar counts: uniform weight 1.0
 
         self.species_freq_weights = weights
 
         # Print distribution summary
         print(f"   Freq label weights: min={weights.min():.3f}, "
               f"median={np.median(weights):.3f}, max={weights.max():.3f}  "
-              f"(p5={int(p5):,}, p95={int(p95):,} observations)")
+              f"(p{pct_lo:.0f}={int(p_lo):,}, p{pct_hi:.0f}={int(p_hi):,} observations)")
 
         return weights
 
@@ -605,19 +721,73 @@ class H3DataPreprocessor:
               f"{len(inputs['lat']):,} -> {int(mask.sum()):,} samples")
         return sub_in, sub_tgt
 
+    def subsample_by_samples(
+        self,
+        inputs: Dict[str, np.ndarray],
+        targets: Dict[str, Any],
+        fraction: float = 1.0,
+        random_state: int = 42,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+        """Randomly subsample a fraction of individual samples (week@location rows).
+
+        Unlike :meth:`subsample_by_location`, which drops entire H3 cells,
+        this method drops individual week-rows while preserving at least some
+        data for every location.  This avoids losing small islands that have
+        few cells but whose endemic species are important to monitor.
+
+        Args:
+            inputs: Dict with 'lat', 'lon', 'week' arrays.
+            targets: Dict with 'species' and 'env_features'.
+            fraction: Fraction of samples to keep (0 < fraction <= 1).
+            random_state: Random seed for reproducibility.
+
+        Returns:
+            (inputs, targets) subsets with the selected samples.
+        """
+        if fraction >= 1.0:
+            return inputs, targets
+
+        n = len(inputs['lat'])
+        k = max(1, int(n * fraction))
+        rng = np.random.RandomState(random_state)
+        selected = np.sort(rng.choice(n, size=k, replace=False))
+
+        def _subset(d: Dict[str, Any], idx: np.ndarray) -> Dict[str, Any]:
+            out = {}
+            for key, v in d.items():
+                if isinstance(v, np.ndarray):
+                    out[key] = v[idx]
+                elif isinstance(v, list):
+                    out[key] = [v[i] for i in idx]
+                else:
+                    out[key] = v
+            return out
+
+        sub_in = _subset(inputs, selected)
+        sub_tgt = _subset(targets, selected)
+        print(f"   Subsampled {fraction:.0%} of samples: "
+              f"{n:,} -> {k:,} samples")
+        return sub_in, sub_tgt
+
     def split_data(
         self,
         inputs: Dict[str, np.ndarray],
         targets: Dict[str, Any],
-        test_size: float = 0.2,
         val_size: float = 0.1,
         random_state: int = 42,
         split_by_location: bool = True,
+        **kwargs,
     ) -> Tuple:
-        """Split into train/val/test (optionally grouped by location to prevent leakage).
+        """Split into train/val (optionally grouped by location to prevent leakage).
 
         Handles both dense ndarray and sparse list-of-arrays species targets.
+
+        Returns:
+            (train_inputs, val_inputs, train_targets, val_targets)
         """
+        # Accept (and ignore) legacy test_size kwarg for backward compat
+        _ = kwargs.pop('test_size', None)
+
         n_samples = len(inputs['lat'])
         indices = np.arange(n_samples)
 
@@ -627,21 +797,15 @@ class H3DataPreprocessor:
             loc_ids = np.array([unique_map.setdefault(c, len(unique_map)) for c in coord_tuples])
             unique_locs = np.unique(loc_ids)
 
-            locs_train, locs_test = train_test_split(
-                unique_locs, test_size=test_size, random_state=random_state
-            )
             locs_train, locs_val = train_test_split(
-                locs_train, test_size=val_size / (1 - test_size), random_state=random_state
+                unique_locs, test_size=val_size, random_state=random_state
             )
             train_mask = np.isin(loc_ids, locs_train)
             val_mask = np.isin(loc_ids, locs_val)
-            test_mask = np.isin(loc_ids, locs_test)
         else:
-            idx_temp, idx_test = train_test_split(indices, test_size=test_size, random_state=random_state)
-            idx_train, idx_val = train_test_split(idx_temp, test_size=val_size / (1 - test_size), random_state=random_state)
+            idx_train, idx_val = train_test_split(indices, test_size=val_size, random_state=random_state)
             train_mask = np.isin(indices, idx_train)
             val_mask = np.isin(indices, idx_val)
-            test_mask = np.isin(indices, idx_test)
 
         def _split_dict(d: Dict[str, Any], mask: np.ndarray) -> Dict[str, Any]:
             out = {}
@@ -657,8 +821,8 @@ class H3DataPreprocessor:
             return out
 
         return (
-            _split_dict(inputs, train_mask), _split_dict(inputs, val_mask), _split_dict(inputs, test_mask),
-            _split_dict(targets, train_mask), _split_dict(targets, val_mask), _split_dict(targets, test_mask),
+            _split_dict(inputs, train_mask), _split_dict(inputs, val_mask),
+            _split_dict(targets, train_mask), _split_dict(targets, val_mask),
         )
 
     def get_preprocessing_info(self) -> Dict[str, Any]:
@@ -674,33 +838,6 @@ class H3DataPreprocessor:
 # ---------------------------------------------------------------------------
 # PyTorch Dataset / DataLoader
 # ---------------------------------------------------------------------------
-
-
-class FractionalRandomSampler(Sampler):
-    """Draw a deterministic random subset of training indices each epoch.
-
-    The seed changes every epoch (``42 + epoch``) so each epoch sees a
-    different subset while remaining reproducible.
-    """
-
-    def __init__(self, data_source: Dataset, fraction: float = 1.0):
-        self.data_source = data_source
-        self.fraction = fraction
-        self.epoch = 0
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = epoch
-
-    def __iter__(self):
-        n = len(self.data_source)
-        k = max(1, int(n * self.fraction))
-        rng = np.random.RandomState(42 + self.epoch)
-        indices = rng.choice(n, size=k, replace=False)
-        rng.shuffle(indices)
-        return iter(indices.tolist())
-
-    def __len__(self) -> int:
-        return max(1, int(len(self.data_source) * self.fraction))
 
 
 class BirdSpeciesDataset(Dataset):
@@ -738,6 +875,12 @@ class BirdSpeciesDataset(Dataset):
         self.env_features = torch.from_numpy(targets['env_features']).float()
         self.jitter_std = jitter_std
 
+        # Observation density (optional, for density-stratified eval)
+        if 'obs_density' in inputs:
+            self.obs_density = torch.from_numpy(inputs['obs_density']).float()
+        else:
+            self.obs_density = None
+
         # Per-species label weights (frequency-based)
         if species_freq_weights is not None:
             self.species_freq_weights = torch.from_numpy(species_freq_weights).float()
@@ -774,23 +917,71 @@ class BirdSpeciesDataset(Dataset):
         if self.species_dense is not None:
             sp = self.species_dense[idx]
             if self.species_freq_weights is not None:
-                # Only weight positive labels (1s); 0s stay 0
                 mask = sp > 0
                 sp = sp.clone()
                 sp[mask] = self.species_freq_weights[mask]
+            inp = {'lat': lat, 'lon': lon, 'week': self.week[idx]}
+            if self.obs_density is not None:
+                inp['obs_density'] = self.obs_density[idx]
+            return (
+                inp,
+                {'species': sp, 'env_features': self.env_features[idx]},
+            )
         else:
-            # Materialise dense vector from sparse indices
-            sp = torch.zeros(self.n_species, dtype=torch.float32)
+            # Return raw sparse indices — dense vector is built in collate_fn
             indices = self.species_sparse[idx]
+            inp = {'lat': lat, 'lon': lon, 'week': self.week[idx]}
+            if self.obs_density is not None:
+                inp['obs_density'] = self.obs_density[idx]
+            return (
+                inp,
+                {'species_indices': indices, 'env_features': self.env_features[idx]},
+            )
+
+
+def _make_sparse_collate_fn(
+    n_species: int,
+    species_freq_weights: Optional[torch.Tensor] = None,
+):
+    """Return a collate function that builds dense species tensors from sparse indices.
+
+    Instead of each ``__getitem__`` call allocating a 40 KB dense vector,
+    the collate function builds one ``(batch, n_species)`` tensor per batch.
+    This cuts per-epoch allocation by ~1000×.
+    """
+    _weights = species_freq_weights  # captured once
+
+    def collate_fn(batch):
+        inputs_list, targets_list = zip(*batch)
+        # Stack scalar inputs
+        lat = torch.stack([inp['lat'] for inp in inputs_list])
+        lon = torch.stack([inp['lon'] for inp in inputs_list])
+        week = torch.stack([inp['week'] for inp in inputs_list])
+        env = torch.stack([tgt['env_features'] for tgt in targets_list])
+
+        inp = {'lat': lat, 'lon': lon, 'week': week}
+        # Observation density (optional, for density-stratified eval)
+        if 'obs_density' in inputs_list[0]:
+            inp['obs_density'] = torch.stack([i['obs_density'] for i in inputs_list])
+
+        # Build dense species matrix from sparse indices
+        B = len(batch)
+        species = torch.zeros(B, n_species, dtype=torch.float32)
+        for i, tgt in enumerate(targets_list):
+            indices = tgt['species_indices']
             if len(indices) > 0:
-                if self.species_freq_weights is not None:
-                    sp[indices] = self.species_freq_weights[indices]
+                idx_t = torch.from_numpy(indices).long() if not isinstance(indices, torch.Tensor) else indices.long()
+                if _weights is not None:
+                    species[i, idx_t] = _weights[idx_t]
                 else:
-                    sp[indices] = 1.0
+                    species[i, idx_t] = 1.0
+
         return (
-            {'lat': lat, 'lon': lon, 'week': self.week[idx]},
-            {'species': sp, 'env_features': self.env_features[idx]},
+            inp,
+            {'species': species, 'env_features': env},
         )
+
+    return collate_fn
 
 
 def create_dataloaders(
@@ -802,17 +993,20 @@ def create_dataloaders(
     num_workers: int = 0,
     pin_memory: bool = True,
     n_species: int = 0,
-    sample_fraction: float = 1.0,
     jitter_std: float = 0.0,
     species_freq_weights: Optional[np.ndarray] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
+    All data is held in memory as PyTorch tensors.  Callers should
+    subsample *before* calling this function if only a fraction of the
+    data is needed (see ``H3DataPreprocessor.subsample_by_location``).
+
+    When species targets are sparse (list of index arrays), a custom
+    collate function builds the dense ``(batch, n_species)`` tensor once
+    per batch instead of per sample, reducing allocation pressure ~1000×.
+
     Args:
-        sample_fraction: Fraction of training samples to use per epoch.
-            When < 1, a ``FractionalRandomSampler`` draws a different
-            random subset each epoch (seed ``42 + epoch``).  Validation
-            always uses all samples.
         jitter_std: Gaussian noise std (degrees) added to training
             coordinates each time a sample is drawn.  Validation
             coordinates are never jittered.
@@ -824,20 +1018,25 @@ def create_dataloaders(
                                   species_freq_weights=species_freq_weights)
     val_ds = BirdSpeciesDataset(val_inputs, val_targets, n_species=n_species)
 
-    if sample_fraction < 1.0:
-        sampler = FractionalRandomSampler(train_ds, fraction=sample_fraction)
-        train_loader = DataLoader(train_ds, batch_size=batch_size,
-                                  sampler=sampler,
-                                  num_workers=num_workers,
-                                  pin_memory=pin_memory, drop_last=True)
-    else:
-        train_loader = DataLoader(train_ds, batch_size=batch_size,
-                                  shuffle=True,
-                                  num_workers=num_workers,
-                                  pin_memory=pin_memory, drop_last=True)
+    # Use custom collation when species targets are sparse
+    _is_sparse = train_ds.species_sparse is not None
+    train_collate = _make_sparse_collate_fn(
+        n_species, train_ds.species_freq_weights) if _is_sparse else None
+    val_collate = _make_sparse_collate_fn(n_species) if _is_sparse else None
+
+    _persistent = num_workers > 0
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
+                              shuffle=True,
+                              num_workers=num_workers,
+                              pin_memory=pin_memory, drop_last=True,
+                              persistent_workers=_persistent,
+                              collate_fn=train_collate)
 
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=pin_memory)
+                            num_workers=num_workers, pin_memory=pin_memory,
+                            persistent_workers=_persistent,
+                            collate_fn=val_collate)
     return train_loader, val_loader
 
 

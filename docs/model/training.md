@@ -24,7 +24,7 @@ The training script handles the full pipeline automatically:
 1. **Load data** — read combined parquet file
 2. **Flatten** — expand H3 cells × 48 weeks into individual samples
 3. **Preprocess** — build species vocabulary, normalize environmental features
-4. **Split** — location-based train/val/test split (prevents spatial data leakage)
+4. **Split** — location-based train/val split (prevents spatial data leakage)
 5. **Train** — multi-task training with checkpointing
 
 ## CLI Reference
@@ -56,11 +56,11 @@ The training script handles the full pipeline automatically:
 | `--env_weight` | `0.1` | Environmental loss multiplier |
 | `--species_loss` | `asl` | Loss function: `asl` (asymmetric, default), `bce`, `focal`, or `an` |
 | `--asl_gamma_pos` | `0.0` | ASL positive focusing parameter (0 = no down-weighting) |
-| `--asl_gamma_neg` | `4.0` | ASL negative focusing parameter (higher = more aggressive) |
+| `--asl_gamma_neg` | `2.0` | ASL negative focusing parameter (higher = more aggressive) |
 | `--asl_clip` | `0.05` | ASL probability margin for negatives (0 = disable) |
-| `--focal_alpha` | `0.25` | Focal loss alpha (only with `--species_loss focal`) |
+| `--focal_alpha` | `0.5` | Focal loss alpha (weight for positive class; only with `--species_loss focal`) |
 | `--focal_gamma` | `2.0` | Focal loss gamma |
-| `--pos_lambda` | `8.0` | Positive up-weighting λ for AN loss |
+| `--pos_lambda` | `4.0` | Positive up-weighting λ for AN loss |
 | `--neg_samples` | `1024` | Negative species to sample per example for AN loss (0 = all) |
 | `--label_smoothing` | `0.05` | Smooth binary targets to prevent overconfidence (0 = off) |
 | `--max_obs_per_species` | `100000` | Cap observations per species (0 = no cap) |
@@ -75,39 +75,79 @@ The training script handles the full pipeline automatically:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--lr_schedule` | `cosine` | `cosine` (warm restarts; Loshchilov & Hutter, 2017) or `none` |
-| `--lr_T0` | `10` | Cosine restart period in epochs |
+| `--lr_schedule` | `cosine` | `cosine` (single decay to `lr_min`) or `none` |
 | `--lr_min` | `1e-6` | Minimum learning rate |
 | `--lr_warmup` | `3` | Linear warmup epochs before cosine schedule (0 = off) |
+
+### GeoScore — Composite Quality Metric
+
+GeoScore combines validation metrics into a single 0–1 value.
+It is the **primary optimization target**: early stopping, best-checkpoint
+selection, and Optuna autotune all maximise GeoScore.
+
+$$
+\text{GeoScore} = \frac{\sum_{i} w_i \cdot s_i}{\sum_{i} w_i}
+$$
+
+where each $s_i$ is a component score normalised to $[0, 1]$ (higher = better):
+
+| Component | Key | Weight | Transform |
+|---|---|---|---|
+| Ranking quality | `mAP` | 0.20 | as-is |
+| Classification quality | `F1 @ 10%` | 0.20 | as-is |
+| List-length calibration | `list_ratio @ 10%` | 0.15 | $\max(0,\; 1 - |\ln(\text{LR})|)$ |
+| Endemic species | `watchlist_mean_ap` | 0.10 | as-is |
+| Geographic generalisation | `holdout_map` | 0.10 | as-is (out-of-region mAP) |
+| Density robustness | `mAP_density_ratio` | 0.20 | as-is (sparse / dense) |
+| Decorrelation | `pred_density_corr` | 0.05 | $\max(0,\; 1 - |r|)$ |
+
+!!! info "Why a composite metric?"
+
+    Optimising mAP alone can push the model toward over-predicting species
+    (inflating recall at the cost of precision) or ignoring rare/endemic
+    species.  GeoScore guards against this by explicitly rewarding:
+
+    - **List calibration** — the log-symmetric penalty ensures predicted
+      species lists are close in length to observed lists.
+    - **Endemic coverage** — watchlist AP prevents the model from focusing
+      exclusively on common species.
+    - **Bias robustness** — density ratio and decorrelation penalise
+      models that merely mirror observer effort patterns.
+    - **Geographic generalisation** — holdout mAP measures performance
+      on geographically held-out regions, rewarding models that
+      extrapolate beyond their training distribution.
+
+!!! tip "Missing components"
+
+    When a component is unavailable (e.g. no watchlist species in the
+    vocabulary, or no observation-density data), its weight is
+    redistributed proportionally among the remaining components.
+    GeoScore is always comparable across runs.
 
 ### Early Stopping
 
 | Flag | Default | Description |
 |---|---|---|
-| `--patience` | `10` | Stop after N epochs without mAP improvement (0 = disabled) |
+| `--patience` | `10` | Stop after N epochs without GeoScore improvement (0 = disabled) |
 
 ### Data Split
 
 | Flag | Default | Description |
 |---|---|---|
-| `--test_size` | `0.1` | Test set fraction |
 | `--val_size` | `0.1` | Validation set fraction |
-| `--sample_fraction` | `1.0` | Fraction of data to use (0–1) |
+| `--sample_fraction` | `1.0` | Fraction of locations to keep (0–1) |
 
 Splitting is **location-based**: all samples from one H3 cell go to the same split, preventing spatial data leakage.  The split uses a fixed random seed (`42`) for reproducibility.
 
 #### Sample fraction
 
-When `--sample_fraction` is less than 1.0 it reduces the effective dataset size in two complementary ways:
-
-- **Validation / test**: a random fraction of *locations* is sampled once (before training starts) and stays fixed, giving consistent evaluation metrics.
-- **Training**: a `FractionalRandomSampler` draws a fresh random subset of training *samples* each epoch (e.g. `0.25` → 25 % of training samples per epoch), so the model sees different data every epoch.
+When `--sample_fraction` is less than 1.0 it reduces the effective dataset size by subsampling a random fraction of *locations* once before training starts.  Both train and validation splits are subsampled the same way.
 
 Key properties:
 
-- **Deterministic** — the val/test location subsample uses a fixed seed (`42`); training epoch *e* uses seed `42 + e`.
-- **Different training subset each epoch** — improves coverage over time while keeping per-epoch cost low.
-- **Val/test stay consistent** — evaluation is comparable across epochs and runs.
+- **Deterministic** — the location subsample uses a fixed seed (`42`).
+- **All temporal structure preserved** — every week belonging to a selected H3 cell is kept.
+- **Evaluation stays consistent** — validation and test sets are fixed across epochs and runs.
 
 #### Coordinate jitter
 
@@ -116,6 +156,53 @@ When `--jitter` is passed, Gaussian noise is added to training coordinates every
 - **Validation and test sets are never jittered** — they always use exact cell centres.
 - **Each draw is independent** — the same sample receives different noise every epoch.
 - Latitude is clamped to $[-90, 90]$; longitude wraps at $\pm 180°$.
+
+### Region Hold-Out (Observation Bias Evaluation)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--holdout_regions` | — | Space-separated region names to mask from training and evaluate separately |
+
+GBIF observation data is heavily biased toward densely populated areas.
+The `--holdout_regions` flag removes well-surveyed geographic regions from
+the training set and creates a separate held-out evaluation set.  The model
+must predict species in these regions using only surrounding data.
+
+Available regions:
+
+| Name | Area | Bounding Box (lon_min, lat_min, lon_max, lat_max) |
+|---|---|---|
+| `us_northwest` | Oregon, Washington | (-125.0, 42.0, -116.5, 49.0) |
+| `benelux` | Belgium, Netherlands, Luxembourg | (2.5, 49.5, 7.2, 53.6) |
+| `uk` | United Kingdom | (-8.2, 49.9, 1.8, 58.7) |
+| `california` | California | (-124.5, 32.5, -114.1, 42.0) |
+| `japan` | Japan | (129.5, 30.0, 145.8, 45.5) |
+
+```bash
+# Hold out US Northwest from training
+python train.py --data_path data.parquet --holdout_regions us_northwest
+
+# Hold out multiple regions
+python train.py --data_path data.parquet --holdout_regions us_northwest benelux
+```
+
+Holdout metrics (mAP, F1\@10%, density-stratified mAP) are reported per epoch
+and saved in `training_history.json`.
+
+#### Density-Stratified Metrics
+
+Independently of region hold-out, every validation epoch computes
+**density-stratified mAP**: validation samples are split into quartiles by
+per-location observation density (total species detections across all weeks).
+A bias-robust model shows a **smaller gap** between mAP in the sparse
+quartile (Q1) and the dense quartile (Q4).
+
+| Metric | Description |
+|---|---|
+| **mAP\_sparse** | mAP for bottom-25% density locations |
+| **mAP\_dense** | mAP for top-25% density locations |
+| **mAP density ratio** | sparse / dense (higher = more robust, 1.0 = no bias) |
+| **pred–density _r_** | Pearson correlation between obs density and predicted species count (lower = less biased) |
 
 ### Checkpoints
 
@@ -146,26 +233,70 @@ where $p_i = \sigma(z_i)$ and $p_m = \max(p_i - m,\, 0)$ is the probability afte
 | Parameter | Default | Notes |
 |---|---|---|
 | `--asl_gamma_pos` | `0.0` | Positive focusing — 0 keeps all positive gradient |
-| `--asl_gamma_neg` | `4.0` | Negative focusing — higher suppresses easy negatives more |
+| `--asl_gamma_neg` | `2.0` | Negative focusing — higher suppresses easy negatives more |
 | `--asl_clip` | `0.05` | Hard probability margin for negatives (0 = disable) |
+
+!!! info "Why γ-=2 instead of 4?"
+    The original ASL paper uses γ-=4 for ImageNet-scale multi-label classification
+    where the positive/negative imbalance is less extreme.  In our setting
+    (10K species, >99.9% negatives per sample) the imbalance is far more
+    severe, and aggressive negative suppression with γ-=4 can cause the model
+    to under-predict rare species.  **γ-=2 is a conservative default** that
+    still down-weights easy negatives while preserving enough gradient signal
+    from moderately-confident negatives.  The ablation study (A10) tests
+    γ-∈{2, 4, 6} to find the best trade-off.
 
 ### BCE
 
-Standard binary cross-entropy with logits. Enable with `--species_loss bce`.
+Standard binary cross-entropy with logits.  Enable with `--species_loss bce`.
 
 $$
 \mathcal{L}_{\text{BCE}} = -\frac{1}{N} \sum_{i} \left[ y_i \log(\sigma(z_i)) + (1-y_i) \log(1-\sigma(z_i)) \right]
 $$
 
+BCE treats every positive and negative label equally — no focusing, no
+re-weighting.  This makes it the simplest baseline and often achieves the
+best raw **mAP** (ranking quality) because it does not distort the gradient
+landscape.  However, the lack of negative suppression means the model
+receives overwhelmingly more gradient from the >99.9% negative labels,
+which can lead to:
+
+- **Over-prediction** — inflated species lists (list-ratio >> 1.0)
+- **Poor calibration** — probabilities not well-separated between present/absent species
+- **Rare species neglect** — endemic or restricted-range species drowned out by common-species negatives
+
 ### Focal Loss
 
-Down-weights easy negatives and up-weights hard positives. Useful when species occur very rarely (>99% of labels are 0).
+Focal loss (Lin et al., 2017) down-weights easy examples and
+up-weights hard ones.  Originally designed for single-label object detection,
+it applies here as a multi-label variant where each species is an independent
+binary classification.
 
 $$
 \mathcal{L}_{\text{focal}} = -\alpha_t (1 - p_t)^\gamma \log(p_t)
 $$
 
-Enable with `--species_loss focal`. Tune `--focal_alpha` and `--focal_gamma` as needed.
+where $\alpha_t$ is the class-weighting factor and $\gamma$ is the focusing
+parameter.  At $\gamma=0$ focal loss collapses to weighted BCE.
+
+The key parameter is **`--focal_alpha`** which controls the weight given to
+the positive class:
+
+| `focal_alpha` | Positive weight | Negative weight | Effect |
+|---|---|---|---|
+| 0.25 | 0.25 | 0.75 | Down-weights positives — **harmful** when positives are already rare |
+| 0.50 | 0.50 | 0.50 | Neutral — lets `focal_gamma` handle all re-weighting (default) |
+| 0.75 | 0.75 | 0.25 | Up-weights positives — can help if recall is too low |
+
+!!! info "Why alpha=0.5 instead of 0.25?"
+    The original focal loss paper uses α=0.25 for COCO object detection where
+    foreground/background imbalance is ~1:3.  In our setting each species
+    occurs in <0.1% of samples, so down-weighting the already-rare positive
+    class with α=0.25 starves the model of positive gradient.  **α=0.5
+    (neutral)** lets the focusing parameter γ handle the imbalance alone,
+    which is the safer default for extreme multi-label problems.
+
+Enable with `--species_loss focal`.  Tune `--focal_alpha` and `--focal_gamma` as needed.
 
 ### Assume-Negative Loss
 
@@ -192,19 +323,27 @@ $$
 where $P$ is the set of positive species, $N_M$ is a random sample of $M$
 assumed-negative species, and $\lambda$ controls positive up-weighting.
 
+!!! info "Why λ=4 instead of 8?"
+    The SINR paper uses λ=8 for the iNaturalist domain where positive labels
+    are rarer and more uncertain.  Our training data includes structured
+    checklists (eBird) with higher detection reliability, so strong positive
+    up-weighting can amplify false positives.  **λ=4 is a conservative
+    default** that balances positive/negative gradients without over-correcting.
+    Increase if recall is too low; the ablation autotune searches 1–64.
+
 Enable with `--species_loss an`:
 
 ```bash
 python train.py \
     --species_loss an \
-    --pos_lambda 8 \
+    --pos_lambda 4 \
     --neg_samples 1024 \
     --label_smoothing 0.05
 ```
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `--pos_lambda` | `8` | Balances positive/negative gradient; increase if recall too low |
+| `--pos_lambda` | `4` | Balances positive/negative gradient; increase if recall too low |
 | `--neg_samples` | `1024` | 0 = use all negatives (exact but slow) |
 | `--label_smoothing` | `0.05` | Prevents overconfident predictions; set 0 to disable |
 
@@ -241,42 +380,47 @@ well-ordered predictions without requiring actual abundance counts.
 When `--label_freq_weight` is passed, positive species labels are scaled by
 observation frequency.  Common species (>= 95th percentile of observation
 counts) receive weight 1.0, rare species (<= 5th percentile) receive
-`--label_freq_weight_min` (default 0.1), with a **sigmoid-shaped**
-interpolation in between that creates a long-tail distribution — most species
-stay near the minimum weight and only the most common ramp up sharply toward
-1.0.
+`--label_freq_weight_min` (default 0.1), with a **log-scale sigmoid**
+interpolation in between.
 
-The mapping uses $t' = \frac{t^3}{t^3 + (1-t)^3}$ where $t$ is the linear
-position between the 5th and 95th percentile, then
-$w = w_{\min} + t' \cdot (1 - w_{\min})$.  Only positive labels (1s) are
-affected — zeros stay at 0, so this does **not** act as label smoothing.
+The position between the 5th and 95th percentile is computed in **log-space**,
+which is natural for count data spanning orders of magnitude (e.g. p5=132,
+p95=35,843).  A linear interpolation would collapse 90%+ of species to the
+minimum weight; log-scale spreads them evenly across the full range.
+
+The mapping uses $t = \frac{\ln c - \ln p_5}{\ln p_{95} - \ln p_5}$ (log-scale
+position), then applies a sigmoid $t' = \frac{t^3}{t^3 + (1-t)^3}$ for smooth
+S-shaped remapping, and finally $w = w_{\min} + t' \cdot (1 - w_{\min})$.
+Only positive labels (1s) are affected — zeros stay at 0, so this does **not**
+act as label smoothing.
 
 #### Weight curve
 
-The table below shows the resulting label weight at various positions between
-the 5th and 95th percentile (with default `min_weight=0.1`).  For example, if
-the 5th percentile is 50 observations and the 95th is 5,000, a species with
-1,025 observations sits at the 20% mark and receives weight 0.11.
+The table below shows the resulting label weight at various **log-scale**
+positions between the 5th and 95th percentile (with default `min_weight=0.1`).
+For example, if p5=132 and p95=35,843, a species with 2,175 observations sits
+at the geometric midpoint (50% log-scale) and receives weight 0.55.
 
-| Position between p5–p95 | Sigmoid $t'$ | Label weight | Category |
+| Log-scale position between p5–p95 | Sigmoid $t'$ | Label weight | Category |
 |---|---|---|---|
 | 0% (≤ p5) | 0.000 | **0.10** | Rare — minimal gradient contribution |
 | 10% | 0.001 | 0.10 | Uncommon — near-minimum weight |
 | 20% | 0.015 | 0.11 | Uncommon |
 | 30% | 0.073 | 0.17 | Below average |
 | 40% | 0.229 | 0.31 | Below average |
-| 50% | 0.500 | 0.55 | Average — midpoint |
+| 50% | 0.500 | 0.55 | Average — geometric midpoint |
 | 60% | 0.771 | 0.79 | Above average |
 | 70% | 0.927 | 0.93 | Common |
 | 80% | 0.985 | 0.99 | Common — near-maximum weight |
 | 90% | 0.999 | 1.00 | Very common |
 | 100% (≥ p95) | 1.000 | **1.00** | Abundant — full gradient contribution |
 
-The S-shaped curve means roughly the **bottom 40% of species by frequency
-receive weights below 0.3**, while the **top 30% are effectively at full
-weight**.  This concentrates gradient signal on well-observed species whose
-labels are most reliable, while still allowing the model to learn from rarer
-species at reduced intensity.
+Because position is computed in log-space, the **geometric midpoint** between
+p5 and p95 maps to weight 0.55 (not the arithmetic midpoint).  This ensures a
+meaningful spread of weights even when counts span two or more orders of
+magnitude.  The S-shaped sigmoid still concentrates gradient signal on
+well-observed species while allowing the model to learn from rarer species at
+reduced intensity.
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -338,6 +482,8 @@ The trainer saves:
 
 Each checkpoint contains the full model state, optimizer state, scheduler state, AMP scaler, and species vocabulary — everything needed to resume training or run inference.
 
+If a checkpoint file is corrupted (e.g. from a crash during writing), `--resume` will log a warning and start training from scratch instead of crashing.
+
 ### Evaluation Metrics
 
 During each validation epoch, the following metrics are computed and recorded:
@@ -347,8 +493,34 @@ During each validation epoch, the following metrics are computed and recorded:
 | **mAP** | Mean per-sample average precision — measures how well positive species are ranked above negatives |
 | **Top-10 recall** | Fraction of true positives appearing in the model's 10 highest-probability predictions |
 | **Top-30 recall** | Fraction of true positives in the top 30 predictions |
+| **F1 @ 5% / 10% / 25%** | Micro-averaged F1 score at three probability thresholds |
+| **Precision @ 5% / 10% / 25%** | Micro-averaged precision at three probability thresholds |
+| **Recall @ 5% / 10% / 25%** | Micro-averaged recall at three probability thresholds |
+| **List-ratio @ 5% / 10% / 25%** | Ratio of predicted list length to true list length (1.0 = perfect calibration) |
+| **Mean list length @ 5% / 10% / 25%** | Average number of species predicted above the threshold |
+| **Watchlist mean AP** | Mean average precision across 18 endemic/restricted-range watchlist species |
+| **Per-species AP** | Individual AP for each watchlist species |
+| **mAP sparse** | mAP for bottom-25% observation density locations |
+| **mAP dense** | mAP for top-25% observation density locations |
+| **mAP density ratio** | sparse/dense ratio (1.0 = no observation bias effect) |
+| **pred–density _r_** | Pearson correlation between obs density and predicted species count |
 
 Metrics are printed after each epoch and saved in `training_history.json`. Use [`scripts/plot_training.py`](../plotting/training-curves.md) to visualise them.
+
+### Watchlist Species
+
+The trainer tracks individual average precision for 18 endemic and restricted-range bird species grouped by island system.  These species have small, disjoint ranges that are particularly challenging for spatiotemporal models:
+
+| Group | Species |
+|---|---|
+| **Hawaiian** | Hawaiian Goose (Nēnē), Hawaiian Hawk, Hawaii Elepaio, Apapane, Iiwi, Hawaii Amakihi |
+| **New Zealand** | Kea, North Island Brown Kiwi, South Island Takahe, Rifleman, Tui, North Island Kokako |
+| **Galápagos** | Galápagos Hawk, Galápagos Rail, Galápagos Petrel |
+| **Other** | Kagu (New Caledonia), California Condor, Whooping Crane |
+
+Per-species AP and the watchlist mean AP are recorded in `training_history.json` every epoch.
+
+When `--sample_fraction` is used, the trainer checks that all watchlist species still have samples in both the training and validation splits and emits a warning if any are missing.
 
 ## Resuming Training
 
@@ -356,7 +528,7 @@ Metrics are printed after each epoch and saved in `training_history.json`. Use [
 python train.py --resume checkpoints/checkpoint_latest.pt --num_epochs 50
 ```
 
-This loads the model, optimizer, scheduler, and scaler states and continues training for 50 more epochs.
+This loads the model, optimizer, scheduler, and scaler states and continues training for 50 more epochs.  If the checkpoint is corrupted (truncated write, power loss, etc.) training starts from scratch with a warning rather than crashing.
 
 ## Hyperparameter Autotune
 
@@ -378,9 +550,6 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 | `label_smoothing` | 0 → 0.1 |
 | `env_weight` | 0.01 → 1.0 (log scale) |
 | `jitter` | {true, false} |
-| `max_obs_per_species` | {0, 500, 1000, 2000, 5000} |
-| `min_obs_per_species` | {0, 10, 50, 100, 200, 500} |
-| `no_yearly` | {true, false} |
 | `species_loss` | {asl, an, bce, focal} |
 | `asl_gamma_neg` | 1.0 → 8.0 |
 | `asl_clip` | 0.0 → 0.2 |
@@ -389,8 +558,9 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 | `week_harmonics` | 2 → 8 (integer) |
 | `label_freq_weight` | {true, false} |
 
-!!! note "Data-affecting parameters"
-    When `max_obs_per_species`, `min_obs_per_species`, or `no_yearly` are included in the tuning set, data is re-preprocessed each trial.  This is slower but necessary because these parameters change the training samples or vocabulary.
+The dataset is built once before tuning starts.  Data-affecting parameters
+(`--max_obs_per_species`, `--min_obs_per_species`, `--no_yearly`) are set via
+the CLI and stay fixed across all trials.
 
 ### Autotune CLI
 
@@ -403,8 +573,6 @@ python train.py --data_path data.parquet --autotune lr pos_lambda    # tune spec
 Each trial trains a fresh model and optimises towards validation mAP.  Optuna's `MedianPruner` kills unpromising trials early (after 3 warmup epochs).  Results are saved to `checkpoints/autotune/autotune_results.json`, and a suggested `train.py` command with the best parameters is printed.
 
 ## References
-
-> Loshchilov, I. & Hutter, F. (2017). SGDR: Stochastic Gradient Descent with Warm Restarts. In *International Conference on Learning Representations*.
 
 > Loshchilov, I. & Hutter, F. (2019). Decoupled Weight Decay Regularization. In *International Conference on Learning Representations*.
 
