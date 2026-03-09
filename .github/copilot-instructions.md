@@ -81,7 +81,8 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
   - Supports `min_obs_per_species` to exclude rare species (default 100)
 - `compute_species_freq_weights()`: Per-species label weights based on observation frequency
   - Treats range (number of occupied cells) as a proxy for abundance
-  - Common species (>=95th percentile) -> weight 1.0; rare (<=5th pct) -> min_weight (default 0.1)
+  - Common species (>=pct_hi percentile, default 99) -> weight 1.0; rare (<=pct_lo, default 10) -> min_weight (default 0.1)
+  - `pct_lo` / `pct_hi` configurable via CLI (`--label_freq_weight_pct_lo`, `--label_freq_weight_pct_hi`)
   - Log-scale sigmoid interpolation between percentiles; stored as `self.species_freq_weights`
 - `compute_obs_density()`: Per-sample observation density (total species detections
   at each location across all weeks). Serves as a proxy for observer effort.
@@ -207,7 +208,7 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - Progress tracking with tqdm
 - GPU/CPU support with automatic device selection
 - Optuna-based hyperparameter autotune (`--autotune`)
-  - Tunes: pos_lambda, neg_samples, label_smoothing, env_weight, jitter, species_loss, model_scale, coord_harmonics, week_harmonics, asl_gamma_neg, asl_clip, focal_alpha, focal_gamma, label_freq_weight, label_freq_weight_min
+  - Tunes: pos_lambda, neg_samples, label_smoothing, env_weight, jitter, species_loss, model_scale, coord_harmonics, week_harmonics, asl_gamma_neg, asl_clip, focal_alpha, focal_gamma, label_freq_weight, label_freq_weight_min, label_freq_weight_pct_lo, label_freq_weight_pct_hi
   - Bayesian optimization with TPE sampler and MedianPruner
   - `--autotune_trials` (default 50), `--autotune_epochs` (default 10)
   - Results saved to `checkpoints/autotune/autotune_results.json`

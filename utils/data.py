@@ -536,6 +536,8 @@ class H3DataPreprocessor:
         self,
         species_lists: List[List[int]],
         min_weight: float = 0.1,
+        pct_lo: float = 10.0,
+        pct_hi: float = 99.0,
     ) -> np.ndarray:
         """Compute per-species label weights based on observation frequency.
 
@@ -547,15 +549,23 @@ class H3DataPreprocessor:
 
         Species are weighted by how often they occur across all samples:
 
-        - >= 95th percentile of counts -> weight 1.0 (common)
-        - <= 5th percentile of counts  -> *min_weight* (rare)
+        - >= *pct_hi* percentile of counts -> weight 1.0 (common)
+        - <= *pct_lo* percentile of counts -> *min_weight* (rare)
         - In between -> log-scale sigmoid interpolation that spreads
           weights naturally across the wide dynamic range of observation
           counts
 
-        The position between p5 and p95 is computed in log-space (natural
-        for count distributions spanning orders of magnitude), then passed
-        through a sigmoid ``t' = t^3 / (t^3 + (1-t)^3)`` for smooth
+        Args:
+            species_lists: Per-sample species occurrence lists.
+            min_weight: Floor weight for rare species.
+            pct_lo: Lower percentile threshold (species at or below get
+                *min_weight*).  Default 10.
+            pct_hi: Upper percentile threshold (species at or above get
+                weight 1.0).  Default 99.
+
+        The position between *pct_lo* and *pct_hi* is computed in log-space
+        (natural for count distributions spanning orders of magnitude), then
+        passed through a sigmoid ``t' = t^3 / (t^3 + (1-t)^3)`` for smooth
         S-shaped remapping.
 
         The returned array has shape ``(n_species,)`` and is stored as
@@ -578,34 +588,34 @@ class H3DataPreprocessor:
             self.species_freq_weights = np.ones(n_species, dtype=np.float32)
             return self.species_freq_weights
 
-        p5 = np.percentile(nonzero, 5)
-        p95 = np.percentile(nonzero, 95)
+        p_lo = np.percentile(nonzero, pct_lo)
+        p_hi = np.percentile(nonzero, pct_hi)
 
         weights = np.ones(n_species, dtype=np.float32)
-        if p95 > p5:
-            log_p5 = np.log(p5)
-            log_span = np.log(p95) - log_p5
+        if p_hi > p_lo:
+            log_lo = np.log(p_lo)
+            log_span = np.log(p_hi) - log_lo
             for i in range(n_species):
                 c = count_arr[i]
-                if c >= p95:
+                if c >= p_hi:
                     weights[i] = 1.0
-                elif c <= p5:
+                elif c <= p_lo:
                     weights[i] = min_weight
                 else:
                     # Log-scale position in [0, 1] — natural for count data
-                    t = (np.log(c) - log_p5) / log_span
+                    t = (np.log(c) - log_lo) / log_span
                     # Sigmoid-shaped remapping: smooth S-curve
                     t3 = t ** 3
                     t = t3 / (t3 + (1.0 - t) ** 3)
                     weights[i] = min_weight + t * (1.0 - min_weight)
-        # If p95 == p5 all species have similar counts: uniform weight 1.0
+        # If p_hi == p_lo all species have similar counts: uniform weight 1.0
 
         self.species_freq_weights = weights
 
         # Print distribution summary
         print(f"   Freq label weights: min={weights.min():.3f}, "
               f"median={np.median(weights):.3f}, max={weights.max():.3f}  "
-              f"(p5={int(p5):,}, p95={int(p95):,} observations)")
+              f"(p{pct_lo:.0f}={int(p_lo):,}, p{pct_hi:.0f}={int(p_hi):,} observations)")
 
         return weights
 

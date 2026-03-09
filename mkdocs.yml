@@ -37,9 +37,6 @@ theme:
     - content.code.copy
     - toc.follow
 
-hooks:
-  - hooks/copy_demo_assets.py
-
 plugins:
   - search
   - mkdocstrings:

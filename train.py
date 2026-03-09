@@ -52,6 +52,7 @@ TUNABLE_PARAMS = [
     'asl_gamma_neg', 'asl_clip',
     'focal_alpha', 'focal_gamma',
     'label_freq_weight', 'label_freq_weight_min',
+    'label_freq_weight_pct_lo', 'label_freq_weight_pct_hi',
 ]
 
 
@@ -836,6 +837,10 @@ def _suggest_param(trial, name: str, args):
         return trial.suggest_categorical('label_freq_weight', [True, False])
     if name == 'label_freq_weight_min':
         return trial.suggest_float('label_freq_weight_min', 0.01, 0.5, log=True)
+    if name == 'label_freq_weight_pct_lo':
+        return trial.suggest_float('label_freq_weight_pct_lo', 1.0, 25.0)
+    if name == 'label_freq_weight_pct_hi':
+        return trial.suggest_float('label_freq_weight_pct_hi', 75.0, 99.0)
     raise ValueError(f"Unknown tunable param: {name}")
 
 
@@ -910,13 +915,18 @@ def run_autotune(args, device: torch.device):
 
     # Pre-compute frequency-based label weights (cheap); per-trial
     # decision whether to use them is made in the objective.
-    # When label_freq_weight_min is tuned, we keep species_lists and
-    # recompute weights per trial with different min_weight values.
-    _tune_freq_min = 'label_freq_weight_min' in tune_params
+    # When any weight shaping param is tuned, keep species_lists to
+    # recompute weights per trial with different values.
+    _tune_freq_shape = bool(
+        {'label_freq_weight_min', 'label_freq_weight_pct_lo',
+         'label_freq_weight_pct_hi'} & set(tune_params)
+    )
     _freq_weights = preprocessor.compute_species_freq_weights(
         species_lists, min_weight=args.label_freq_weight_min,
+        pct_lo=args.label_freq_weight_pct_lo,
+        pct_hi=args.label_freq_weight_pct_hi,
     )
-    _species_lists_ref = species_lists if _tune_freq_min else None
+    _species_lists_ref = species_lists if _tune_freq_shape else None
 
     # Free species_lists — no longer needed after vocab + weights
     del species_lists
@@ -981,11 +991,13 @@ def run_autotune(args, device: torch.device):
         # Use pre-built dataset; decide per-trial whether to apply freq weights
         t_in, v_in, t_tgt, v_tgt = train_in, val_in, train_tgt, val_tgt
         use_freq_wt = bool(p.get('label_freq_weight', args.label_freq_weight))
-        if use_freq_wt and _tune_freq_min and _species_lists_ref is not None:
-            # Recompute with trial-specific min_weight
+        if use_freq_wt and _tune_freq_shape and _species_lists_ref is not None:
+            # Recompute with trial-specific min_weight / percentiles
             _trial_freq_weights = preprocessor.compute_species_freq_weights(
                 _species_lists_ref,
                 min_weight=float(p.get('label_freq_weight_min', args.label_freq_weight_min)),
+                pct_lo=float(p.get('label_freq_weight_pct_lo', args.label_freq_weight_pct_lo)),
+                pct_hi=float(p.get('label_freq_weight_pct_hi', args.label_freq_weight_pct_hi)),
             )
         elif use_freq_wt:
             _trial_freq_weights = _freq_weights
@@ -1112,8 +1124,38 @@ def run_autotune(args, device: torch.device):
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
     )
 
+    results_dir = Path(args.checkpoint_dir) / 'autotune'
+    results_dir.mkdir(parents=True, exist_ok=True)
+    results_path = results_dir / 'autotune_results.json'
+
+    def _save_study(study):
+        """Persist current study state to autotune_results.json."""
+        best = study.best_trial if study.best_trial is not None else None
+        results = {
+            'best_geoscore': best.value if best else None,
+            'best_params': best.params if best else {},
+            'n_trials': n_trials,
+            'epochs_per_trial': n_epochs,
+            'tuned_params': tune_params,
+            'all_trials': [
+                {
+                    'number': t.number,
+                    'value': t.value if t.value is not None else None,
+                    'params': t.params,
+                    'state': str(t.state),
+                    'epoch_history': t.user_attrs.get('epoch_history', []),
+                }
+                for t in study.trials
+            ],
+        }
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+
     def _after_trial(study, trial):
-        """Print best params so far after each completed trial."""
+        """Print best params so far and save results after each trial."""
+        # Save after every trial (including pruned/failed) so progress survives interruption
+        _save_study(study)
+
         if trial.state != optuna.trial.TrialState.COMPLETE:
             return
         b = study.best_trial
@@ -1138,29 +1180,8 @@ def run_autotune(args, device: torch.device):
         else:
             print(f"    --{k:20s} {v}")
 
-    # Save results
-    results_dir = Path(args.checkpoint_dir) / 'autotune'
-    results_dir.mkdir(parents=True, exist_ok=True)
-    results_path = results_dir / 'autotune_results.json'
-    results = {
-        'best_geoscore': best.value,
-        'best_params': best.params,
-        'n_trials': n_trials,
-        'epochs_per_trial': n_epochs,
-        'tuned_params': tune_params,
-        'all_trials': [
-            {
-                'number': t.number,
-                'value': t.value if t.value is not None else None,
-                'params': t.params,
-                'state': str(t.state),
-                'epoch_history': t.user_attrs.get('epoch_history', []),
-            }
-            for t in study.trials
-        ],
-    }
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
+    # Save final results (also saved incrementally in _after_trial)
+    _save_study(study)
     print(f"\n  Results saved to {results_path}")
 
     # Print suggested command
@@ -1186,12 +1207,12 @@ def main():
     parser.add_argument('--data_path', type=str, help='Path to H3-aggregated training data (Parquet files)', required=True)
 
     # Model
-    parser.add_argument('--model_scale', type=float, default=1.0,
+    parser.add_argument('--model_scale', type=float, default=0.5,
                         help='Model size scaling factor (1.0 ≈ 7M params, 0.5 ≈ 1.8M, 2.0 ≈ 36M)')
-    parser.add_argument('--coord_harmonics', type=int, default=8,
-                        help='Number of harmonics for lat/lon circular encoding (default: 8)')
-    parser.add_argument('--week_harmonics', type=int, default=4,
-                        help='Number of harmonics for week circular encoding (default: 4)')
+    parser.add_argument('--coord_harmonics', type=int, default=4,
+                        help='Number of harmonics for lat/lon circular encoding (default: 4)')
+    parser.add_argument('--week_harmonics', type=int, default=8,
+                        help='Number of harmonics for week circular encoding (default: 8)')
 
     # Training
     parser.add_argument('--batch_size', type=int, default=1024)
@@ -1199,9 +1220,9 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=1e-3)
     parser.add_argument('--species_weight', type=float, default=1.0)
-    parser.add_argument('--env_weight', type=float, default=0.1)
-    parser.add_argument('--species_loss', type=str, default='asl', choices=['asl', 'bce', 'focal', 'an'],
-                        help='Species loss function: asl (asymmetric, default), bce, focal, or an')
+    parser.add_argument('--env_weight', type=float, default=0.5)
+    parser.add_argument('--species_loss', type=str, default='bce', choices=['asl', 'bce', 'focal', 'an'],
+                        help='Species loss function: bce (cross entropy, default), bce, focal, or an')
     parser.add_argument('--asl_gamma_pos', type=float, default=0.0,
                         help='ASL positive focusing parameter (default: 0, no down-weighting)')
     parser.add_argument('--asl_gamma_neg', type=float, default=2.0,
@@ -1216,12 +1237,12 @@ def main():
                         help='Positive up-weighting λ for assume-negative loss (default: 4)')
     parser.add_argument('--neg_samples', type=int, default=1024,
                         help='Number of negative species to sample per example for AN loss (default: 1024, 0=all)')
-    parser.add_argument('--label_smoothing', type=float, default=0.05,
-                        help='Smooth binary targets to prevent overconfident predictions (default: 0.05, 0=off)')
+    parser.add_argument('--label_smoothing', type=float, default=0.0,
+                        help='Smooth binary targets to prevent overconfident predictions (default: 0.0, 0=off)')
     parser.add_argument('--max_obs_per_species', type=int, default=0,
                         help='Cap observations per species to reduce common-species dominance (default: 0, 0=no cap)')
-    parser.add_argument('--min_obs_per_species', type=int, default=100,
-                        help='Exclude species with fewer than N observations (default: 100, 0=keep all)')
+    parser.add_argument('--min_obs_per_species', type=int, default=50,
+                        help='Exclude species with fewer than N observations (default: 50, 0=keep all)')
     parser.add_argument('--ocean_sample_rate', type=float, default=1.0,
                         help='Fraction of ocean cells (water_fraction > 0.9) to keep (default: 1.0, 1.0=keep all)')
     parser.add_argument('--no_yearly', action='store_true',
@@ -1233,9 +1254,13 @@ def main():
     parser.add_argument('--label_freq_weight', action='store_true',
                         help='Weight positive labels by species frequency '
                              '(common=1.0, rare=min_weight, sigmoid-shaped '
-                             'interpolation between 5th/95th percentile)')
-    parser.add_argument('--label_freq_weight_min', type=float, default=0.1,
-                        help='Minimum label weight for rare species (default: 0.1)')
+                             'interpolation between lo/hi percentile)')
+    parser.add_argument('--label_freq_weight_min', type=float, default=0.05,
+                        help='Minimum label weight for rare species (default: 0.01)')
+    parser.add_argument('--label_freq_weight_pct_lo', type=float, default=25.0,
+                        help='Lower percentile: species at or below get min_weight (default: 25)')
+    parser.add_argument('--label_freq_weight_pct_hi', type=float, default=99.0,
+                        help='Upper percentile: species at or above get weight 1.0 (default: 99)')
 
     # LR schedule
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],
@@ -1377,6 +1402,8 @@ def main():
     if args.label_freq_weight:
         freq_weights = preprocessor.compute_species_freq_weights(
             species_lists, min_weight=args.label_freq_weight_min,
+            pct_lo=args.label_freq_weight_pct_lo,
+            pct_hi=args.label_freq_weight_pct_hi,
         )
 
     # Free species_lists — no longer needed after vocab + weights
