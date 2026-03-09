@@ -532,91 +532,122 @@ class H3DataPreprocessor:
 
         return inputs, targets
 
+    _REGION_LAT_BIN = 30.0   # degrees per latitude bin
+    _REGION_LON_BIN = 60.0   # degrees per longitude bin
+
     def compute_species_freq_weights(
         self,
         species_lists: List[List[int]],
+        lats: np.ndarray,
+        lons: np.ndarray,
         min_weight: float = 0.1,
         pct_lo: float = 10.0,
-        pct_hi: float = 99.0,
+        pct_hi: float = 90.0,
     ) -> np.ndarray:
-        """Compute per-species label weights based on observation frequency.
+        """Compute per-species label weights via region-normalized frequency.
 
-        Geographic range (number of occupied cells) is treated as a proxy for
-        local abundance.  This is not ecologically exact — range and abundance
-        are different quantities — but it provides a practical approximation
-        that turns hard binary labels into soft weights, yielding well-ordered
-        ranked species lists for a given location and week.
+        Citizen-science observation density varies enormously across regions.
+        The US alone can contribute an order of magnitude more records than
+        the Neotropics, so a naive global frequency count would assign high
+        weights to common US species while suppressing species-rich tropical
+        communities.  Region-normalized weighting solves this by computing
+        frequency **percentile ranks within geographic bins** and using the
+        **maximum regional percentile** as each species' weight basis.
 
-        Species are weighted by how often they occur across all samples:
+        Algorithm:
 
-        - >= *pct_hi* percentile of counts -> weight 1.0 (common)
-        - <= *pct_lo* percentile of counts -> *min_weight* (rare)
-        - In between -> log-scale sigmoid interpolation that spreads
-          weights naturally across the wide dynamic range of observation
-          counts
+        1. Partition samples into geographic bins (30° lat × 60° lon).
+        2. Within each bin, count per-species occurrences.
+        3. Within each bin, compute the percentile rank of every species
+           (among species present in that bin).
+        4. For each species, take the **max** percentile rank across bins.
+        5. Map that max-regional-percentile to a weight via a sigmoid
+           curve controlled by *pct_lo* / *pct_hi*.
+
+        This makes weights independent of absolute observation density:
+        a species at the 90th percentile in Colombia gets the same weight
+        as one at the 90th percentile in the US.
 
         Args:
             species_lists: Per-sample species occurrence lists.
+            lats: Per-sample latitudes.
+            lons: Per-sample longitudes.
             min_weight: Floor weight for rare species.
-            pct_lo: Lower percentile threshold (species at or below get
-                *min_weight*).  Default 10.
-            pct_hi: Upper percentile threshold (species at or above get
-                weight 1.0).  Default 99.
+            pct_lo: Lower percentile threshold.  Default 10.
+            pct_hi: Upper percentile threshold.  Default 90.
 
-        The position between *pct_lo* and *pct_hi* is computed in log-space
-        (natural for count distributions spanning orders of magnitude), then
-        passed through a sigmoid ``t' = t^3 / (t^3 + (1-t)^3)`` for smooth
-        S-shaped remapping.
-
-        The returned array has shape ``(n_species,)`` and is stored as
-        ``self.species_freq_weights`` for use in the Dataset.
+        Returns:
+            Array of shape ``(n_species,)`` stored as
+            ``self.species_freq_weights``.
         """
-        from collections import Counter
-
-        counts: Counter = Counter()
-        for sl in species_lists:
-            for sid in sl:
-                if sid in self.species_to_idx:
-                    counts[self.species_to_idx[sid]] += 1
+        from collections import Counter, defaultdict
 
         n_species = len(self.species_vocab)
-        count_arr = np.array([counts.get(i, 0) for i in range(n_species)],
-                             dtype=np.float64)
 
-        nonzero = count_arr[count_arr > 0]
-        if len(nonzero) == 0:
-            self.species_freq_weights = np.ones(n_species, dtype=np.float32)
-            return self.species_freq_weights
+        # Assign samples to geographic bins
+        lat_bins = np.clip(
+            ((lats + 90.0) / self._REGION_LAT_BIN).astype(int), 0, 5)
+        lon_bins = np.clip(
+            ((lons + 180.0) / self._REGION_LON_BIN).astype(int), 0, 5)
+        region_ids = lat_bins * 10 + lon_bins
 
-        p_lo = np.percentile(nonzero, pct_lo)
-        p_hi = np.percentile(nonzero, pct_hi)
+        # Count per-species occurrences within each region
+        region_counts: Dict[int, Counter] = defaultdict(Counter)
+        for i, sl in enumerate(species_lists):
+            rid = int(region_ids[i])
+            for sid in sl:
+                idx = self.species_to_idx.get(sid)
+                if idx is not None:
+                    region_counts[rid][idx] += 1
 
-        weights = np.ones(n_species, dtype=np.float32)
-        if p_hi > p_lo:
-            log_lo = np.log(p_lo)
-            log_span = np.log(p_hi) - log_lo
+        # For each region compute percentile ranks; track max across regions
+        max_pctile = np.zeros(n_species, dtype=np.float64)
+
+        for rid, sp_counter in region_counts.items():
+            indices = np.array(list(sp_counter.keys()), dtype=np.int64)
+            counts = np.array([sp_counter[i] for i in indices],
+                              dtype=np.float64)
+            n = len(counts)
+            if n < 2:
+                # Singleton region — give 50th percentile by default
+                max_pctile[indices] = np.maximum(
+                    max_pctile[indices], 50.0)
+                continue
+
+            # Percentile rank = fraction of species with strictly lower
+            # count in this region, scaled to [0, 100).
+            sorted_counts = np.sort(counts)
+            pctiles = (np.searchsorted(sorted_counts, counts, side='left')
+                       / n * 100.0)
+
+            # Update per-species max percentile
+            np.maximum.at(max_pctile, indices, pctiles)
+
+        # Map max-regional-percentile → weight via sigmoid curve
+        weights = np.full(n_species, min_weight, dtype=np.float32)
+        span = pct_hi - pct_lo
+        if span > 0:
             for i in range(n_species):
-                c = count_arr[i]
-                if c >= p_hi:
+                p = max_pctile[i]
+                if p >= pct_hi:
                     weights[i] = 1.0
-                elif c <= p_lo:
-                    weights[i] = min_weight
-                else:
-                    # Log-scale position in [0, 1] — natural for count data
-                    t = (np.log(c) - log_lo) / log_span
-                    # Sigmoid-shaped remapping: smooth S-curve
+                elif p > pct_lo:
+                    t = (p - pct_lo) / span
                     t3 = t ** 3
                     t = t3 / (t3 + (1.0 - t) ** 3)
                     weights[i] = min_weight + t * (1.0 - min_weight)
-        # If p_hi == p_lo all species have similar counts: uniform weight 1.0
+                # else: stays at min_weight (species absent or very rare
+                #        in every region they appear)
 
         self.species_freq_weights = weights
 
-        # Print distribution summary
-        print(f"   Freq label weights: min={weights.min():.3f}, "
-              f"median={np.median(weights):.3f}, max={weights.max():.3f}  "
-              f"(p{pct_lo:.0f}={int(p_lo):,}, p{pct_hi:.0f}={int(p_hi):,} observations)")
-
+        n_regions = len(region_counts)
+        n_max_w = (weights >= 0.99).sum()
+        n_min_w = (weights <= min_weight + 0.001).sum()
+        print(f"   Freq label weights ({n_regions} regional bins): "
+              f"min={weights.min():.3f}, median={np.median(weights):.3f}, "
+              f"max={weights.max():.3f}  "
+              f"({n_max_w:,} species at 1.0, {n_min_w:,} at floor)")
         return weights
 
     def _cap_observations(

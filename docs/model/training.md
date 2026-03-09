@@ -68,8 +68,10 @@ The training script handles the full pipeline automatically:
 | `--ocean_sample_rate` | `1.0` | Fraction of ocean cells (water > 90%) to keep (1.0 = keep all) |
 | `--no_yearly` | off | Exclude week-0 (yearly) samples from training |
 | `--jitter` | off | Jitter training coordinates within H3 cells each epoch |
-| `--label_freq_weight` | off | Weight positive labels by species frequency |
+| `--label_freq_weight` | off | Weight positive labels by region-normalized species frequency |
 | `--label_freq_weight_min` | `0.1` | Minimum label weight for rare species |
+| `--label_freq_weight_pct_lo` | `10` | Lower percentile threshold (species at or below get min weight) |
+| `--label_freq_weight_pct_hi` | `90` | Upper percentile threshold (species at or above get weight 1.0) |
 
 ### Learning Rate Schedule
 
@@ -377,55 +379,73 @@ This is not ecologically exact — range and local abundance are different
 quantities — but it provides a practical approximation that yields
 well-ordered predictions without requiring actual abundance counts.
 
-When `--label_freq_weight` is passed, positive species labels are scaled by
-observation frequency.  Common species (>= 95th percentile of observation
-counts) receive weight 1.0, rare species (<= 5th percentile) receive
-`--label_freq_weight_min` (default 0.1), with a **log-scale sigmoid**
-interpolation in between.
+#### The observation bias problem
 
-The position between the 5th and 95th percentile is computed in **log-space**,
-which is natural for count data spanning orders of magnitude (e.g. p5=132,
-p95=35,843).  A linear interpolation would collapse 90%+ of species to the
-minimum weight; log-scale spreads them evenly across the full range.
+Citizen-science observation density varies enormously across regions.  The
+US alone can contribute 10× more records than the Neotropics, so a naive
+**global** frequency count would assign high weights to common North American
+species while suppressing species-rich tropical communities.  The result is
+inflated prediction lists in heavily surveyed areas (e.g. 100 species at
+>70% probability for a location in New York) and deflated lists in
+under-surveyed but species-rich areas (e.g. only 18 species above 40% for
+a location in Colombia).
 
-The mapping uses $t = \frac{\ln c - \ln p_5}{\ln p_{95} - \ln p_5}$ (log-scale
-position), then applies a sigmoid $t' = \frac{t^3}{t^3 + (1-t)^3}$ for smooth
-S-shaped remapping, and finally $w = w_{\min} + t' \cdot (1 - w_{\min})$.
-Only positive labels (1s) are affected — zeros stay at 0, so this does **not**
-act as label smoothing.
+#### Region-normalized weighting
+
+To eliminate this bias, we compute frequency weights via **regional percentile
+normalization**.  The algorithm:
+
+1. **Partition** the globe into geographic bins (30° latitude × 60° longitude,
+   yielding up to 36 bins covering all land masses).
+2. **Count** per-species occurrences within each bin independently.
+3. **Rank** each species within its bin by percentile (fraction of species in
+   that bin with fewer observations).
+4. **Aggregate** across bins: each species keeps its **maximum** regional
+   percentile rank.  Using the max ensures that a species common in *any*
+   region gets an appropriately high weight — even if it is absent or rare
+   in most other regions.
+5. **Map** the max-regional-percentile to a label weight via a sigmoid curve
+   controlled by `--label_freq_weight_pct_lo` and `--label_freq_weight_pct_hi`.
+
+This makes weights independent of absolute observation density: a species at
+the 90th percentile in Colombia gets the same weight as one at the 90th
+percentile in the US — regardless of raw count differences.
+
+#### Sigmoid mapping
+
+The position between `pct_lo` (default 10) and `pct_hi` (default 90) is mapped
+through a sigmoid $t' = \frac{t^3}{t^3 + (1-t)^3}$ for smooth S-shaped
+remapping, and finally $w = w_{\min} + t' \cdot (1 - w_{\min})$.  Only positive
+labels (1s) are affected — zeros stay at 0, so this does **not** act as label
+smoothing.
 
 #### Weight curve
 
-The table below shows the resulting label weight at various **log-scale**
-positions between the 5th and 95th percentile (with default `min_weight=0.1`).
-For example, if p5=132 and p95=35,843, a species with 2,175 observations sits
-at the geometric midpoint (50% log-scale) and receives weight 0.55.
+The table below shows the resulting label weight at various positions between
+`pct_lo` and `pct_hi` (with default `min_weight=0.1`):
 
-| Log-scale position between p5–p95 | Sigmoid $t'$ | Label weight | Category |
+| Position between pct_lo–pct_hi | Sigmoid $t'$ | Label weight | Category |
 |---|---|---|---|
-| 0% (≤ p5) | 0.000 | **0.10** | Rare — minimal gradient contribution |
+| 0% (≤ pct_lo) | 0.000 | **0.10** | Rare — minimal gradient contribution |
 | 10% | 0.001 | 0.10 | Uncommon — near-minimum weight |
 | 20% | 0.015 | 0.11 | Uncommon |
 | 30% | 0.073 | 0.17 | Below average |
 | 40% | 0.229 | 0.31 | Below average |
-| 50% | 0.500 | 0.55 | Average — geometric midpoint |
+| 50% | 0.500 | 0.55 | Average |
 | 60% | 0.771 | 0.79 | Above average |
 | 70% | 0.927 | 0.93 | Common |
 | 80% | 0.985 | 0.99 | Common — near-maximum weight |
 | 90% | 0.999 | 1.00 | Very common |
-| 100% (≥ p95) | 1.000 | **1.00** | Abundant — full gradient contribution |
+| 100% (≥ pct_hi) | 1.000 | **1.00** | Abundant — full gradient contribution |
 
-Because position is computed in log-space, the **geometric midpoint** between
-p5 and p95 maps to weight 0.55 (not the arithmetic midpoint).  This ensures a
-meaningful spread of weights even when counts span two or more orders of
-magnitude.  The S-shaped sigmoid still concentrates gradient signal on
-well-observed species while allowing the model to learn from rarer species at
-reduced intensity.
+#### Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--label_freq_weight` | off | Enable frequency-based label weighting |
+| `--label_freq_weight` | off | Enable region-normalized label weighting |
 | `--label_freq_weight_min` | `0.1` | Minimum weight assigned to rare species |
+| `--label_freq_weight_pct_lo` | `10` | Regional percentile at or below which species get min weight |
+| `--label_freq_weight_pct_hi` | `90` | Regional percentile at or above which species get weight 1.0 |
 
 ```bash
 python train.py --label_freq_weight --label_freq_weight_min 0.1

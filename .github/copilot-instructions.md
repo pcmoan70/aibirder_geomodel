@@ -79,11 +79,15 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 - `prepare_training_data()`: Complete preprocessing pipeline
   - Supports `max_obs_per_species` to cap common species observations
   - Supports `min_obs_per_species` to exclude rare species (default 100)
-- `compute_species_freq_weights()`: Per-species label weights based on observation frequency
-  - Treats range (number of occupied cells) as a proxy for abundance
-  - Common species (>=pct_hi percentile, default 99) -> weight 1.0; rare (<=pct_lo, default 10) -> min_weight (default 0.1)
+- `compute_species_freq_weights()`: Per-species label weights via region-normalized frequency
+  - Requires lats/lons arrays; partitions globe into 30°×60° bins
+  - Computes per-species percentile rank within each bin, uses max regional
+    percentile as the weight basis
+  - Prevents heavily surveyed regions (e.g. US) from biasing weights against
+    species-rich but less-surveyed areas (e.g. Neotropics)
+  - Common species (>=pct_hi percentile, default 90) -> weight 1.0; rare (<=pct_lo, default 10) -> min_weight (default 0.1)
   - `pct_lo` / `pct_hi` configurable via CLI (`--label_freq_weight_pct_lo`, `--label_freq_weight_pct_hi`)
-  - Log-scale sigmoid interpolation between percentiles; stored as `self.species_freq_weights`
+  - Sigmoid interpolation between percentiles; stored as `self.species_freq_weights`
 - `compute_obs_density()`: Per-sample observation density (total species detections
   at each location across all weeks). Serves as a proxy for observer effort.
   Stored in `inputs['obs_density']` and used for density-stratified validation metrics.

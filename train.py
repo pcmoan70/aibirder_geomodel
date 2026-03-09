@@ -925,8 +925,11 @@ def run_autotune(args, device: torch.device):
         species_lists, min_weight=args.label_freq_weight_min,
         pct_lo=args.label_freq_weight_pct_lo,
         pct_hi=args.label_freq_weight_pct_hi,
+        lats=inputs['lat'], lons=inputs['lon'],
     )
     _species_lists_ref = species_lists if _tune_freq_shape else None
+    _lats_ref = inputs['lat'] if _tune_freq_shape else None
+    _lons_ref = inputs['lon'] if _tune_freq_shape else None
 
     # Free species_lists — no longer needed after vocab + weights
     del species_lists
@@ -998,6 +1001,7 @@ def run_autotune(args, device: torch.device):
                 min_weight=float(p.get('label_freq_weight_min', args.label_freq_weight_min)),
                 pct_lo=float(p.get('label_freq_weight_pct_lo', args.label_freq_weight_pct_lo)),
                 pct_hi=float(p.get('label_freq_weight_pct_hi', args.label_freq_weight_pct_hi)),
+                lats=_lats_ref, lons=_lons_ref,
             )
         elif use_freq_wt:
             _trial_freq_weights = _freq_weights
@@ -1257,10 +1261,10 @@ def main():
                              'interpolation between lo/hi percentile)')
     parser.add_argument('--label_freq_weight_min', type=float, default=0.05,
                         help='Minimum label weight for rare species (default: 0.01)')
-    parser.add_argument('--label_freq_weight_pct_lo', type=float, default=25.0,
-                        help='Lower percentile: species at or below get min_weight (default: 25)')
-    parser.add_argument('--label_freq_weight_pct_hi', type=float, default=99.0,
-                        help='Upper percentile: species at or above get weight 1.0 (default: 99)')
+    parser.add_argument('--label_freq_weight_pct_lo', type=float, default=10.0,
+                        help='Lower percentile: species at or below get min_weight (default: 10)')
+    parser.add_argument('--label_freq_weight_pct_hi', type=float, default=90.0,
+                        help='Upper percentile: species at or above get weight 1.0 (default: 90)')
 
     # LR schedule
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],
