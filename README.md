@@ -75,6 +75,7 @@ A multi-task neural network that learns spatial-temporal patterns from coordinat
 - **Input:** Raw (lat, lon, week) — circular encoding is handled inside the model
 - **Primary task:** Multi-label species classification (BCE default; ASL, focal, AN also available)
 - **Auxiliary task:** Environmental feature regression (training only, acts as regularizer)
+- **Habitat head** (optional, `--habitat_head`)**:** predicted env features → species logits, combined with direct head via learned gate — makes environment→species relationships explicit
 - **Scalable:** ~1.8M (scale=0.5) to ~36M (scale=2.0) parameters with ~12K species (default scale=1.0 ≈ 7M)
 - **Tiny footprint:** Under 10 MB (≈ 3 MB at FP16) — replaces hundreds of MB of raw eBird/iNat observation data while interpolating into survey gaps and smoothing geographic biases
 
@@ -130,8 +131,9 @@ An interactive web demo is included under `docs/demo/`. It runs the ONNX FP16 mo
 
 Features:
 - **Range Map** — select a species to see its predicted occurrence probability on a Leaflet map. Resolution adapts to the zoom level (coarser when zoomed out, finer when zoomed in).
+- **Richness Map** — predicted species count per grid cell, color-coded from low to high.
 - **Species List** — click any location to see all predicted species for that point.
-- **Week slider** — scrub through all 48 weeks of the year.
+- **Week selector** — choose any of the 48 weeks of the year.
 
 ### Running the docs locally
 
@@ -147,8 +149,6 @@ mkdocs serve -a 0.0.0.0:8000
 ```
 
 Then open <http://localhost:8000/demo/> in your browser.
-
-> **Note:** The demo requires `demo/geomodel_fp16.onnx` and `demo/labels.txt`. These are copied into `docs/demo/` automatically during `mkdocs build` / `mkdocs serve` by the build hook in `hooks/copy_demo_assets.py`. To generate them, run `python convert.py` after training.
 
 ## Citation
 

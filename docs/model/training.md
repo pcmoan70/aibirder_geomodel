@@ -43,6 +43,7 @@ The training script handles the full pipeline automatically:
 | `--model_scale` | `0.5` | Continuous scaling factor (0.5 ≈ 1.8M, 1.0 ≈ 7M, 2.0 ≈ 36M params) |
 | `--coord_harmonics` | `4` | Harmonics for lat/lon encoding |
 | `--week_harmonics` | `8` | Harmonics for week encoding |
+| `--habitat_head` | off | Enable habitat-species association head (env → species pathway with learned gate) |
 
 ### Training
 
@@ -205,8 +206,8 @@ quartile (Q1) and the dense quartile (Q4).
 
 | Metric | Description |
 |---|---|
-| **mAP\_sparse** | mAP for bottom-25% density locations |
-| **mAP\_dense** | mAP for top-25% density locations |
+| **mAP_sparse** | mAP for bottom-25% density locations |
+| **mAP_dense** | mAP for top-25% density locations |
 | **mAP density ratio** | sparse / dense (higher = more robust, 1.0 = no bias) |
 | **pred–density _r_** | Pearson correlation between obs density and predicted species count (lower = less biased) |
 
@@ -438,13 +439,13 @@ percentile positions (with default `pct_lo=1`, `pct_hi=99`,
 
 | Regional percentile | Label weight | Category |
 |---|---|---|
-| ≤ 1 (pct\_lo) | **0.01** | Rare — minimal gradient contribution |
+| ≤ 1 (pct_lo) | **0.01** | Rare — minimal gradient contribution |
 | 10 | 0.10 | Uncommon |
 | 25 | 0.25 | Below average |
 | 50 | 0.50 | Average |
 | 75 | 0.76 | Common |
 | 90 | 0.91 | Very common |
-| ≥ 99 (pct\_hi) | **1.00** | Abundant — full gradient contribution |
+| ≥ 99 (pct_hi) | **1.00** | Abundant — full gradient contribution |
 
 #### Parameters
 

@@ -148,12 +148,23 @@ Species identifiers from the Global Biodiversity Information Facility (GBIF) tax
 5. **EnvironmentalPredictionHead**: Regression head (auxiliary task)
    - Residual blocks + linear output
    - Default: 256 → residual blocks × 1 → n_env_features
-   - Output: Predicted environmental feature values (training only)
+   - Output: Predicted environmental feature values
+   - When habitat head is enabled, also runs at inference to feed the habitat pathway
 
-6. **BirdNETGeoModel**: Complete multi-task model
+6. **HabitatSpeciesHead**: Habitat-species association head (optional, `--habitat_head`)
+   - Takes predicted env features (from EnvironmentalPredictionHead) → species logits
+   - Architecture: Linear projection → residual blocks → bottleneck → n_species
+   - Combined with direct SpeciesPredictionHead via learned per-species gate:
+     `logits = gate * direct + (1-gate) * habitat`
+   - Gate = σ(W·embedding + b), initialised with bias=+1 (σ(1) ≈ 0.73, direct dominates)
+   - Gradients flow through env head, strengthening env representation learning
+   - Makes env→species link explicit; helps predict species in unobserved areas
+
+7. **BirdNETGeoModel**: Complete multi-task model
    - Combines all components
    - Forward pass returns both species logits and environmental predictions (training)
-   - Inference mode skips environmental prediction for efficiency
+   - When habitat_head is enabled, env head always runs and logits are gate-combined
+   - When habitat_head is disabled (default), inference skips env prediction
    - `predict_species()`: Convenience method for binary predictions
    - `get_species_probabilities()`: Get occurrence probabilities
 
@@ -332,10 +343,11 @@ implementation priority):
    - Forces encoder to produce similar embeddings → species head transfers naturally
    - Requires careful pair/triplet mining; added as third multi-task loss term
 
-5. **Habitat-species association head** (future)
+5. **Habitat-species association head** ✅ (implemented)
    - Branch: predicted env features → species probabilities
    - Makes the env→species link explicit rather than relying on shared encoder
    - Combine with direct species head via learned gating
+   - Enable with `--habitat_head` flag
 
 ## Project Goals
 - Predict which bird species are likely to occur in specific locations (H3 cells) during specific weeks of the year

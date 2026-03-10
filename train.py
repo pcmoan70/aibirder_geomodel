@@ -1034,6 +1034,7 @@ def run_autotune(args, device: torch.device):
             model_scale=float(p.get('model_scale', args.model_scale)),
             coord_harmonics=int(p.get('coord_harmonics', args.coord_harmonics)),
             week_harmonics=int(p.get('week_harmonics', args.week_harmonics)),
+            habitat_head=args.habitat_head,
         )
 
         criterion = MultiTaskLoss(
@@ -1227,6 +1228,10 @@ def main():
                         help='Number of harmonics for lat/lon circular encoding (default: 4)')
     parser.add_argument('--week_harmonics', type=int, default=8,
                         help='Number of harmonics for week circular encoding (default: 8)')
+    parser.add_argument('--habitat_head', action='store_true',
+                        help='Enable habitat-species association head: predicted env features '
+                             'feed a secondary species head, combined with the direct head '
+                             'via a learned per-species gate')
 
     # Training
     parser.add_argument('--batch_size', type=int, default=1024)
@@ -1523,6 +1528,7 @@ def main():
     model = create_model(
         n_species=n_species, n_env_features=n_env, model_scale=args.model_scale,
         coord_harmonics=args.coord_harmonics, week_harmonics=args.week_harmonics,
+        habitat_head=args.habitat_head,
     )
     total_params = sum(p.numel() for p in model.parameters())
     print(f"   scale={args.model_scale} — {total_params:,} params (~{total_params * 4 / 1024 / 1024:.1f} MB)")
@@ -1533,6 +1539,7 @@ def main():
         'n_env_features': n_env,
         'coord_harmonics': args.coord_harmonics,
         'week_harmonics': args.week_harmonics,
+        'habitat_head': args.habitat_head,
     }
     species_vocab = {
         'species_to_idx': preprocessor.species_to_idx,
