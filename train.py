@@ -1589,7 +1589,7 @@ def main():
     # Save labels file from taxonomy CSV (produced by combine.py)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     labels_path = checkpoint_dir / 'labels.txt'
-    name_map: Dict[int, tuple] = {}  # taxonKey → (sciName, comName)
+    name_map: Dict[str, tuple] = {}  # primaryId → (sciName, comName)
 
     taxonomy_path = args.taxonomy
     if taxonomy_path is None:
@@ -1611,16 +1611,19 @@ def main():
         with open(taxonomy_path, encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                tk = int(row['taxonKey'])
-                name_map[tk] = (row['scientificName'], row.get('commonName', row['scientificName']))
+                pid = row.get('species_code') or row.get('primaryId')
+                sci = row.get('sci_name') or row.get('scientificName')
+                com = row.get('com_name') or row.get('commonName', sci)
+                if pid and sci:
+                    name_map[pid] = (sci, com)
     else:
-        print("\n7. No taxonomy file found — labels will use taxonKey only")
+        print("\n7. No taxonomy file found — labels will use primaryId only")
 
     with open(labels_path, 'w', encoding='utf-8') as f:
         for idx in range(n_species):
-            tk = preprocessor.idx_to_species[idx]
-            sci, com = name_map.get(tk, (str(tk), str(tk)))
-            f.write(f"{tk}\t{sci}\t{com}\n")
+            pid = preprocessor.idx_to_species[idx]
+            sci, com = name_map.get(pid, (str(pid), str(pid)))
+            f.write(f"{pid}\t{sci}\t{com}\n")
     named = sum(1 for idx in range(n_species) if preprocessor.idx_to_species[idx] in name_map)
     print(f"   Saved {n_species} labels ({named} with names) to {labels_path}")
 
