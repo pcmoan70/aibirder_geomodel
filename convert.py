@@ -437,11 +437,15 @@ def convert(
           f"range [{ref_outputs.min():.4f}, {ref_outputs.max():.4f}]")
 
     # Copy labels.txt alongside exports
-    labels_src = Path(checkpoint_path).parent / "labels.txt"
+    ckpt_dir = Path(checkpoint_path).parent
+    ckpt_stem = Path(checkpoint_path).stem
+    labels_src = ckpt_dir / f"{ckpt_stem}_labels.txt"
+    if not labels_src.exists():
+        labels_src = ckpt_dir / "labels.txt"
     if labels_src.exists():
         import shutil
         shutil.copy2(labels_src, outpath / "labels.txt")
-        print(f"Copied labels.txt → {outpath / 'labels.txt'}")
+        print(f"Copied {labels_src.name} → {outpath / 'labels.txt'}")
 
     # Run conversions
     results: Dict[str, bool] = {}

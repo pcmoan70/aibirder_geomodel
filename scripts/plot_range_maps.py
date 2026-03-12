@@ -138,12 +138,12 @@ def load_ground_truth_data(data_path: str):
     # Convert week columns to sets for fast membership testing
     for col in [c for c in df.columns if c.startswith('week_')]:
         df[col] = df[col].apply(
-            lambda x: {int(s) for s in x} if isinstance(x, (list, np.ndarray)) else set()
+            lambda x: {str(s) for s in x} if isinstance(x, (list, np.ndarray)) else set()
         )
     return df, cell_lats, cell_lons
 
 
-def _plot_gt_cells(ax, gt_df, cell_lats, cell_lons, taxon_key: int, week: int):
+def _plot_gt_cells(ax, gt_df, cell_lats, cell_lons, taxon_key: str, week: int):
     """Overlay ground truth presence dots (green) on a map axis."""
     col = f'week_{week}'
     if col not in gt_df.columns:
@@ -177,7 +177,11 @@ def load_model_and_labels(checkpoint_path: str, device: torch.device):
     model.to(device)
     model.eval()
 
-    labels_path = Path(checkpoint_path).parent / 'labels.txt'
+    ckpt_dir = Path(checkpoint_path).parent
+    ckpt_stem = Path(checkpoint_path).stem
+    labels_path = ckpt_dir / f'{ckpt_stem}_labels.txt'
+    if not labels_path.exists():
+        labels_path = ckpt_dir / 'labels.txt'
     labels = load_labels(str(labels_path)) if labels_path.exists() else {}
 
     return model, idx_to_species, labels
@@ -187,41 +191,31 @@ def resolve_species_indices(
     species_names: Optional[List[str]],
     taxon_keys: Optional[List[int]],
     idx_to_species: Dict,
-    labels: Dict[int, Tuple[str, str]],
-) -> List[Tuple[int, int, str, str]]:
+    labels: Dict[int, Tuple[str, str, str]],
+) -> List[Tuple[int, str, str, str]]:
     """
     Resolve requested species to model indices.
 
-    Returns list of (model_index, taxonKey, sciName, comName).
+    Returns list of (model_index, speciesCode, sciName, comName).
     """
-    # Build reverse lookups
-    taxon_to_idx = {int(v): int(k) for k, v in idx_to_species.items()}
     results = []
 
-    if taxon_keys:
-        for tk in taxon_keys:
-            if tk in taxon_to_idx:
-                idx = taxon_to_idx[tk]
-                sci, com = labels.get(idx, (str(tk), str(tk)))
-                results.append((idx, tk, sci, com))
-            else:
-                print(f"Warning: taxonKey {tk} not found in model vocabulary, skipping.")
-
     if species_names:
-        # Build searchable list from labels
         for name_query in species_names:
             query_lower = name_query.lower().strip()
             found = False
-            for idx_key, taxon_key in idx_to_species.items():
+            for idx_key, species_id in idx_to_species.items():
                 idx = int(idx_key)
-                sci, com = labels.get(idx, (str(taxon_key), str(taxon_key)))
+                label = labels.get(idx)
+                if label:
+                    code, sci, com = label
+                else:
+                    code = sci = com = str(species_id)
                 if query_lower in sci.lower() or query_lower in com.lower():
-                    tk = int(taxon_key)
-                    # Avoid duplicates
                     if not any(r[0] == idx for r in results):
-                        results.append((idx, tk, sci, com))
+                        results.append((idx, code, sci, com))
                         found = True
-                        break  # Take first match
+                        break
             if not found:
                 print(f"Warning: species '{name_query}' not found in labels, skipping.")
 
@@ -418,7 +412,7 @@ def _render_gif_frame(
         _add_map_features(ax)
         _plot_cells(ax, sp_probs, resolution_deg, bounds, cmap, norm)
         if gt_data is not None:
-            _plot_gt_cells(ax, *gt_data, int(sp_info[1]), week)
+            _plot_gt_cells(ax, *gt_data, str(sp_info[1]), week)
 
         ax.set_title(f"{com_name}", fontsize=11, fontweight='bold')
 
@@ -515,7 +509,6 @@ def _plot_gif(
 
 def plot_range_maps(
     species_names: Optional[List[str]] = None,
-    taxon_keys: Optional[List[int]] = None,
     checkpoint_path: str = 'checkpoints/checkpoint_best.pt',
     resolution_deg: float = 2.0,
     bounds: Tuple[float, float, float, float] = (-180.0, -90.0, 180.0, 90.0),
@@ -533,8 +526,8 @@ def plot_range_maps(
     With *gif=True*, renders all 48 weeks and assembles an animated GIF
     with all species shown in a single gridded figure per frame.
     """
-    if not species_names and not taxon_keys:
-        print("Error: provide --species and/or --taxon_keys")
+    if not species_names:
+        print("Error: provide --species")
         return
 
     if device == 'auto':
@@ -545,7 +538,7 @@ def plot_range_maps(
     print(f"Using device: {dev}")
     model, idx_to_species, labels = load_model_and_labels(checkpoint_path, dev)
 
-    species_list = resolve_species_indices(species_names, taxon_keys, idx_to_species, labels)
+    species_list = resolve_species_indices(species_names, None, idx_to_species, labels)
     if not species_list:
         print("No valid species found. Exiting.")
         return
@@ -603,8 +596,6 @@ def main():
                         help='Path to model checkpoint')
     parser.add_argument('--species', nargs='+', type=str, default=None,
                         help='Species to plot (common or scientific name, substring match)')
-    parser.add_argument('--taxon_keys', nargs='+', type=int, default=None,
-                        help='GBIF taxonKeys of species to plot')
     parser.add_argument('--resolution', type=float, default=2.0,
                         help='Grid resolution in degrees (default: 2.0)')
     parser.add_argument('--bounds', nargs='+', default=['world'],
@@ -631,7 +622,6 @@ def main():
 
     plot_range_maps(
         species_names=args.species,
-        taxon_keys=args.taxon_keys,
         checkpoint_path=args.checkpoint,
         resolution_deg=args.resolution,
         bounds=bounds,

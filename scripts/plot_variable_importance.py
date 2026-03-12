@@ -60,7 +60,11 @@ def load_model_and_labels(checkpoint_path: str, device: torch.device):
     model.to(device)
     model.eval()
 
-    labels_path = Path(checkpoint_path).parent / 'labels.txt'
+    ckpt_dir = Path(checkpoint_path).parent
+    ckpt_stem = Path(checkpoint_path).stem
+    labels_path = ckpt_dir / f'{ckpt_stem}_labels.txt'
+    if not labels_path.exists():
+        labels_path = ckpt_dir / 'labels.txt'
     labels = load_labels(str(labels_path)) if labels_path.exists() else {}
 
     return model, idx_to_species, labels
@@ -70,37 +74,29 @@ def load_model_and_labels(checkpoint_path: str, device: torch.device):
 
 def resolve_species_indices(
     species_names: Optional[List[str]],
-    taxon_keys: Optional[List[int]],
     idx_to_species: Dict,
-    labels: Dict[int, Tuple[str, str]],
-) -> List[Tuple[int, int, str, str]]:
+    labels: Dict[int, Tuple[str, str, str]],
+) -> List[Tuple[int, str, str, str]]:
     """Resolve requested species to model indices.
 
-    Returns list of (model_index, taxonKey, sciName, comName).
+    Returns list of (model_index, speciesCode, sciName, comName).
     """
-    taxon_to_idx = {int(v): int(k) for k, v in idx_to_species.items()}
     results = []
-
-    if taxon_keys:
-        for tk in taxon_keys:
-            if tk in taxon_to_idx:
-                idx = taxon_to_idx[tk]
-                sci, com = labels.get(idx, (str(tk), str(tk)))
-                results.append((idx, tk, sci, com))
-            else:
-                print(f"Warning: taxonKey {tk} not found in model vocabulary, skipping.")
 
     if species_names:
         for name_query in species_names:
             query_lower = name_query.lower().strip()
             found = False
-            for idx_key, taxon_key in idx_to_species.items():
+            for idx_key, species_id in idx_to_species.items():
                 idx = int(idx_key)
-                sci, com = labels.get(idx, (str(taxon_key), str(taxon_key)))
+                label = labels.get(idx)
+                if label:
+                    code, sci, com = label
+                else:
+                    code = sci = com = str(species_id)
                 if query_lower in sci.lower() or query_lower in com.lower():
-                    tk = int(taxon_key)
                     if not any(r[0] == idx for r in results):
-                        results.append((idx, tk, sci, com))
+                        results.append((idx, code, sci, com))
                         found = True
                         break
             if not found:
@@ -447,8 +443,6 @@ def main():
     # Species selection
     parser.add_argument('--species', type=str, nargs='+', default=None,
                         help='Species common or scientific names (substring match)')
-    parser.add_argument('--taxon_keys', type=int, nargs='+', default=None,
-                        help='GBIF taxonKey identifiers')
 
     # Data
     parser.add_argument('--data_path', type=str, required=True,
@@ -468,8 +462,8 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.species and not args.taxon_keys:
-        parser.error('Provide at least one of --species or --taxon_keys')
+    if not args.species:
+        parser.error('Provide --species')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
@@ -480,15 +474,15 @@ def main():
 
     # Resolve species
     species_list = resolve_species_indices(
-        args.species, args.taxon_keys, idx_to_species, labels,
+        args.species, idx_to_species, labels,
     )
     if not species_list:
         print("No valid species found. Exiting.")
         return
 
     print(f"Species: {len(species_list)}")
-    for _, tk, sci, com in species_list:
-        print(f"  {com} ({sci}) — taxonKey {tk}")
+    for _, code, sci, com in species_list:
+        print(f"  {com} ({sci}) — {code}")
 
     # Load data
     print(f"\nLoading data from {args.data_path}...")

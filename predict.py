@@ -104,17 +104,26 @@ def predict(
             probs = torch.sigmoid(output['species_logits']).cpu().numpy()[0]
 
     # Load labels file (auto-detect from checkpoint dir)
-    labels_path = Path(checkpoint_path).parent / 'labels.txt'
+    # Try: <checkpoint_stem>_labels.txt, then labels.txt
+    ckpt_dir = Path(checkpoint_path).parent
+    ckpt_stem = Path(checkpoint_path).stem
+    labels_path = ckpt_dir / f'{ckpt_stem}_labels.txt'
+    if not labels_path.exists():
+        labels_path = ckpt_dir / 'labels.txt'
     labels = load_labels(str(labels_path)) if labels_path.exists() else {}
 
     # Build results
     results = []
-    for idx_key, taxon_key in idx_to_species.items():
+    for idx_key, species_id in idx_to_species.items():
         idx = int(idx_key)
-        taxon_key = int(taxon_key)
+        species_id = str(species_id)
         prob = float(probs[idx])
-        sci_name, com_name = labels.get(idx, (str(taxon_key), str(taxon_key)))
-        results.append((taxon_key, sci_name, com_name, prob))
+        label = labels.get(idx)
+        if label:
+            code, sci_name, com_name = label
+        else:
+            code, sci_name, com_name = species_id, species_id, species_id
+        results.append((code, sci_name, com_name, prob))
 
     results.sort(key=lambda x: x[3], reverse=True)
 
@@ -153,10 +162,10 @@ def main():
     # Print results
     week_label = "yearly" if args.week == -1 else f"week={args.week}"
     print(f"\nPredictions for lat={args.lat}, lon={args.lon}, {week_label}")
-    print(f"{'Rank':<5} {'TaxonKey':<12} {'Probability':<12} {'Common Name':<30} {'Scientific Name'}")
+    print(f"{'Rank':<5} {'Code':<12} {'Probability':<12} {'Common Name':<30} {'Scientific Name'}")
     print("-" * 100)
-    for i, (taxon_key, sci_name, com_name, prob) in enumerate(results, 1):
-        print(f"{i:<5} {taxon_key:<12} {prob:<12.4f} {com_name:<30} {sci_name}")
+    for i, (code, sci_name, com_name, prob) in enumerate(results, 1):
+        print(f"{i:<5} {code:<12} {prob:<12.4f} {com_name:<30} {sci_name}")
 
     if not results:
         print("  (no species above threshold)")
