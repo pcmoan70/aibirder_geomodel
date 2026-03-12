@@ -180,12 +180,26 @@ def estimate_gzip_rows(file_path, sample_rows=10000):
     return int(compressed_size / bytes_per_row) if bytes_per_row > 0 else 0
 
 
-def combine_data(h3_path, gbif_path, output_path, resolution=None, workers=1, classes=None, taxonomy_path=None):
+def combine_data(
+    h3_path: str,
+    gbif_path: str,
+    output_path: str,
+    resolution: int | None = None,
+    workers: int = 1,
+    classes: list | None = None,
+    taxonomy_path: str | None = None,
+) -> None:
     """Combine H3 environmental data with GBIF occurrences.
     
     Args:
-        resolution: H3 resolution for mapping GBIF coordinates. If None (default),
-                    auto-detected from the H3 environmental data.
+        h3_path: Path to H3 environmental GeoParquet.
+        gbif_path: Path to processed GBIF CSV.
+        output_path: Path for the combined output parquet.
+        resolution (int | None): H3 resolution for mapping GBIF coordinates.
+            If ``None`` (default), auto-detected from the H3 environmental data.
+        workers: Number of parallel worker processes.
+        classes: Taxonomic classes to include.
+        taxonomy_path: Path to taxonomy CSV for species code resolution.
     """
     if classes is None:
         # If no classes provided, dynamically determine them from taxonomy

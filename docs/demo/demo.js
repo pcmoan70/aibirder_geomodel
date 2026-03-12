@@ -25,22 +25,40 @@
   var DISPLAY_GAMMA = 0.5;
 
   // Preselected species (species code for quick access)
+  // Curated to showcase: long-distance migrants, year-round residents,
+  // pelagic seabirds, island endemics, raptors, and non-bird taxa.
   var FEATURED_SPECIES = [
-    { key: "9515886", sci: "Hirundo rustica", common: "Barn Swallow" },
-    { key: "5229230", sci: "Sterna paradisaea", common: "Arctic Tern" },
-    { key: "5231918", sci: "Cuculus canorus", common: "Common Cuckoo" },
-    { key: "2493052", sci: "Phylloscopus trochilus", common: "Willow Warbler" },
-    { key: "9705453", sci: "Parus major", common: "Great Tit" },
-    { key: "2490384", sci: "Cardinalis cardinalis", common: "Northern Cardinal" },
-    { key: "9510564", sci: "Turdus migratorius", common: "American Robin" },
-    { key: "5232445", sci: "Branta sandvicensis", common: "Hawaiian Goose (N\u0113n\u0113)" },
-    { key: "2479593", sci: "Nestor notabilis", common: "Kea" },
-    { key: "2480569", sci: "Buteo galapagoensis", common: "Gal\u00e1pagos Hawk" },
-    { key: "2495144", sci: "Apteryx mantelli", common: "North Island Brown Kiwi" },
-    { key: "5219243", sci: "Vulpes vulpes", common: "Red Fox" },
-    { key: "2436940", sci: "Oryctolagus cuniculus", common: "European Rabbit" },
-    { key: "5219681", sci: "Sciurus carolinensis", common: "Eastern Gray Squirrel" },
-    { key: "5218786", sci: "Procyon lotor", common: "Common Raccoon" },
+    // Long-distance migrants
+    { key: "barswa",  sci: "Hirundo rustica",        common: "Barn Swallow" },
+    { key: "arcter",  sci: "Sterna paradisaea",      common: "Arctic Tern" },
+    { key: "comcuc",  sci: "Cuculus canorus",         common: "Common Cuckoo" },
+    { key: "rthhum",  sci: "Archilochus colubris",   common: "Ruby-throated Hummingbird" },
+    { key: "eubeat1", sci: "Merops apiaster",         common: "European Bee-eater" },
+    // Year-round residents
+    { key: "gretit1", sci: "Parus major",             common: "Great Tit" },
+    { key: "norcar",  sci: "Cardinalis cardinalis",   common: "Northern Cardinal" },
+    { key: "supfai1", sci: "Malurus cyaneus",         common: "Superb Fairywren" },
+    { key: "greroa",  sci: "Geococcyx californianus", common: "Greater Roadrunner" },
+    // Pelagic seabirds
+    { key: "bripet",  sci: "Hydrobates pelagicus",    common: "European Storm-Petrel" },
+    { key: "wispet",  sci: "Oceanites oceanicus",     common: "Wilson\u2019s Storm-Petrel" },
+    { key: "atlpuf",  sci: "Fratercula arctica",      common: "Atlantic Puffin" },
+    { key: "bkbalb",  sci: "Thalassarche melanophris",common: "Black-browed Albatross" },
+    // Island endemics
+    { key: "hawgoo",  sci: "Branta sandvicensis",     common: "Hawaiian Goose (N\u0113n\u0113)" },
+    { key: "kea1",    sci: "Nestor notabilis",        common: "Kea" },
+    { key: "galhaw1", sci: "Buteo galapagoensis",     common: "Gal\u00e1pagos Hawk" },
+    { key: "galpen1", sci: "Spheniscus mendiculus",   common: "Gal\u00e1pagos Penguin" },
+    { key: "kagu1",   sci: "Rhynochetos jubatus",     common: "Kagu" },
+    // Nocturnal species
+    { key: "tawowl1", sci: "Strix aluco",             common: "Tawny Owl" },
+    { key: "grhowl",  sci: "Bubo virginianus",        common: "Great Horned Owl" },
+    { key: "eurnig1", sci: "Caprimulgus europaeus",   common: "Eurasian Nightjar" },
+    { key: "compot1", sci: "Nyctibius griseus",       common: "Common Potoo" },
+    // Non-bird taxa
+    { key: "42069",   sci: "Vulpes vulpes",           common: "Red Fox" },
+    { key: "41663",   sci: "Procyon lotor",           common: "Common Raccoon" },
+    { key: "46001",   sci: "Sciurus vulgaris",        common: "Eurasian Red Squirrel" },
   ];
 
   // ---- Colormap ------------------------------------------------------------
