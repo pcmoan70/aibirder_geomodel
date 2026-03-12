@@ -23,9 +23,11 @@ Usage:
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import math
 import os
+import pickle
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -37,7 +39,7 @@ from tqdm import tqdm
 from model.model import create_model
 from model.loss import MultiTaskLoss
 from utils.data import H3DataLoader, H3DataPreprocessor, create_dataloaders
-from utils.regions import HOLDOUT_REGIONS, resolve_holdout_regions
+from utils.regions import HOLDOUT_REGIONS, resolve_holdout_regions, REGION_BOUNDS
 
 
 # ---------------------------------------------------------------------------
@@ -59,13 +61,106 @@ TUNABLE_PARAMS = [
 
 
 # ---------------------------------------------------------------------------
+# Preprocessed data cache
+# ---------------------------------------------------------------------------
+
+# All CLI args that affect the final train/val split.  If any of these change,
+# the cache is invalidated.
+_DATA_CACHE_KEYS = [
+    'data_path',             # source parquet
+    'ocean_sample_rate',
+    'no_yearly',
+    'propagate_labels', 'propagate_k', 'propagate_max_radius',
+    'propagate_min_obs', 'propagate_max_spread',
+    'max_obs_per_species', 'min_obs_per_species',
+    'val_size', 'sample_fraction',
+    'holdout_regions',
+    'label_freq_weight', 'label_freq_weight_min',
+    'label_freq_weight_pct_lo', 'label_freq_weight_pct_hi',
+]
+
+
+def _data_cache_key(args) -> str:
+    """Build a deterministic hash from all args that affect preprocessing."""
+    h = hashlib.sha256()
+
+    # File identity: use mtime + size as a cheap fingerprint
+    p = Path(args.data_path)
+    stat = p.stat()
+    h.update(f"file:{p.resolve()}|mtime:{stat.st_mtime}|size:{stat.st_size}".encode())
+
+    # All data-affecting args
+    for key in _DATA_CACHE_KEYS:
+        val = getattr(args, key, None)
+        h.update(f"|{key}={val!r}".encode())
+
+    return h.hexdigest()[:16]
+
+
+def _data_cache_path(args) -> Path:
+    """Return the cache file path for the current data settings."""
+    digest = _data_cache_key(args)
+    cache_dir = Path(args.checkpoint_dir) / '.data_cache'
+    return cache_dir / f'preprocessed_{digest}.pkl'
+
+
+def _save_data_cache(path: Path, payload: dict) -> None:
+    """Persist preprocessed data to disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    with open(tmp, 'wb') as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.rename(path)  # atomic on POSIX
+
+
+def _load_data_cache(path: Path) -> Optional[dict]:
+    """Load preprocessed data from cache, or None if missing/corrupt."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except (pickle.UnpicklingError, EOFError, ValueError, ModuleNotFoundError) as e:
+        print(f"   Cache load failed ({type(e).__name__}: {e}), reprocessing...")
+        path.unlink(missing_ok=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Endemic / restricted-range watchlist for per-species AP tracking
 # ---------------------------------------------------------------------------
 
 
+# Watchlist map: species_code → common name
+WATCHLIST_SPECIES: Dict[str, str] = {
+    # Hawaiian endemics
+    'hawgoo': 'Hawaiian Goose',
+    'hawhaw': 'Hawaiian Hawk',
+    'elepai': 'Hawaii Elepaio',
+    'apapan': 'Apapane',
+    'iiwi':   'Iiwi',
+    'hawama': 'Hawaii Amakihi',
+    # New Zealand endemics
+    'kea1':    'Kea',
+    'nibkiw1': 'North Island Brown Kiwi',
+    'takahe3': 'South Island Takahe',
+    'riflem1': 'Rifleman',
+    'tui1':    'Tui',
+    'kokako3': 'North Island Kokako',
+    # Galápagos endemics
+    'galhaw1':    'Galápagos Hawk',
+    'galrai1':    'Galápagos Rail',
+    'galpet':     'Galápagos Petrel',
+    # Other restricted-range
+    'kagu1':  'Kagu',
+    'calcon': 'California Condor',
+    'whocra': 'Whooping Crane',
+}
+
+
 def _check_watchlist_coverage(
-    watchlist: Dict[int, str],
-    species_to_idx: Dict[int, int],
+    watchlist: Dict[str, str],
+    species_to_idx: Dict[str, int],
     train_tgt: Dict,
     val_tgt: Dict,
     n_species: int,
@@ -99,68 +194,40 @@ def _check_watchlist_coverage(
     missing_train = []
     missing_val = []
     not_in_vocab = []
-    for taxon_key, name in watchlist.items():
-        idx = species_to_idx.get(taxon_key)
+    for code, name in watchlist.items():
+        idx = species_to_idx.get(code)
         if idx is None:
-            not_in_vocab.append((taxon_key, name))
+            not_in_vocab.append((code, name))
             continue
         if idx not in train_present:
-            missing_train.append((taxon_key, name))
+            missing_train.append((code, name))
         if idx not in val_present:
-            missing_val.append((taxon_key, name))
+            missing_val.append((code, name))
 
     if not_in_vocab:
         warnings.warn(
             f"Watchlist: {len(not_in_vocab)} species not in vocabulary "
             f"(filtered by min_obs?): "
-            + ", ".join(f"{n} ({t})" for t, n in not_in_vocab),
+            + ", ".join(f"{n} ({c})" for c, n in not_in_vocab),
             stacklevel=2,
         )
     if missing_train:
         warnings.warn(
             f"Watchlist: {len(missing_train)} species have ZERO training "
             f"samples after subsampling: "
-            + ", ".join(f"{n} ({t})" for t, n in missing_train),
+            + ", ".join(f"{n} ({c})" for c, n in missing_train),
             stacklevel=2,
         )
     if missing_val:
         warnings.warn(
             f"Watchlist: {len(missing_val)} species have ZERO validation "
             f"samples after subsampling: "
-            + ", ".join(f"{n} ({t})" for t, n in missing_val),
+            + ", ".join(f"{n} ({c})" for c, n in missing_val),
             stacklevel=2,
         )
     if not not_in_vocab and not missing_train and not missing_val:
         print(f"   Watchlist: all {len(watchlist)} species present in "
               f"train & val splits")
-
-
-# TaxonKey → common name for species tracked in ablation study section 3.2.
-# These must appear in the training vocabulary to produce valid AP values.
-WATCHLIST_SPECIES: Dict[int, str] = {
-    # Hawaiian endemics
-    5232445: 'Hawaiian Goose',
-    2480528: 'Hawaiian Hawk',
-    2486699: 'Hawaii Elepaio',
-    2494524: 'Apapane',
-    8070758: 'Iiwi',
-    8346110: 'Hawaii Amakihi',
-    # New Zealand endemics
-    2479593: 'Kea',
-    2495144: 'North Island Brown Kiwi',
-    5228153: 'South Island Takahe',
-    5229954: 'Rifleman',
-    2487029: 'Tui',
-    5817136: 'North Island Kokako',
-    # Galápagos endemics
-    2480569: 'Galápagos Hawk',
-    2474597: 'Galápagos Rail',
-    2481460: 'Galápagos Petrel',
-    # Other restricted-range
-    2474354: 'Kagu',
-    2481920: 'California Condor',
-    2474941: 'Whooping Crane',
-}
 
 
 # ---------------------------------------------------------------------------
@@ -277,17 +344,19 @@ class Trainer:
         # Optional holdout DataLoader for region hold-out evaluation
         self.holdout_loader = holdout_loader
 
-        # Resolve watchlist taxonKeys to model column indices
+        # Resolve watchlist species codes to model column indices
         self.watchlist: Dict[int, str] = watchlist or {}
         s2i = self.species_vocab.get('species_to_idx', {})
-        self.watchlist_indices: Dict[int, int] = {}  # taxonKey → model index
+        self.watchlist_indices: Dict[int, int] = {}  # species code → model index
         for tk in self.watchlist:
             if tk in s2i:
                 self.watchlist_indices[tk] = s2i[tk]
 
         self.history = {
             'train_loss': [], 'train_species_loss': [], 'train_env_loss': [],
+            'train_habitat_loss': [],
             'val_loss': [], 'val_species_loss': [], 'val_env_loss': [],
+            'val_habitat_loss': [],
             'val_map': [], 'val_top10_recall': [], 'val_top30_recall': [],
             'val_f1_5': [], 'val_f1_10': [], 'val_f1_25': [],
             'val_list_ratio_5': [], 'val_list_ratio_10': [], 'val_list_ratio_25': [],
@@ -326,7 +395,7 @@ class Trainer:
             all batches.
         """
         self.model.train()
-        total_loss = total_species = total_env = 0.0
+        total_loss = total_species = total_env = total_habitat = 0.0
         n_batches = 0
         n_total = len(train_loader)
 
@@ -358,15 +427,26 @@ class Trainer:
             total_loss += losses['total'].item()
             total_species += losses['species'].item()
             total_env += losses['env'].item()
+            if 'habitat' in losses:
+                total_habitat += losses['habitat'].item()
             n_batches += 1
 
             if (batch_idx + 1) % self.log_interval == 0:
-                pbar.set_postfix(loss=f"{losses['total'].item():.4f}",
-                                 species=f"{losses['species'].item():.4f}",
-                                 env=f"{losses['env'].item():.4f}")
+                postfix = dict(
+                    loss=f"{losses['total'].item():.4f}",
+                    species=f"{losses['species'].item():.4f}",
+                    env=f"{losses['env'].item():.4f}",
+                )
+                if 'habitat' in losses:
+                    postfix['habitat'] = f"{losses['habitat'].item():.4f}"
+                pbar.set_postfix(**postfix)
 
-        return {'loss': total_loss / n_batches, 'species_loss': total_species / n_batches,
-                'env_loss': total_env / n_batches}
+        result = {'loss': total_loss / n_batches,
+                  'species_loss': total_species / n_batches,
+                  'env_loss': total_env / n_batches}
+        if total_habitat > 0:
+            result['habitat_loss'] = total_habitat / n_batches
+        return result
 
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
@@ -392,7 +472,7 @@ class Trainer:
             per-species AP for watchlist species, and density metrics.
         """
         self.model.eval()
-        total_loss = total_species = total_env = 0.0
+        total_loss = total_species = total_env = total_habitat = 0.0
         n_batches = 0
 
         # Metric accumulators
@@ -445,6 +525,8 @@ class Trainer:
             total_loss += losses['total'].item()
             total_species += losses['species'].item()
             total_env += losses['env'].item()
+            if 'habitat' in losses:
+                total_habitat += losses['habitat'].item()
             n_batches += 1
 
             # --- Species prediction metrics ---
@@ -531,6 +613,8 @@ class Trainer:
             'top10_recall': total_hits_10 / max(total_positives, 1),
             'top30_recall': total_hits_30 / max(total_positives, 1),
         }
+        if total_habitat > 0:
+            metrics['habitat_loss'] = total_habitat / n_batches
         for t in THRESHOLDS:
             pct = int(t * 100)
             tp, fp, fn = thresh_tp[t], thresh_fp[t], thresh_fn[t]
@@ -704,6 +788,11 @@ class Trainer:
                 for k in ('loss', 'species_loss', 'env_loss'):
                     self.history[f'train_{k}'].append(train_m[k])
                     self.history[f'val_{k}'].append(val_m[k])
+                # Habitat loss (only populated when habitat head is active)
+                self.history['train_habitat_loss'].append(
+                    train_m.get('habitat_loss', float('nan')))
+                self.history['val_habitat_loss'].append(
+                    val_m.get('habitat_loss', float('nan')))
                 for k in ('map', 'top10_recall', 'top30_recall',
                           'f1_5', 'f1_10', 'f1_25',
                           'list_ratio_5', 'list_ratio_10', 'list_ratio_25'):
@@ -738,9 +827,13 @@ class Trainer:
                     val_m['geoscore'] = compute_geoscore(val_m)
                     self.history['val_geoscore'][-1] = val_m['geoscore']
 
+                _hab_t = train_m.get('habitat_loss', float('nan'))
+                _hab_v = val_m.get('habitat_loss', float('nan'))
+                _hab_train = f" hab={_hab_t:.4f}" if not math.isnan(_hab_t) else ""
+                _hab_val = f" hab={_hab_v:.4f}" if not math.isnan(_hab_v) else ""
                 print(f"\nEpoch {epoch + 1} \u2014 lr={lr:.2e}  "
-                      f"Train: {train_m['loss']:.4f} (sp={train_m['species_loss']:.4f} env={train_m['env_loss']:.4f})  "
-                      f"Val: {val_m['loss']:.4f} (sp={val_m['species_loss']:.4f} env={val_m['env_loss']:.4f})")
+                      f"Train: {train_m['loss']:.4f} (sp={train_m['species_loss']:.4f} env={train_m['env_loss']:.4f}{_hab_train})  "
+                      f"Val: {val_m['loss']:.4f} (sp={val_m['species_loss']:.4f} env={val_m['env_loss']:.4f}{_hab_val})")
                 print(f"  Metrics: mAP={val_m['map']:.4f}  "
                       f"top-10={val_m['top10_recall']:.4f}  "
                       f"top-30={val_m['top30_recall']:.4f}")
@@ -877,91 +970,141 @@ def run_autotune(args, device: torch.device):
     print(f"  Objective:  GeoScore (maximize)")
     print(f"  Device:     {device}")
 
-    # -- Load data --------------------------------------------------------
-    print("\n1. Loading data...")
-    loader = H3DataLoader(args.data_path)
-    loader.load_data()
+    # -- Load data (with cache) ------------------------------------------
+    cache_path = _data_cache_path(args)
+    cached = None if args.no_cache else _load_data_cache(cache_path)
 
-    # Jitter scale is fixed by H3 resolution, compute once
-    _jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
+    if cached is not None:
+        print(f"\n   Using cached preprocessed data: {cache_path.name}")
+        train_in     = cached['train_in']
+        val_in       = cached['val_in']
+        train_tgt    = cached['train_tgt']
+        val_tgt      = cached['val_tgt']
+        preprocessor = cached['preprocessor']
+        _freq_weights = cached['freq_weights']
+        _jitter_std   = cached['jitter_std']
+        n_species     = cached['n_species']
+        n_env         = cached['n_env']
+        _species_lists_ref = cached.get('species_lists_ref')
+        _lats_ref     = cached.get('lats_ref')
+        _lons_ref     = cached.get('lons_ref')
+        print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}  |  "
+              f"Species: {n_species:,}  |  Env features: {n_env}")
+        del cached
+    else:
+        print("\n1. Loading data...")
+        loader = H3DataLoader(args.data_path)
+        loader.load_data()
 
-    # Build dataset once — data params are not tuned
-    print("2. Flattening to samples...")
-    lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
-        ocean_sample_rate=args.ocean_sample_rate,
-        include_yearly=not args.no_yearly,
-    )
+        # Jitter scale is fixed by H3 resolution, compute once
+        _jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
 
-    # Free the GeoDataFrame — no longer needed after flattening
-    del loader
-    gc.collect()
-
-    # Environmental neighbor label propagation (before preprocessing)
-    if args.propagate_labels:
-        print("   Propagating labels from observed to sparse cells...")
-        species_lists = H3DataPreprocessor.propagate_env_labels(
-            lats, lons, weeks, species_lists, env_features,
-            k=args.propagate_k,
-            max_radius_km=args.propagate_max_radius,
-            min_obs_threshold=args.propagate_min_obs,
+        # Build dataset once — data params are not tuned
+        print("2. Flattening to samples...")
+        lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
+            ocean_sample_rate=args.ocean_sample_rate,
+            include_yearly=not args.no_yearly,
         )
 
-    print("3. Preprocessing...")
-    preprocessor = H3DataPreprocessor()
-    inputs, targets = preprocessor.prepare_training_data(
-        lats, lons, weeks, species_lists, env_features, fit=True,
-        max_obs_per_species=args.max_obs_per_species,
-        min_obs_per_species=args.min_obs_per_species,
-    )
+        # Free the GeoDataFrame — no longer needed after flattening
+        del loader
+        gc.collect()
 
-    # Free raw flattened arrays — now encoded in inputs/targets
-    del lats, lons, weeks, env_features
-    gc.collect()
+        # Save pre-propagation species lists for frequency weight computation.
+        # Propagation inflates counts for common species and skews regional
+        # percentile estimates, so weights must be derived from original data.
+        species_lists_original = list(species_lists) if args.propagate_labels else None
 
-    info = preprocessor.get_preprocessing_info()
-    n_species = info['n_species']
-    n_env = info['n_env_features']
-    print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
+        # Environmental neighbor label propagation (before preprocessing)
+        if args.propagate_labels:
+            print("   Propagating labels from observed to sparse cells...")
+            
+            species_lists = H3DataPreprocessor.propagate_env_labels(
+                lats, lons, weeks, species_lists, env_features,
+                k=args.propagate_k,
+                max_radius_km=args.propagate_max_radius,
+                min_obs_threshold=args.propagate_min_obs,
+                max_spread_factor=args.propagate_max_spread,
+            )
 
-    # Pre-compute frequency-based label weights (cheap); per-trial
-    # decision whether to use them is made in the objective.
-    # When any weight shaping param is tuned, keep species_lists to
-    # recompute weights per trial with different values.
+        print("3. Preprocessing...")
+        preprocessor = H3DataPreprocessor()
+        inputs, targets = preprocessor.prepare_training_data(
+            lats, lons, weeks, species_lists, env_features, fit=True,
+            max_obs_per_species=args.max_obs_per_species,
+            min_obs_per_species=args.min_obs_per_species,
+        )
+
+        # Free raw flattened arrays — now encoded in inputs/targets
+        del lats, lons, weeks, env_features
+        gc.collect()
+
+        info = preprocessor.get_preprocessing_info()
+        n_species = info['n_species']
+        n_env = info['n_env_features']
+        print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
+
+        # Pre-compute frequency-based label weights (cheap); per-trial
+        # decision whether to use them is made in the objective.
+        # When any weight shaping param is tuned, keep species_lists to
+        # recompute weights per trial with different values.
+        _tune_freq_shape = bool(
+            {'label_freq_weight_min', 'label_freq_weight_pct_lo',
+             'label_freq_weight_pct_hi'} & set(tune_params)
+        )
+        # Use pre-propagation species lists for freq weights so propagated
+        # pseudo-labels don't skew regional abundance percentiles.
+        _freq_sl = species_lists_original if species_lists_original is not None else species_lists
+        _freq_weights = preprocessor.compute_species_freq_weights(
+            _freq_sl, min_weight=args.label_freq_weight_min,
+            pct_lo=args.label_freq_weight_pct_lo,
+            pct_hi=args.label_freq_weight_pct_hi,
+            lats=inputs['lat'], lons=inputs['lon'],
+        )
+        _species_lists_ref = _freq_sl if _tune_freq_shape else None
+        _lats_ref = inputs['lat'] if _tune_freq_shape else None
+        _lons_ref = inputs['lon'] if _tune_freq_shape else None
+
+        # Free species_lists — no longer needed after vocab + weights
+        del species_lists, species_lists_original, _freq_sl
+        gc.collect()
+
+        print("4. Splitting data...")
+        train_in, val_in, train_tgt, val_tgt = preprocessor.split_data(
+            inputs, targets, val_size=args.val_size,
+            random_state=42, split_by_location=True,
+        )
+
+        # Free unsplit data — now in train/val subsets
+        del inputs, targets
+        gc.collect()
+        # Subsample all splits once by location
+        if args.sample_fraction < 1.0:
+            train_in, train_tgt = preprocessor.subsample_by_location(
+                train_in, train_tgt, fraction=args.sample_fraction, random_state=42,
+            )
+            val_in, val_tgt = preprocessor.subsample_by_location(
+                val_in, val_tgt, fraction=args.sample_fraction, random_state=42,
+            )
+
+        # Save to cache for next run
+        print(f"   Saving preprocessed data cache: {cache_path.name}")
+        _save_data_cache(cache_path, {
+            'train_in': train_in, 'val_in': val_in,
+            'train_tgt': train_tgt, 'val_tgt': val_tgt,
+            'preprocessor': preprocessor,
+            'freq_weights': _freq_weights,
+            'jitter_std': _jitter_std,
+            'n_species': n_species, 'n_env': n_env,
+            'species_lists_ref': _species_lists_ref,
+            'lats_ref': _lats_ref, 'lons_ref': _lons_ref,
+        })
+
+    # _tune_freq_shape depends on tune_params; compute here (outside cache)
     _tune_freq_shape = bool(
         {'label_freq_weight_min', 'label_freq_weight_pct_lo',
          'label_freq_weight_pct_hi'} & set(tune_params)
     )
-    _freq_weights = preprocessor.compute_species_freq_weights(
-        species_lists, min_weight=args.label_freq_weight_min,
-        pct_lo=args.label_freq_weight_pct_lo,
-        pct_hi=args.label_freq_weight_pct_hi,
-        lats=inputs['lat'], lons=inputs['lon'],
-    )
-    _species_lists_ref = species_lists if _tune_freq_shape else None
-    _lats_ref = inputs['lat'] if _tune_freq_shape else None
-    _lons_ref = inputs['lon'] if _tune_freq_shape else None
-
-    # Free species_lists — no longer needed after vocab + weights
-    del species_lists
-    gc.collect()
-
-    print("4. Splitting data...")
-    train_in, val_in, train_tgt, val_tgt = preprocessor.split_data(
-        inputs, targets, val_size=args.val_size,
-        random_state=42, split_by_location=True,
-    )
-
-    # Free unsplit data — now in train/val subsets
-    del inputs, targets
-    gc.collect()
-    # Subsample all splits once by location
-    if args.sample_fraction < 1.0:
-        train_in, train_tgt = preprocessor.subsample_by_location(
-            train_in, train_tgt, fraction=args.sample_fraction, random_state=42,
-        )
-        val_in, val_tgt = preprocessor.subsample_by_location(
-            val_in, val_tgt, fraction=args.sample_fraction, random_state=42,
-        )
 
     # Verify watchlist species survived subsampling / splitting
     _check_watchlist_coverage(
@@ -1034,11 +1177,13 @@ def run_autotune(args, device: torch.device):
             model_scale=float(p.get('model_scale', args.model_scale)),
             coord_harmonics=int(p.get('coord_harmonics', args.coord_harmonics)),
             week_harmonics=int(p.get('week_harmonics', args.week_harmonics)),
+            habitat_head=args.habitat_head,
         )
 
         criterion = MultiTaskLoss(
             species_weight=args.species_weight,
             env_weight=float(p['env_weight']),
+            habitat_weight=args.habitat_weight if args.habitat_head else 0.0,
             species_loss=str(p.get('species_loss', args.species_loss)),
             focal_alpha=float(p.get('focal_alpha', args.focal_alpha)),
             focal_gamma=float(p.get('focal_gamma', args.focal_gamma)),
@@ -1227,6 +1372,14 @@ def main():
                         help='Number of harmonics for lat/lon circular encoding (default: 4)')
     parser.add_argument('--week_harmonics', type=int, default=8,
                         help='Number of harmonics for week circular encoding (default: 8)')
+    parser.add_argument('--habitat_head', action='store_true',
+                        help='Enable habitat-species association head: predicted env features '
+                             'feed a secondary species head, combined with the direct head '
+                             'via a learned per-species gate')
+    parser.add_argument('--habitat_weight', type=float, default=0.1,
+                        help='Weight for auxiliary habitat-species loss (applied to habitat '
+                             'head logits directly, independent of the gate). '
+                             'Only used when --habitat_head is set. Default: 0.1')
 
     # Training
     parser.add_argument('--batch_size', type=int, default=1024)
@@ -1236,7 +1389,7 @@ def main():
     parser.add_argument('--species_weight', type=float, default=1.0)
     parser.add_argument('--env_weight', type=float, default=0.5)
     parser.add_argument('--species_loss', type=str, default='bce', choices=['asl', 'bce', 'focal', 'an'],
-                        help='Species loss function: bce (cross entropy, default), bce, focal, or an')
+                        help='Species loss function: bce (default), asl (asymmetric), focal, or an')
     parser.add_argument('--asl_gamma_pos', type=float, default=0.0,
                         help='ASL positive focusing parameter (default: 0, no down-weighting)')
     parser.add_argument('--asl_gamma_neg', type=float, default=2.0,
@@ -1271,10 +1424,10 @@ def main():
                              'interpolation between lo/hi percentile)')
     parser.add_argument('--label_freq_weight_min', type=float, default=0.01,
                         help='Minimum label weight for rare species (default: 0.01)')
-    parser.add_argument('--label_freq_weight_pct_lo', type=float, default=1.0,
-                        help='Lower percentile: species at or below get min_weight (default: 1)')
-    parser.add_argument('--label_freq_weight_pct_hi', type=float, default=99.0,
-                        help='Upper percentile: species at or above get weight 1.0 (default: 99)')
+    parser.add_argument('--label_freq_weight_pct_lo', type=float, default=10.0,
+                        help='Lower percentile: species at or below get min_weight (default: 10)')
+    parser.add_argument('--label_freq_weight_pct_hi', type=float, default=95.0,
+                        help='Upper percentile: species at or above get weight 1.0 (default: 95)')
 
     # Label propagation (env neighbor)
     parser.add_argument('--propagate_labels', action='store_true',
@@ -1286,6 +1439,9 @@ def main():
                         help='Geographic radius cap in km for label propagation (default: 2000)')
     parser.add_argument('--propagate_min_obs', type=int, default=3,
                         help='Samples with fewer species than this receive propagated labels (default: 3)')
+    parser.add_argument('--propagate_max_spread', type=float, default=2.0,
+                        help='Restrict propagation distance by observed species range radius '
+                             'multiplied by this factor (default: 2.0).  Set to 0 to disable.')
 
     # LR schedule
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],
@@ -1317,6 +1473,8 @@ def main():
                         help='Path to taxonomy CSV (produced by combine.py). Auto-detected if omitted.')
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--save_every', type=int, default=5)
+    parser.add_argument('--no_cache', action='store_true',
+                        help='Force reprocessing of data even if a valid cache exists')
 
     # Device
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'])
@@ -1386,100 +1544,141 @@ def main():
         print(f"  Holdout:    {', '.join(args.holdout_regions)}")
     print(f"  Device:     {device}")
 
-    # -- Data loading & preprocessing ---
-    print("\n1. Loading data...")
-    loader = H3DataLoader(args.data_path)
-    loader.load_data()
+    # -- Data loading & preprocessing (with cache) ---
+    cache_path = _data_cache_path(args)
+    cached = None if args.no_cache else _load_data_cache(cache_path)
 
-    print("2. Flattening to samples...")
-    lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
-        ocean_sample_rate=args.ocean_sample_rate,
-        include_yearly=not args.no_yearly,
-    )
+    if cached is not None:
+        print(f"\n   Using cached preprocessed data: {cache_path.name}")
+        train_in    = cached['train_in']
+        val_in      = cached['val_in']
+        train_tgt   = cached['train_tgt']
+        val_tgt     = cached['val_tgt']
+        holdout_in  = cached['holdout_in']
+        holdout_tgt = cached['holdout_tgt']
+        preprocessor = cached['preprocessor']
+        freq_weights = cached['freq_weights']
+        jitter_std   = cached['jitter_std']
+        n_species    = cached['n_species']
+        n_env        = cached['n_env']
+        print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}  |  "
+              f"Species: {n_species:,}  |  Env features: {n_env}")
+        del cached
+    else:
+        print("\n1. Loading data...")
+        loader = H3DataLoader(args.data_path)
+        loader.load_data()
 
-    # Coordinate jitter
-    jitter_std = 0.0
-    if args.jitter:
-        jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
-        print(f"   Coordinate jitter: ±{jitter_std:.4f}° std")
-
-    # Free the GeoDataFrame — no longer needed after flattening
-    del loader
-    gc.collect()
-
-    # Environmental neighbor label propagation (before preprocessing)
-    if args.propagate_labels:
-        print("   Propagating labels from observed to sparse cells...")
-        species_lists = H3DataPreprocessor.propagate_env_labels(
-            lats, lons, weeks, species_lists, env_features,
-            k=args.propagate_k,
-            max_radius_km=args.propagate_max_radius,
-            min_obs_threshold=args.propagate_min_obs,
+        print("2. Flattening to samples...")
+        lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
+            ocean_sample_rate=args.ocean_sample_rate,
+            include_yearly=not args.no_yearly,
         )
 
-    print("3. Preprocessing...")
-    preprocessor = H3DataPreprocessor()
-    inputs, targets = preprocessor.prepare_training_data(
-        lats, lons, weeks, species_lists, env_features, fit=True,
-        max_obs_per_species=args.max_obs_per_species,
-        min_obs_per_species=args.min_obs_per_species,
-    )
+        # Coordinate jitter
+        jitter_std = 0.0
+        if args.jitter:
+            jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
+            print(f"   Coordinate jitter: ±{jitter_std:.4f}° std")
 
-    # Free raw flattened arrays — now encoded in inputs/targets
-    del lats, lons, weeks, env_features
-    gc.collect()
+        # Free the GeoDataFrame — no longer needed after flattening
+        del loader
+        gc.collect()
 
-    info = preprocessor.get_preprocessing_info()
-    n_species = info['n_species']
-    n_env = info['n_env_features']
-    print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
+        # Save pre-propagation species lists for frequency weight computation.
+        # Propagation inflates counts for common species and skews regional
+        # percentile estimates, so weights must be derived from original data.
+        species_lists_original = list(species_lists) if args.propagate_labels else None
 
-    # Frequency-based label weights (computed from original species_lists)
-    freq_weights = None
-    if args.label_freq_weight:
-        freq_weights = preprocessor.compute_species_freq_weights(
-            species_lists, min_weight=args.label_freq_weight_min,
-            pct_lo=args.label_freq_weight_pct_lo,
-            pct_hi=args.label_freq_weight_pct_hi,
-            lats=inputs['lat'], lons=inputs['lon'],
+        # Environmental neighbor label propagation (before preprocessing)
+        if args.propagate_labels:
+            print("   Propagating labels from observed to sparse cells...")
+            
+            species_lists = H3DataPreprocessor.propagate_env_labels(
+                lats, lons, weeks, species_lists, env_features,
+                k=args.propagate_k,
+                max_radius_km=args.propagate_max_radius,
+                min_obs_threshold=args.propagate_min_obs,
+                max_spread_factor=args.propagate_max_spread,
+            )
+
+        print("3. Preprocessing...")
+        preprocessor = H3DataPreprocessor()
+        inputs, targets = preprocessor.prepare_training_data(
+            lats, lons, weeks, species_lists, env_features, fit=True,
+            max_obs_per_species=args.max_obs_per_species,
+            min_obs_per_species=args.min_obs_per_species,
         )
 
-    # Free species_lists — no longer needed after vocab + weights
-    del species_lists
-    gc.collect()
+        # Free raw flattened arrays — now encoded in inputs/targets
+        del lats, lons, weeks, env_features
+        gc.collect()
 
-    print("4. Splitting data...")
-    train_in, val_in, train_tgt, val_tgt = preprocessor.split_data(
-        inputs, targets, val_size=args.val_size,
-        random_state=42, split_by_location=True,
-    )
-    print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}")
+        info = preprocessor.get_preprocessing_info()
+        n_species = info['n_species']
+        n_env = info['n_env_features']
+        print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
 
-    # Free unsplit data — now in train/val subsets
-    del inputs, targets
-    gc.collect()
+        # Frequency-based label weights — use pre-propagation species lists
+        # so pseudo-labels don't skew regional abundance percentiles.
+        freq_weights = None
+        if args.label_freq_weight:
+            _freq_sl = species_lists_original if species_lists_original is not None else species_lists
+            freq_weights = preprocessor.compute_species_freq_weights(
+                _freq_sl, min_weight=args.label_freq_weight_min,
+                pct_lo=args.label_freq_weight_pct_lo,
+                pct_hi=args.label_freq_weight_pct_hi,
+                lats=inputs['lat'], lons=inputs['lon'],
+            )
 
-    # Subsample once by location if fraction < 1 (all splits).
-    if args.sample_fraction < 1.0:
-        train_in, train_tgt = preprocessor.subsample_by_location(
-            train_in, train_tgt, fraction=args.sample_fraction, random_state=42,
+        # Free species_lists — no longer needed after vocab + weights
+        del species_lists, species_lists_original
+        gc.collect()
+
+        print("4. Splitting data...")
+        train_in, val_in, train_tgt, val_tgt = preprocessor.split_data(
+            inputs, targets, val_size=args.val_size,
+            random_state=42, split_by_location=True,
         )
-        val_in, val_tgt = preprocessor.subsample_by_location(
-            val_in, val_tgt, fraction=args.sample_fraction, random_state=42,
-        )
+        print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}")
 
-    # -- Region hold-out ---
-    holdout_bboxes = resolve_holdout_regions(args.holdout_regions) if args.holdout_regions else []
-    holdout_in = holdout_tgt = None
-    if holdout_bboxes:
-        region_names = ', '.join(args.holdout_regions)
-        # Mask holdout regions out of the training set
-        train_in, train_tgt, holdout_in, holdout_tgt = preprocessor.mask_regions(
-            train_in, train_tgt, holdout_bboxes,
-        )
-        n_holdout = len(holdout_in['lat'])
-        print(f"   Holdout regions ({region_names}): {n_holdout:,} samples removed from training")
-        print(f"   Train after holdout: {len(train_in['lat']):,}")
+        # Free unsplit data — now in train/val subsets
+        del inputs, targets
+        gc.collect()
+
+        # Subsample once by location if fraction < 1 (all splits).
+        if args.sample_fraction < 1.0:
+            train_in, train_tgt = preprocessor.subsample_by_location(
+                train_in, train_tgt, fraction=args.sample_fraction, random_state=42,
+            )
+            val_in, val_tgt = preprocessor.subsample_by_location(
+                val_in, val_tgt, fraction=args.sample_fraction, random_state=42,
+            )
+
+        # -- Region hold-out ---
+        holdout_bboxes = resolve_holdout_regions(args.holdout_regions) if args.holdout_regions else []
+        holdout_in = holdout_tgt = None
+        if holdout_bboxes:
+            region_names = ', '.join(args.holdout_regions)
+            # Mask holdout regions out of the training set
+            train_in, train_tgt, holdout_in, holdout_tgt = preprocessor.mask_regions(
+                train_in, train_tgt, holdout_bboxes,
+            )
+            n_holdout = len(holdout_in['lat'])
+            print(f"   Holdout regions ({region_names}): {n_holdout:,} samples removed from training")
+            print(f"   Train after holdout: {len(train_in['lat']):,}")
+
+        # Save to cache for next run
+        print(f"   Saving preprocessed data cache: {cache_path.name}")
+        _save_data_cache(cache_path, {
+            'train_in': train_in, 'val_in': val_in,
+            'train_tgt': train_tgt, 'val_tgt': val_tgt,
+            'holdout_in': holdout_in, 'holdout_tgt': holdout_tgt,
+            'preprocessor': preprocessor,
+            'freq_weights': freq_weights,
+            'jitter_std': jitter_std,
+            'n_species': n_species, 'n_env': n_env,
+        })
 
     # Verify watchlist species survived subsampling / splitting
     _check_watchlist_coverage(
@@ -1523,6 +1722,7 @@ def main():
     model = create_model(
         n_species=n_species, n_env_features=n_env, model_scale=args.model_scale,
         coord_harmonics=args.coord_harmonics, week_harmonics=args.week_harmonics,
+        habitat_head=args.habitat_head,
     )
     total_params = sum(p.numel() for p in model.parameters())
     print(f"   scale={args.model_scale} — {total_params:,} params (~{total_params * 4 / 1024 / 1024:.1f} MB)")
@@ -1533,6 +1733,7 @@ def main():
         'n_env_features': n_env,
         'coord_harmonics': args.coord_harmonics,
         'week_harmonics': args.week_harmonics,
+        'habitat_head': args.habitat_head,
     }
     species_vocab = {
         'species_to_idx': preprocessor.species_to_idx,
@@ -1544,7 +1745,7 @@ def main():
     # Save labels file from taxonomy CSV (produced by combine.py)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     labels_path = checkpoint_dir / 'labels.txt'
-    name_map: Dict[int, tuple] = {}  # taxonKey → (sciName, comName)
+    name_map: Dict[str, tuple] = {}  # primaryId → (sciName, comName)
 
     taxonomy_path = args.taxonomy
     if taxonomy_path is None:
@@ -1566,22 +1767,26 @@ def main():
         with open(taxonomy_path, encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                tk = int(row['taxonKey'])
-                name_map[tk] = (row['scientificName'], row.get('commonName', row['scientificName']))
+                pid = row.get('species_code') or row.get('primaryId')
+                sci = row.get('sci_name') or row.get('scientificName')
+                com = row.get('com_name') or row.get('commonName', sci)
+                if pid and sci:
+                    name_map[pid] = (sci, com)
     else:
-        print("\n7. No taxonomy file found — labels will use taxonKey only")
+        print("\n7. No taxonomy file found — labels will use primaryId only")
 
     with open(labels_path, 'w', encoding='utf-8') as f:
         for idx in range(n_species):
-            tk = preprocessor.idx_to_species[idx]
-            sci, com = name_map.get(tk, (str(tk), str(tk)))
-            f.write(f"{tk}\t{sci}\t{com}\n")
+            pid = preprocessor.idx_to_species[idx]
+            sci, com = name_map.get(pid, (str(pid), str(pid)))
+            f.write(f"{pid}\t{sci}\t{com}\n")
     named = sum(1 for idx in range(n_species) if preprocessor.idx_to_species[idx] in name_map)
     print(f"   Saved {n_species} labels ({named} with names) to {labels_path}")
 
     # -- Criterion, optimizer, scheduler --
     criterion = MultiTaskLoss(
         species_weight=args.species_weight, env_weight=args.env_weight,
+        habitat_weight=args.habitat_weight if args.habitat_head else 0.0,
         species_loss=args.species_loss,
         focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
         pos_lambda=args.pos_lambda, neg_samples=args.neg_samples,

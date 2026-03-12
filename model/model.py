@@ -315,6 +315,72 @@ class EnvironmentalPredictionHead(nn.Module):
         return self.head(x)
 
 
+class HabitatSpeciesHead(nn.Module):
+    """Predict species from predicted environmental features.
+
+    Creates an explicit pathway from environmental conditions to species
+    occurrence, making the habitat→species relationship directly learnable
+    rather than implicit in the shared encoder.  Combined with the direct
+    :class:`SpeciesPredictionHead` via a learned per-species gate, the
+    model can leverage both spatial-embedding patterns and environmental
+    feature associations.
+
+    Architecture mirrors :class:`SpeciesPredictionHead` (residual blocks +
+    low-rank bottleneck) but takes predicted environmental features as
+    input instead of the encoder embedding.
+
+    During training, gradients flow back through the environmental head,
+    reinforcing it to produce representations that are useful for both
+    regression accuracy *and* species prediction.
+    """
+
+    def __init__(
+        self,
+        n_env_features: int,
+        n_species: int,
+        hidden_dim: int = 256,
+        n_blocks: int = 1,
+        dropout: float = 0.1,
+        bottleneck: int = 128,
+    ):
+        """Initialize the habitat-species head.
+
+        Args:
+            n_env_features: Number of input environmental features
+                (output dim of the environmental head).
+            n_species: Number of target species (output logits).
+            hidden_dim: Hidden dimension of residual blocks.
+            n_blocks: Number of residual blocks.
+            dropout: Dropout probability.
+            bottleneck: Low-rank bottleneck dimension before the output layer.
+        """
+        super().__init__()
+        self.proj = nn.Linear(n_env_features, hidden_dim)
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(hidden_dim, dropout) for _ in range(n_blocks)]
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_dim, eps=LAYERNORM_EPS),
+            nn.Linear(hidden_dim, bottleneck),
+            nn.GELU(),
+            nn.Linear(bottleneck, n_species),
+        )
+
+    def forward(self, env_pred: torch.Tensor) -> torch.Tensor:
+        """Predict species logits from environmental features.
+
+        Args:
+            env_pred: Predicted environmental features of shape
+                ``(batch, n_env_features)``.
+
+        Returns:
+            Logits of shape ``(batch, n_species)``.
+        """
+        x = self.proj(env_pred)
+        x = self.blocks(x)
+        return self.head(x)
+
+
 # ---------------------------------------------------------------------------
 # Full model
 # ---------------------------------------------------------------------------
@@ -345,6 +411,10 @@ class BirdNETGeoModel(nn.Module):
         dropout: float = 0.1,
         species_dropout: float = 0.2,
         env_dropout: float = 0.1,
+        habitat_head: bool = False,
+        habitat_head_dim: int = 256,
+        habitat_head_blocks: int = 1,
+        habitat_bottleneck: int = 128,
     ):
         """Initialize the full multi-task model.
 
@@ -363,6 +433,13 @@ class BirdNETGeoModel(nn.Module):
             dropout: Encoder dropout.
             species_dropout: Species head dropout.
             env_dropout: Environmental head dropout.
+            habitat_head: Enable habitat-species association head. When
+                True, predicted environmental features are fed through a
+                secondary species head whose logits are combined with the
+                direct species head via a learned per-species gate.
+            habitat_head_dim: Hidden dim for habitat-species head.
+            habitat_head_blocks: Residual blocks in habitat-species head.
+            habitat_bottleneck: Low-rank bottleneck for habitat-species head.
         """
         super().__init__()
         self.n_species = n_species
@@ -383,6 +460,27 @@ class BirdNETGeoModel(nn.Module):
             dropout=env_dropout,
         )
 
+        # Optional habitat-species association head
+        if habitat_head:
+            self.habitat_species_head = HabitatSpeciesHead(
+                n_env_features=n_env_features, n_species=n_species,
+                hidden_dim=habitat_head_dim, n_blocks=habitat_head_blocks,
+                dropout=species_dropout, bottleneck=habitat_bottleneck,
+            )
+            # Learned per-species gate conditioned on the encoder embedding.
+            # gate = σ(W·embedding + b) ∈ (0, 1) per species.
+            # Combined logits = gate * direct + (1 - gate) * habitat.
+            # Bias initialised to +3 → σ(3) ≈ 0.95, so the direct head
+            # strongly dominates at the start.  The habitat contribution
+            # only fades in once the env head and habitat head have learned
+            # useful representations.
+            self.species_gate = nn.Linear(embed_dim, n_species)
+            nn.init.zeros_(self.species_gate.weight)
+            nn.init.constant_(self.species_gate.bias, 3.0)
+        else:
+            self.habitat_species_head = None
+            self.species_gate = None
+
     def forward(
         self,
         lat: torch.Tensor,
@@ -392,17 +490,45 @@ class BirdNETGeoModel(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Run the full model forward pass.
 
+        When the habitat-species head is enabled, the environmental head
+        always runs (even during inference) and its output feeds into the
+        habitat head.  The final species logits are a learned gate-weighted
+        combination of the direct and habitat predictions.
+
         Args:
             lat: Raw latitude in degrees, shape ``(batch,)``.
             lon: Raw longitude in degrees, shape ``(batch,)``.
             week: Week number (0–48), shape ``(batch,)``.
-            return_env: If True, also predict environmental features.
+            return_env: If True, also return environmental predictions.
 
         Returns:
             Dict with ``'species_logits'`` and optionally ``'env_pred'``.
         """
         encoded = self.encoder(lat, lon, week)
-        output = {'species_logits': self.species_head(encoded)}
+        direct_logits = self.species_head(encoded)
+
+        if self.habitat_species_head is not None:
+            # Habitat path: env head → habitat-species head → gated combination.
+            # env_pred is detached before the habitat head so species-loss
+            # gradients don't flow back into the env head (prevents
+            # gradient conflict with the MSE regression objective).
+            # The env head thus learns clean environmental representations
+            # from MSE alone, while the habitat head learns env→species
+            # associations from those stable features.
+            env_pred = self.env_head(encoded)
+            habitat_logits = self.habitat_species_head(env_pred.detach())
+            gate = torch.sigmoid(self.species_gate(encoded))
+            species_logits = gate * direct_logits + (1.0 - gate) * habitat_logits
+            output: Dict[str, torch.Tensor] = {'species_logits': species_logits}
+            if return_env:
+                output['env_pred'] = env_pred
+                # Return habitat logits separately so the loss function can
+                # apply an auxiliary species loss directly on the habitat
+                # head (independent of the gate scaling).
+                output['habitat_logits'] = habitat_logits
+            return output
+
+        output = {'species_logits': direct_logits}
         if return_env:
             output['env_pred'] = self.env_head(encoded)
         return output
@@ -459,6 +585,7 @@ def create_model(
     model_scale: float = 1.0,
     coord_harmonics: int = 4,
     week_harmonics: int = 8,
+    habitat_head: bool = False,
 ) -> BirdNETGeoModel:
     """Create model with a continuous size scaling factor.
 
@@ -479,6 +606,7 @@ def create_model(
         model_scale: Continuous scaling factor (default 1.0).
         coord_harmonics: Harmonics for lat/lon encoding.
         week_harmonics: Harmonics for week encoding.
+        habitat_head: Enable habitat-species association head.
     """
     # Reference dimensions at scale=1.0 (former "medium")
     embed_dim = max(64, round(512 * model_scale / 64) * 64)
@@ -496,6 +624,11 @@ def create_model(
     species_dropout = max(0.0, min(base_dropout + 0.1, 0.4))
     env_dropout = max(0.0, min(base_dropout, 0.3))
 
+    # Habitat-species head dimensions (matches env head width, species bottleneck)
+    habitat_head_dim = env_head_dim
+    habitat_head_blocks = max(1, round(1 * model_scale))
+    habitat_bottleneck = species_bottleneck
+
     return BirdNETGeoModel(
         n_species=n_species, n_env_features=n_env_features,
         coord_harmonics=coord_harmonics, week_harmonics=week_harmonics,
@@ -506,4 +639,8 @@ def create_model(
         env_head_dim=env_head_dim, env_head_blocks=env_head_blocks,
         dropout=dropout, species_dropout=species_dropout,
         env_dropout=env_dropout,
+        habitat_head=habitat_head,
+        habitat_head_dim=habitat_head_dim,
+        habitat_head_blocks=habitat_head_blocks,
+        habitat_bottleneck=habitat_bottleneck,
     )

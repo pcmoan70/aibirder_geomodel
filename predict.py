@@ -18,15 +18,15 @@ import torch
 from model.model import create_model
 
 
-def load_labels(labels_path: str) -> Dict[int, Tuple[str, str]]:
+def load_labels(labels_path: str) -> Dict[int, Tuple[str, str, str]]:
     """
     Load labels.txt (saved by train.py) — one line per species in vocab order.
-    Format: taxonKey<TAB>scientificName<TAB>commonName
+    Format: speciesCode<TAB>scientificName<TAB>commonName
 
     Returns:
-        Dict mapping model output index → (scientificName, commonName)
+        Dict mapping model output index → (speciesCode, scientificName, commonName)
     """
-    labels: Dict[int, Tuple[str, str]] = {}
+    labels: Dict[int, Tuple[str, str, str]] = {}
     path = Path(labels_path)
     if not path.exists():
         return labels
@@ -35,13 +35,13 @@ def load_labels(labels_path: str) -> Dict[int, Tuple[str, str]]:
         for idx, line in enumerate(f):
             parts = line.rstrip('\n').split('\t')
             if len(parts) >= 3:
-                _, sci, com = parts[0], parts[1], parts[2]
+                code, sci, com = parts[0], parts[1], parts[2]
             elif len(parts) == 2:
-                _, sci = parts[0], parts[1]
+                code, sci = parts[0], parts[1]
                 com = sci
             else:
-                sci = com = parts[0]
-            labels[idx] = (sci, com)
+                code = sci = com = parts[0]
+            labels[idx] = (code, sci, com)
     return labels
 
 
@@ -53,11 +53,11 @@ def predict(
     top_k: Optional[int] = None,
     threshold: Optional[float] = None,
     device: str = 'auto',
-) -> List[Tuple[int, str, str, float]]:
+) -> List[Tuple[str, str, str, float]]:
     """
     Predict species occurrence for a location and week.
 
-    Returns list of (taxonKey, scientificName, commonName, probability) tuples,
+    Returns list of (speciesCode, scientificName, commonName, probability) tuples,
     sorted by probability descending.
     """
     if device == 'auto':
@@ -78,6 +78,7 @@ def predict(
         model_scale=model_config.get('model_scale', 1.0),
         coord_harmonics=model_config.get('coord_harmonics', 8),
         week_harmonics=model_config.get('week_harmonics', 4),
+        habitat_head=model_config.get('habitat_head', False),
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(dev)
@@ -103,17 +104,33 @@ def predict(
             probs = torch.sigmoid(output['species_logits']).cpu().numpy()[0]
 
     # Load labels file (auto-detect from checkpoint dir)
-    labels_path = Path(checkpoint_path).parent / 'labels.txt'
+    # Try: <checkpoint_stem>_labels.txt, then labels.txt
+    ckpt_dir = Path(checkpoint_path).parent
+    ckpt_stem = Path(checkpoint_path).stem
+    labels_path = ckpt_dir / f'{ckpt_stem}_labels.txt'
+    if not labels_path.exists():
+        labels_path = ckpt_dir / 'labels.txt'
     labels = load_labels(str(labels_path)) if labels_path.exists() else {}
+    if not labels:
+        import warnings
+        warnings.warn(
+            f"No labels file found in {ckpt_dir} — output will use species "
+            f"codes only. Expected: {ckpt_stem}_labels.txt or labels.txt",
+            stacklevel=2,
+        )
 
     # Build results
     results = []
-    for idx_key, taxon_key in idx_to_species.items():
+    for idx_key, species_id in idx_to_species.items():
         idx = int(idx_key)
-        taxon_key = int(taxon_key)
+        species_id = str(species_id)
         prob = float(probs[idx])
-        sci_name, com_name = labels.get(idx, (str(taxon_key), str(taxon_key)))
-        results.append((taxon_key, sci_name, com_name, prob))
+        label = labels.get(idx)
+        if label:
+            code, sci_name, com_name = label
+        else:
+            code, sci_name, com_name = species_id, species_id, species_id
+        results.append((code, sci_name, com_name, prob))
 
     results.sort(key=lambda x: x[3], reverse=True)
 
@@ -130,14 +147,14 @@ def main():
     parser.add_argument('--checkpoint', type=str, default='checkpoints/checkpoint_best.pt', help='Path to model checkpoint')
     parser.add_argument('--lat', type=float, required=True, help='Latitude (-90 to 90)')
     parser.add_argument('--lon', type=float, required=True, help='Longitude (-180 to 180)')
-    parser.add_argument('--week', type=int, required=True, help='Week number (1-48, or -1 for yearly)')
+    parser.add_argument('--week', type=int, required=True, help='Week number (1-48, or -1/0 for yearly)')
     parser.add_argument('--top_k', type=int, default=100, help='Show top K species')
     parser.add_argument('--threshold', type=float, default=0.15, help='Min probability threshold')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'])
     args = parser.parse_args()
 
-    if not (args.week == -1 or 1 <= args.week <= 48):
-        parser.error("Week must be between 1 and 48, or -1 for yearly")
+    if not (args.week in (-1, 0) or 1 <= args.week <= 48):
+        parser.error("Week must be between 1 and 48, or -1/0 for yearly")
 
     # Map CLI -1 → internal week 0 (yearly)
     internal_week = 0 if args.week == -1 else args.week
@@ -152,10 +169,10 @@ def main():
     # Print results
     week_label = "yearly" if args.week == -1 else f"week={args.week}"
     print(f"\nPredictions for lat={args.lat}, lon={args.lon}, {week_label}")
-    print(f"{'Rank':<5} {'TaxonKey':<12} {'Probability':<12} {'Common Name':<30} {'Scientific Name'}")
+    print(f"{'Rank':<5} {'Code':<12} {'Probability':<12} {'Common Name':<30} {'Scientific Name'}")
     print("-" * 100)
-    for i, (taxon_key, sci_name, com_name, prob) in enumerate(results, 1):
-        print(f"{i:<5} {taxon_key:<12} {prob:<12.4f} {com_name:<30} {sci_name}")
+    for i, (code, sci_name, com_name, prob) in enumerate(results, 1):
+        print(f"{i:<5} {code:<12} {prob:<12.4f} {com_name:<30} {sci_name}")
 
     if not results:
         print("  (no species above threshold)")

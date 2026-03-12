@@ -40,11 +40,26 @@ class H3DataLoader:
 
     def load_data(self) -> gpd.GeoDataFrame:
         """Load the H3 cell data from parquet file."""
+        # Use geopandas read_parquet as the primary method to preserve metadata
         self.gdf = gpd.read_parquet(self.data_path)
+            
+        # Robust conversion: if for any reason (external tool, etc.) the geometry 
+        # is WKB bytes, ensure it gets converted to shapes so GeoPandas works.
+        if 'geometry' in self.gdf.columns and len(self.gdf) > 0:
+            if isinstance(self.gdf['geometry'].iloc[0], bytes):
+                from shapely import wkb
+                self.gdf['geometry'] = self.gdf['geometry'].apply(wkb.loads)
+            
+        # Ensure h3_index is consistent (hex strings)
+        if 'h3_index' in self.gdf.columns:
+            self.gdf['h3_index'] = self.gdf['h3_index'].apply(
+                lambda x: x if isinstance(x, str) else h3.int_to_str(x)
+            )
+            
         self.week_columns = [c for c in self.gdf.columns if c.startswith('week_')]
         self.env_columns = [
             c for c in self.gdf.columns
-            if c not in self.week_columns and c not in ('h3_index', 'geometry')
+            if c not in self.week_columns and c not in ('h3_index', 'geometry', 'h3_resolution', 'target_km')
         ]
         return self.gdf
 
@@ -89,7 +104,7 @@ class H3DataLoader:
         ocean_sample_rate: float = 1.0,
         water_threshold: float = 0.9,
         include_yearly: bool = True,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[List[int]], pd.DataFrame]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[List[str]], pd.DataFrame]:
         """
         Flatten H3-cell × weeks to individual (lat, lon, week, species, env) samples.
 
@@ -187,9 +202,9 @@ class H3DataPreprocessor:
     def __init__(self):
         """Initialize the preprocessor with empty state."""
         self.env_scaler = StandardScaler()
-        self.species_vocab: Set[int] = set()
-        self.species_to_idx: Dict[int, int] = {}
-        self.idx_to_species: Dict[int, int] = {}
+        self.species_vocab: Set[str] = set()
+        self.species_to_idx: Dict[str, int] = {}
+        self.idx_to_species: Dict[int, str] = {}
         self.env_feature_names: Optional[List[str]] = None
 
         # Column classification for proper encoding
@@ -292,13 +307,14 @@ class H3DataPreprocessor:
 
     def build_species_vocabulary(
         self,
-        species_lists: List[List[int]],
+        species_lists: List[List[str]],
         min_obs_per_species: int = 0,
     ) -> None:
-        """Build vocabulary of all unique GBIF taxonKeys.
+        """Build vocabulary of all unique species codes.
 
         Args:
-            species_lists: Per-sample lists of taxonKeys.
+            species_lists: Per-sample lists of species codes (eBird codes
+                for birds, iNat IDs for non-birds).
             min_obs_per_species: If >0, exclude species observed in fewer
                 than this many samples.  Default 0 (keep all).
         """
@@ -327,7 +343,7 @@ class H3DataPreprocessor:
         self.species_to_idx = {s: i for i, s in enumerate(sorted(all_species))}
         self.idx_to_species = {i: s for s, i in self.species_to_idx.items()}
 
-    def encode_species_multilabel(self, species_lists: List[List[int]]) -> np.ndarray:
+    def encode_species_multilabel(self, species_lists: List[List[str]]) -> np.ndarray:
         """Convert species lists to multi-label binary matrix.
 
         NOTE: only used for small datasets. For large datasets use
@@ -345,7 +361,7 @@ class H3DataPreprocessor:
                     matrix[i, idx] = 1.0
         return matrix
 
-    def encode_species_sparse(self, species_lists: List[List[int]]) -> List[np.ndarray]:
+    def encode_species_sparse(self, species_lists: List[List[str]]) -> List[np.ndarray]:
         """Convert species lists to a list of sparse index arrays.
 
         Each element is an int32 array of active species indices for that
@@ -367,7 +383,7 @@ class H3DataPreprocessor:
     @staticmethod
     def compute_obs_density(
         inputs: Dict[str, np.ndarray],
-        species_lists: List[List[int]],
+        species_lists: List[List[str]],
     ) -> np.ndarray:
         """Compute per-sample observation density for density-stratified evaluation.
 
@@ -379,12 +395,12 @@ class H3DataPreprocessor:
         A well-surveyed H3 cell (e.g. Central Park, NYC) will have a high
         density value; a poorly surveyed cell (e.g. rural Siberia) will have
         a low value.  During validation the density is used to stratify
-        metrics — a model that generalises well should have similar mAP in
+        metrics — a model that generalizes well should have similar mAP in
         dense and sparse strata.
 
         Args:
             inputs: Dict with 'lat', 'lon' float32 arrays.
-            species_lists: Per-sample lists of taxonKeys (before encoding).
+            species_lists: Per-sample lists of species codes (before encoding).
 
         Returns:
             Float32 array of shape ``(n_samples,)`` with per-location density.
@@ -470,13 +486,14 @@ class H3DataPreprocessor:
         lats: np.ndarray,
         lons: np.ndarray,
         weeks: np.ndarray,
-        species_lists: List[List[int]],
+        species_lists: List[List[str]],
         env_features: pd.DataFrame,
         k: int = 5,
         max_radius_km: float = 2000.0,
         min_obs_threshold: int = 3,
         soft_weight: float = 0.5,
-    ) -> List[List[int]]:
+        max_spread_factor: float = 2.0,
+    ) -> List[List[str]]:
         """Propagate species labels from observed to sparse/unobserved cells.
 
         For each sample whose species list is shorter than *min_obs_threshold*,
@@ -485,6 +502,9 @@ class H3DataPreprocessor:
         neighbours within *max_radius_km*.  Per-week matching prevents
         seasonal species from leaking across weeks (e.g. summer migrants
         appearing in winter).
+
+        Uses sparse matrix operations to vectorize the species merge and
+        range check, avoiding per-species Python loops.
 
         Args:
             lats: Per-sample latitudes.
@@ -497,6 +517,11 @@ class H3DataPreprocessor:
             min_obs_threshold: Samples with fewer species than this are
                 considered sparse and receive propagated labels (default 3).
             soft_weight: Reserved for future soft-label support.
+            max_spread_factor: Restrict species propagation based on their
+                observed geographic range.  A species will only propagate to a
+                cell if the cell is within distance D of the nearest original
+                observation, where D = *max_spread_factor* × (observed range
+                diameter / 2). Set to 0 to disable range filtering (default 2.0).
 
         Returns:
             Modified species_lists with propagated labels (also mutated
@@ -504,6 +529,7 @@ class H3DataPreprocessor:
         """
         from sklearn.preprocessing import StandardScaler
         from scipy.spatial import cKDTree
+        import scipy.sparse as sps
 
         n = len(species_lists)
 
@@ -519,11 +545,94 @@ class H3DataPreprocessor:
                   f"({n_observed:,} observed, {n_sparse:,} sparse)")
             return species_lists
 
-        # Normalize environmental features (vectorized NaN fill)
+        # --- Build species vocabulary and sparse membership matrix ---
+        # This replaces the per-species Python loops with sparse matrix ops.
+        all_sp: set = set()
+        for sl in species_lists:
+            all_sp.update(sl)
+        sp_list = sorted(all_sp)
+        sp_to_idx = {s: i for i, s in enumerate(sp_list)}
+        n_sp = len(sp_list)
+
+        # Flatten (sample_index, species_index) pairs for CSR construction
+        total_entries = int(obs_counts.sum())
+        mem_r = np.empty(total_entries, dtype=np.int32)
+        mem_c = np.empty(total_entries, dtype=np.int32)
+        pos = 0
+        for i, sl in enumerate(species_lists):
+            n_sl = len(sl)
+            if n_sl > 0:
+                mem_r[pos:pos + n_sl] = i
+                mem_c[pos:pos + n_sl] = [sp_to_idx[s] for s in sl]
+                pos += n_sl
+        membership = sps.csr_matrix(
+            (np.ones(pos, dtype=np.float32), (mem_r[:pos], mem_c[:pos])),
+            shape=(n, n_sp),
+        )
+        del mem_r, mem_c
+
+        # --- Species Range Computation (vectorized with reduceat) ---
+        R = 6371.0
+        centroids_lat = np.zeros(n_sp, dtype=np.float64)
+        centroids_lon = np.zeros(n_sp, dtype=np.float64)
+        # Default max propagation distance = floor radius × spread factor
+        sp_max_dist = np.full(
+            n_sp,
+            50.0 * max_spread_factor if max_spread_factor > 0 else np.inf,
+            dtype=np.float64,
+        )
+
+        if max_spread_factor > 0:
+            obs_idx = np.where(observed_mask)[0]
+            obs_lats = lats[obs_idx].astype(np.float64)
+            obs_lons = lons[obs_idx].astype(np.float64)
+
+            # Extract (obs_local_row, species_col) pairs from sparse matrix
+            obs_mem = membership[obs_idx]
+            obs_rows_sp, obs_cols_sp = obs_mem.nonzero()
+
+            if len(obs_rows_sp) > 0:
+                flat_lats = obs_lats[obs_rows_sp]
+                flat_lons = obs_lons[obs_rows_sp]
+                flat_sp = obs_cols_sp
+
+                # Sort by species index for grouped numpy operations
+                order = np.argsort(flat_sp)
+                sorted_sp = flat_sp[order]
+                sorted_lats = flat_lats[order]
+                sorted_lons = flat_lons[order]
+
+                uniq_sp, starts, counts = np.unique(
+                    sorted_sp, return_index=True, return_counts=True)
+
+                # Centroids via reduceat (sum / count)
+                lat_sums = np.add.reduceat(sorted_lats, starts)
+                lon_sums = np.add.reduceat(sorted_lons, starts)
+                centroids_lat[uniq_sp] = lat_sums / counts
+                centroids_lon[uniq_sp] = lon_sums / counts
+
+                # Range radius from bounding box diagonal
+                lat_mins = np.minimum.reduceat(sorted_lats, starts)
+                lat_maxs = np.maximum.reduceat(sorted_lats, starts)
+                lon_mins = np.minimum.reduceat(sorted_lons, starts)
+                lon_maxs = np.maximum.reduceat(sorted_lons, starts)
+
+                dlat = lat_maxs - lat_mins
+                dlon = lon_maxs - lon_mins
+                d_lat_km = R * np.radians(dlat)
+                d_lon_km = (R * np.radians(dlon)
+                            * np.cos(np.radians(centroids_lat[uniq_sp])))
+                radii = np.maximum(
+                    0.5 * np.sqrt(d_lat_km**2 + d_lon_km**2), 50.0)
+                sp_max_dist[uniq_sp] = max_spread_factor * radii
+
+            del obs_idx, obs_lats, obs_lons, obs_mem
+
+        # --- Normalize environmental features ---
         env_arr = env_features.values.astype(np.float64)
         col_means = np.nanmean(env_arr, axis=0)
-        inds = np.where(np.isnan(env_arr))
-        env_arr[inds] = np.take(col_means, inds[1])
+        nans = np.where(np.isnan(env_arr))
+        env_arr[nans] = np.take(col_means, nans[1])
 
         scaler = StandardScaler()
         env_scaled = scaler.fit_transform(env_arr).astype(np.float32)
@@ -532,7 +641,6 @@ class H3DataPreprocessor:
         lats_rad = np.radians(lats.astype(np.float64))
         lons_rad = np.radians(lons.astype(np.float64))
         cos_lats = np.cos(lats_rad)
-        R = 6371.0  # Earth radius in km
 
         # Propagate within the same week — each week gets its own
         # KD-tree so summer species don't leak into winter, etc.
@@ -561,38 +669,87 @@ class H3DataPreprocessor:
                 dists = dists[:, None]
                 nb_local = nb_local[:, None]
 
-            # Map local neighbour indices back to global indices
-            nb_global = obs_in[nb_local]  # shape (n_sparse_bucket, k_use)
+            nb_global_arr = obs_in[nb_local]
 
-            # Vectorized haversine for ALL (sparse, neighbour) pairs at once
-            sp_idx = np.repeat(sparse_in, k_use)        # each sparse repeated k times
-            nb_idx = nb_global.ravel()                    # all neighbours flat
+            # Vectorized haversine for ALL (sparse, neighbor) pairs at once
+            n_sp_bucket = len(sparse_in)
+            sp_flat = np.repeat(sparse_in, k_use)
+            nb_flat = nb_global_arr.ravel()
 
-            dlat = lats_rad[nb_idx] - lats_rad[sp_idx]
-            dlon = lons_rad[nb_idx] - lons_rad[sp_idx]
-            a = (np.sin(dlat * 0.5) ** 2 +
-                 cos_lats[sp_idx] * cos_lats[nb_idx] *
-                 np.sin(dlon * 0.5) ** 2)
+            d_lat = lats_rad[nb_flat] - lats_rad[sp_flat]
+            d_lon = lons_rad[nb_flat] - lons_rad[sp_flat]
+            a = (np.sin(d_lat * 0.5) ** 2 +
+                 cos_lats[sp_flat] * cos_lats[nb_flat] *
+                 np.sin(d_lon * 0.5) ** 2)
             geo_km = R * 2.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+            geo_km = geo_km.reshape(n_sp_bucket, k_use)
 
-            # Reshape back to (n_sparse_bucket, k_use)
-            geo_km = geo_km.reshape(len(sparse_in), k_use)
-
-            # Mask: valid neighbours (finite dist AND within radius)
+            # Mask: valid neighbors (finite dist AND within radius)
             valid = (dists < np.inf) & (geo_km <= max_radius_km)
 
-            # Merge species from valid neighbours
-            for row_i in range(len(sparse_in)):
-                si = sparse_in[row_i]
-                cols = np.where(valid[row_i])[0]
-                if len(cols) == 0:
-                    continue
+            # --- Vectorized species propagation via sparse matmul ---
+            # Instead of a triple-nested Python loop over
+            # (sparse_cells × neighbors × species), use a sparse matrix
+            # multiply to collect all candidate species at once.
 
+            valid_rows, valid_cols = np.where(valid)
+            if len(valid_rows) == 0:
+                continue
+
+            # Picking matrix: maps each sparse cell to its valid neighbors
+            # Shape: (n_sparse_bucket, n_obs_bucket)
+            pick_local = nb_local[valid_rows, valid_cols]
+            picking = sps.csr_matrix(
+                (np.ones(len(valid_rows), dtype=np.float32),
+                 (valid_rows, pick_local)),
+                shape=(n_sp_bucket, len(obs_in)),
+            )
+
+            # Candidate matrix = picking @ membership[obs_in]
+            # Shape: (n_sparse_bucket, n_species)
+            # Non-zero entries mark species reachable from each sparse cell.
+            candidate = (picking @ membership[obs_in]).tocsr()
+            cand_rows, cand_cols = candidate.nonzero()
+
+            if len(cand_rows) == 0:
+                continue
+
+            # Vectorized range filter (haversine to species centroids)
+            if max_spread_factor > 0:
+                t_lats = lats[sparse_in[cand_rows]]
+                t_lons = lons[sparse_in[cand_rows]]
+                c_lats = centroids_lat[cand_cols]
+                c_lons = centroids_lon[cand_cols]
+
+                d_lat = np.radians(t_lats - c_lats)
+                d_lon = np.radians(t_lons - c_lons)
+                a = (np.sin(d_lat * 0.5) ** 2 +
+                     np.cos(np.radians(c_lats)) *
+                     np.cos(np.radians(t_lats)) *
+                     np.sin(d_lon * 0.5) ** 2)
+                dist_cent = R * 2.0 * np.arcsin(
+                    np.sqrt(np.clip(a, 0.0, 1.0)))
+
+                keep = dist_cent <= sp_max_dist[cand_cols]
+                cand_rows = cand_rows[keep]
+                cand_cols = cand_cols[keep]
+
+            if len(cand_rows) == 0:
+                continue
+
+            # Update species_lists — iterate only over modified cells
+            order = np.argsort(cand_rows)
+            s_rows = cand_rows[order]
+            s_cols = cand_cols[order]
+            uniq, u_starts, u_counts = np.unique(
+                s_rows, return_index=True, return_counts=True)
+
+            for i, row_i in enumerate(uniq):
+                si = sparse_in[row_i]
+                sp_indices = s_cols[u_starts[i]:u_starts[i] + u_counts[i]]
                 new_species = set(species_lists[si])
                 before = len(new_species)
-                for c in cols:
-                    new_species.update(species_lists[nb_global[row_i, c]])
-
+                new_species.update(sp_list[j] for j in sp_indices)
                 added = len(new_species) - before
                 if added > 0:
                     species_lists[si] = list(new_species)
@@ -614,7 +771,7 @@ class H3DataPreprocessor:
         lats: np.ndarray,
         lons: np.ndarray,
         weeks: np.ndarray,
-        species_lists: List[List[int]],
+        species_lists: List[List[str]],
         env_features: pd.DataFrame,
         fit: bool = True,
         max_obs_per_species: int = 0,
@@ -680,7 +837,7 @@ class H3DataPreprocessor:
 
     def compute_species_freq_weights(
         self,
-        species_lists: List[List[int]],
+        species_lists: List[List[str]],
         lats: np.ndarray,
         lons: np.ndarray,
         min_weight: float = 0.1,
@@ -793,9 +950,9 @@ class H3DataPreprocessor:
 
     def _cap_observations(
         self,
-        species_lists: List[List[int]],
+        species_lists: List[List[str]],
         max_obs: int,
-    ) -> Tuple[List[List[int]], int]:
+    ) -> Tuple[List[List[str]], int]:
         """Cap per-species observations to reduce dominance of common species.
 
         For each species that appears in more than *max_obs* samples, a random
@@ -804,7 +961,7 @@ class H3DataPreprocessor:
         that lose all species remain as valid all-negative training examples.
 
         Args:
-            species_lists: List of taxonKey lists per sample.
+            species_lists: List of species-code lists per sample.
             max_obs: Maximum positive samples per species.
 
         Returns:

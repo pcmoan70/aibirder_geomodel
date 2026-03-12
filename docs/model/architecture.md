@@ -45,11 +45,23 @@ graph TD
 
     subgraph Heads
         I["Species Head<br/>(multi-label classification)"]
-        J["Environmental Head<br/>(regression, training only)"]
+        J["Environmental Head<br/>(regression)"]
     end
 
     H --> I
     H --> J
+
+    subgraph "Habitat Head (optional)"
+        K["Habitat-Species Head<br/>(env → species)"]
+        L["Learned Gate σ(W·emb + b)"]
+        M["gate × direct +<br/>(1−gate) × habitat"]
+    end
+
+    J -.->|detach| K
+    K --> M
+    I --> M
+    H --> L
+    L --> M
 ```
 
 ## Components
@@ -68,7 +80,7 @@ $$
 - **Longitude**: same as latitude (8 features)
 - **Week**: mapped to $[0, 2\pi)$ over 48 weeks, then encoded with `week_harmonics` harmonics (default 8 → 16 features)
 
-Spatial input features: $2 \times 2 \times \text{coord\_harmonics}$ = 16 by default.  Week features (16) are used for FiLM conditioning rather than concatenated.
+Spatial input features: $2 \times 2 \times n$ = 16 by default (where $n$ = `coord_harmonics`).  Week features (16) are used for FiLM conditioning rather than concatenated.
 
 Year-round predictions (week 0) are computed at inference time as the **max** across all 48 weekly predictions — no special week-0 encoding is needed.
 
@@ -96,7 +108,34 @@ Output: raw logits (apply sigmoid for probabilities).
 
 ### Environmental Prediction Head
 
-A regression head that predicts normalized environmental features (elevation, temperature, precipitation, etc.) from the shared embedding. Only used during training as an auxiliary objective.
+A regression head that predicts normalized environmental features (elevation, temperature, precipitation, etc.) from the shared embedding. Used during training as an auxiliary objective. When the habitat-species head is enabled (see below), the environmental head also runs during inference so its output can feed the habitat pathway.
+
+### Habitat-Species Association Head (optional)
+
+Enabled with `--habitat_head`, this head creates an **explicit pathway from predicted environment to species occurrence**, making the relationship directly learnable rather than implicit in the shared encoder.
+
+**Architecture:**
+
+1. **Input**: predicted environmental features from the environmental head, **detached** (`env_pred.detach()`) so species-loss gradients don't corrupt the env head's MSE regression objective — the env head learns clean environmental representations from MSE alone
+2. **Projection** + residual blocks + **low-rank bottleneck** → species logits (same structure as the species head)
+3. **Learned gate**: a per-species gate $g = \sigma(W \cdot e + b)$ conditioned on the encoder embedding $e$ combines the two pathways:
+
+$$
+\hat{y} = g \cdot y_{\text{direct}} + (1 - g) \cdot y_{\text{habitat}}
+$$
+
+The gate is initialized with zero weights and bias = 3 ($\sigma(3) \approx 0.95$), so the **direct species head strongly dominates initially** and the habitat contribution only fades in once the env and habitat heads have learned useful representations.
+
+4. **Auxiliary habitat loss**: the same species loss function is applied directly to the habitat head's logits (before gating) with weight `--habitat_weight` (default 0.5). This gives the habitat head a full-strength learning signal independent of the gate value — critical because the gate initially suppresses the habitat contribution to ~5%.
+
+**Why this helps:**
+
+- The direct species head learns spatial-temporal patterns from coordinates alone
+- The habitat head learns explicit environment→species associations (e.g., "high elevation + conifer forest → Clark's Nutcracker")
+- The stop-gradient ensures the env head produces stable, accurate environmental features, while the habitat head learns from those clean representations
+- Together, they enable the model to predict species in **unobserved areas** with similar environments to observed ones — without needing data-level label propagation
+
+**Parameter overhead:** the gate linear layer adds `embed_dim × n_species` parameters; the habitat head itself is similar in size to the environmental head. At scale 0.5 with 12K species, this adds ~3.9M parameters.
 
 ## Model Scaling
 

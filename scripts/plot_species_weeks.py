@@ -38,7 +38,7 @@ def predict_all_weeks(checkpoint_path: str, lat: float, lon: float, device: str 
     Run inference for all 48 weeks.
 
     Returns:
-        idx_to_species: dict mapping model index → taxonKey
+        idx_to_species: dict mapping model index → species code
         labels: dict mapping model index → (sciName, comName)
         probs: np.ndarray of shape (48, n_species) — rows 0–47 = weeks 1–48
     """
@@ -58,6 +58,7 @@ def predict_all_weeks(checkpoint_path: str, lat: float, lon: float, device: str 
         model_scale=model_config.get('model_scale', 1.0),
         coord_harmonics=model_config.get('coord_harmonics', 8),
         week_harmonics=model_config.get('week_harmonics', 4),
+        habitat_head=model_config.get('habitat_head', False),
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(dev)
@@ -75,7 +76,11 @@ def predict_all_weeks(checkpoint_path: str, lat: float, lon: float, device: str 
         probs = torch.sigmoid(output['species_logits']).cpu().numpy()  # (48, n_species)
 
     # Load labels
-    labels_path = Path(checkpoint_path).parent / 'labels.txt'
+    ckpt_dir = Path(checkpoint_path).parent
+    ckpt_stem = Path(checkpoint_path).stem
+    labels_path = ckpt_dir / f'{ckpt_stem}_labels.txt'
+    if not labels_path.exists():
+        labels_path = ckpt_dir / 'labels.txt'
     labels = load_labels(str(labels_path)) if labels_path.exists() else {}
 
     return idx_to_species, labels, probs
@@ -84,22 +89,26 @@ def predict_all_weeks(checkpoint_path: str, lat: float, lon: float, device: str 
 def resolve_species_by_name(
     species_names: List[str],
     idx_to_species: Dict,
-    labels: Dict[int, Tuple[str, str]],
-) -> List[Tuple[int, int, str, str]]:
+    labels: Dict[int, Tuple[str, str, str]],
+) -> List[Tuple[int, str, str, str]]:
     """Resolve species names to model indices via fuzzy substring match.
 
-    Returns list of (model_index, taxonKey, sciName, comName).
+    Returns list of (model_index, speciesCode, sciName, comName).
     """
     results = []
     for name_query in species_names:
         query_lower = name_query.lower().strip()
         found = False
-        for idx_key, taxon_key in idx_to_species.items():
+        for idx_key, species_id in idx_to_species.items():
             idx = int(idx_key)
-            sci, com = labels.get(idx, (str(taxon_key), str(taxon_key)))
+            label = labels.get(idx)
+            if label:
+                code, sci, com = label
+            else:
+                code = sci = com = str(species_id)
             if query_lower in sci.lower() or query_lower in com.lower():
                 if not any(r[0] == idx for r in results):
-                    results.append((idx, int(taxon_key), sci, com))
+                    results.append((idx, code, sci, com))
                     found = True
                     break
         if not found:
@@ -107,11 +116,11 @@ def resolve_species_by_name(
     return results
 
 
-def load_ground_truth(data_path: str, lat: float, lon: float) -> Dict[int, Set[int]]:
+def load_ground_truth(data_path: str, lat: float, lon: float) -> Dict[int, Set[str]]:
     """Load ground truth species observations for the H3 cell at (lat, lon).
 
     Returns:
-        gt_by_week: dict mapping week (1–48) → set of taxonKeys observed.
+        gt_by_week: dict mapping week (1–48) → set of species IDs observed.
         Empty dict if the cell is not found in the data.
     """
     import h3
@@ -128,13 +137,13 @@ def load_ground_truth(data_path: str, lat: float, lon: float) -> Dict[int, Set[i
         return {}
 
     row = cell_data.iloc[0]
-    gt: Dict[int, Set[int]] = {}
+    gt: Dict[int, Set[str]] = {}
     for w in range(1, NUM_WEEKS + 1):
         col = f'week_{w}'
         if col in df.columns:
             species = row[col]
             if isinstance(species, (list, np.ndarray)):
-                gt[w] = {int(s) for s in species}
+                gt[w] = {str(s) for s in species}
             else:
                 gt[w] = set()
         else:
@@ -143,15 +152,15 @@ def load_ground_truth(data_path: str, lat: float, lon: float) -> Dict[int, Set[i
 
 
 def _add_gt_markers(
-    ax, taxon_key: int, gt_by_week: Dict[int, Set[int]],
+    ax, species_code: str, gt_by_week: Dict[int, Set[str]],
     weeks: np.ndarray, yearly_x: float,
 ):
     """Overlay ground truth presence markers (green ◆) on a species subplot."""
     if not gt_by_week:
         return
-    present_weeks = [w for w in weeks if taxon_key in gt_by_week.get(int(w), set())]
+    present_weeks = [w for w in weeks if species_code in gt_by_week.get(int(w), set())]
     yearly_present = any(
-        taxon_key in gt_by_week.get(w, set()) for w in range(1, NUM_WEEKS + 1)
+        species_code in gt_by_week.get(w, set()) for w in range(1, NUM_WEEKS + 1)
     )
     xs = list(present_weeks)
     if yearly_present:
@@ -194,12 +203,12 @@ def plot_species_weeks(
         # Resolve named species
         resolved = resolve_species_by_name(species_names, idx_to_species, labels)
         species_info = []
-        for idx, taxon_key, sci_name, com_name in resolved:
+        for idx, species_code, sci_name, com_name in resolved:
             week_probs = weekly_probs[:, idx]
             yearly_prob = float(yearly_probs[idx])
             max_prob = max(float(week_probs.max()), yearly_prob)
             species_info.append({
-                'taxon_key': taxon_key,
+                'species_code': species_code,
                 'sci_name': sci_name,
                 'com_name': com_name,
                 'max_prob': max_prob,
@@ -209,16 +218,20 @@ def plot_species_weeks(
     else:
         # Select species based on yearly probability (threshold + top_k)
         species_info = []
-        for idx_key, taxon_key in idx_to_species.items():
+        for idx_key, species_id in idx_to_species.items():
             idx = int(idx_key)
-            taxon_key = int(taxon_key)
+            species_code = str(species_id)
             week_probs = weekly_probs[:, idx]
             yearly_prob = float(yearly_probs[idx])
             if yearly_prob >= threshold:
-                sci_name, com_name = labels.get(idx, (str(taxon_key), str(taxon_key)))
+                label = labels.get(idx)
+                if label:
+                    code, sci_name, com_name = label
+                else:
+                    code = sci_name = com_name = species_code
                 max_prob = max(float(week_probs.max()), yearly_prob)
                 species_info.append({
-                    'taxon_key': taxon_key,
+                    'species_code': species_code,
                     'sci_name': sci_name,
                     'com_name': com_name,
                     'max_prob': max_prob,
@@ -260,7 +273,7 @@ def plot_species_weeks(
             ax.bar(yearly_x, sp['yearly_prob'], width=1.5, color=yearly_color,
                    edgecolor='black', linewidth=0.5)
 
-            _add_gt_markers(ax, sp['taxon_key'], gt_by_week, weeks, yearly_x)
+            _add_gt_markers(ax, sp['species_code'], gt_by_week, weeks, yearly_x)
 
             ax.set_xlim(0.5, yearly_x + 1.5)
             ax.set_ylim(0, 1.0)
@@ -295,7 +308,7 @@ def plot_species_weeks(
         ax.bar(yearly_x, sp['yearly_prob'], width=1.5, color=yearly_color,
                edgecolor='black', linewidth=0.5)
 
-        _add_gt_markers(ax, sp['taxon_key'], gt_by_week, weeks, yearly_x)
+        _add_gt_markers(ax, sp['species_code'], gt_by_week, weeks, yearly_x)
 
         ax.set_xlim(0.5, yearly_x + 1.5)
         ax.set_ylim(0, 1.0)
@@ -341,7 +354,7 @@ def plot_species_weeks(
             ax.bar(yearly_x, sp['yearly_prob'], width=1.5, color=yearly_color,
                    edgecolor='black', linewidth=0.5)
 
-            _add_gt_markers(ax, sp['taxon_key'], gt_by_week, weeks, yearly_x)
+            _add_gt_markers(ax, sp['species_code'], gt_by_week, weeks, yearly_x)
 
             ax.set_xlim(0.5, yearly_x + 1.5)
             ax.set_ylim(0, 1.0)

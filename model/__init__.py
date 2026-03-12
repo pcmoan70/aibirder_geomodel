@@ -5,6 +5,7 @@ from .model import (
     SpatioTemporalEncoder,
     SpeciesPredictionHead,
     EnvironmentalPredictionHead,
+    HabitatSpeciesHead,
     create_model
 )
 
@@ -20,6 +21,7 @@ __all__ = [
     'SpatioTemporalEncoder',
     'SpeciesPredictionHead',
     'EnvironmentalPredictionHead',
+    'HabitatSpeciesHead',
     'create_model',
     'MultiTaskLoss',
     'compute_pos_weights',

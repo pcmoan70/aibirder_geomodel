@@ -34,50 +34,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from utils.data import H3DataLoader, H3DataPreprocessor
 
 
-def load_taxonomy(taxonomy_path: Optional[str] = None) -> Dict[int, Tuple[str, str]]:
-    """Load taxonomy CSV mapping taxonKey → (scientificName, commonName)."""
-    taxonomy: Dict[int, Tuple[str, str]] = {}
+def load_taxonomy(taxonomy_path: Optional[str] = None) -> Dict[str, Tuple[str, str]]:
+    """Load taxonomy CSV mapping speciesCode → (scientificName, commonName).
+
+    Auto-detects taxonomy.csv or data/taxonomy.csv if *taxonomy_path* is not
+    provided, falling back to checkpoints/labels.txt (tab-separated
+    code/sciName/comName format).
+    """
+    taxonomy: Dict[str, Tuple[str, str]] = {}
 
     if taxonomy_path is None:
-        # Auto-detect: try taxonomy.csv first, fall back to labels.txt
         for candidate in ['taxonomy.csv', 'data/taxonomy.csv']:
             if Path(candidate).exists():
                 taxonomy_path = candidate
                 break
 
     if taxonomy_path is None or not Path(taxonomy_path).exists():
-        # Try labels.txt as fallback (taxonKey\tsciName\tcomName)
-        for labels_candidate in ['checkpoints/labels.txt', 'demo/labels.txt']:
-            p = Path(labels_candidate)
-            if p.exists():
-                with open(p, encoding='utf-8') as f:
-                    for line in f:
-                        parts = line.rstrip('\n').split('\t')
-                        if len(parts) >= 3:
-                            try:
-                                taxonomy[int(parts[0])] = (parts[1], parts[2])
-                            except ValueError:
-                                continue
-                return taxonomy
+        # Fallback: labels.txt (code\tsciName\tcomName)
+        labels_path = Path('checkpoints/labels.txt')
+        if labels_path.exists():
+            with open(labels_path, encoding='utf-8') as f:
+                for line in f:
+                    parts = line.rstrip('\n').split('\t')
+                    if len(parts) >= 3:
+                        taxonomy[parts[0]] = (parts[1], parts[2])
+            return taxonomy
         return taxonomy
 
     with open(taxonomy_path, encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            try:
-                key = int(row.get('id', row.get('taxonKey', row.get('taxon_key', 0))))
-                sci = (row.get('sciName (Clements/eBird/ML)')
-                       or row.get('scientificName')
-                       or row.get('scientific_name')
-                       or row.get('sciName (GBIF)', ''))
-                com = (row.get('comNameEn (Clements/eBird/ML)')
-                       or row.get('commonName')
-                       or row.get('common_name')
-                       or sci)
-                if key > 0 and sci:
-                    taxonomy[key] = (sci, com)
-            except (ValueError, KeyError):
-                continue
+            code = (row.get('species_code', '') or '').strip()
+            sci = (row.get('sci_name', '') or row.get('scientificName', '') or '').strip()
+            com = (row.get('com_name', '') or row.get('commonName', '') or sci).strip()
+            if code and sci:
+                taxonomy[code] = (sci, com)
 
     return taxonomy
 
@@ -109,12 +100,12 @@ def get_cell_samples(
     return np.where(mask)[0]
 
 
-def species_name(taxon_key: int, taxonomy: Dict[int, Tuple[str, str]]) -> str:
+def species_name(species_id: str, taxonomy: Dict[str, Tuple[str, str]]) -> str:
     """Format a species name string."""
-    if taxon_key in taxonomy:
-        sci, com = taxonomy[taxon_key]
+    if species_id in taxonomy:
+        sci, com = taxonomy[species_id]
         return f"{com} ({sci})" if com != sci else sci
-    return str(taxon_key)
+    return str(species_id)
 
 
 def plot_weekly_comparison(
@@ -296,6 +287,8 @@ def main():
                         help='Max geographic radius in km (default: 2000)')
     parser.add_argument('--propagate_min_obs', type=int, default=3,
                         help='Sparsity threshold (default: 3)')
+    parser.add_argument('--propagate_max_spread', type=float, default=2.0,
+                        help='Restrict propagation distance by species range radius factor')
     parser.add_argument('--no_yearly', action='store_true',
                         help='Exclude yearly (week 0) samples')
     parser.add_argument('--outdir', type=str, default='outputs/plots/propagation',
@@ -323,11 +316,13 @@ def main():
 
     # Run propagation on the copy
     print("Running label propagation...")
+    
     H3DataPreprocessor.propagate_env_labels(
         lats, lons, weeks, species_after, env_features,
         k=args.propagate_k,
         max_radius_km=args.propagate_max_radius,
         min_obs_threshold=args.propagate_min_obs,
+        max_spread_factor=args.propagate_max_spread,
     )
 
     # Global summary plot

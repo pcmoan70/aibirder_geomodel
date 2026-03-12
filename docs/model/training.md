@@ -43,6 +43,8 @@ The training script handles the full pipeline automatically:
 | `--model_scale` | `0.5` | Continuous scaling factor (0.5 ≈ 1.8M, 1.0 ≈ 7M, 2.0 ≈ 36M params) |
 | `--coord_harmonics` | `4` | Harmonics for lat/lon encoding |
 | `--week_harmonics` | `8` | Harmonics for week encoding |
+| `--habitat_head` | off | Enable habitat-species association head (env → species pathway with learned gate) |
+| `--habitat_weight` | `0.1` | Weight for auxiliary habitat-species loss (only used with `--habitat_head`) |
 
 ### Training
 
@@ -67,14 +69,16 @@ The training script handles the full pipeline automatically:
 | `--min_obs_per_species` | `50` | Exclude species with fewer than N observations (0 = keep all) |
 | `--ocean_sample_rate` | `1.0` | Fraction of ocean cells (water > 90%) to keep (1.0 = keep all) |
 | `--no_yearly` | off | Exclude week-0 (yearly) samples from training |
+| `--no_cache` | off | Disable data preprocessing cache (force reprocessing) |
 | `--jitter` | off | Jitter training coordinates within H3 cells each epoch |
 | `--label_freq_weight` | off | Weight positive labels by region-normalized species frequency |
 | `--label_freq_weight_min` | `0.01` | Minimum label weight for rare species |
-| `--label_freq_weight_pct_lo` | `1` | Lower percentile threshold (species at or below get min weight) |
-| `--label_freq_weight_pct_hi` | `99` | Upper percentile threshold (species at or above get weight 1.0) |
+| `--label_freq_weight_pct_lo` | `10` | Lower percentile threshold (species at or below get min weight) |
+| `--label_freq_weight_pct_hi` | `95` | Upper percentile threshold (species at or above get weight 1.0) |
 | `--propagate_labels` | off | Propagate species labels from observed to sparse cells via env similarity |
 | `--propagate_k` | `5` | Number of nearest env-space neighbors for propagation |
 | `--propagate_max_radius` | `2000` | Geographic radius cap in km for propagation |
+| `--propagate_max_spread` | `2.0` | Species range expansion multiplier (0 = disable range check) |
 | `--propagate_min_obs` | `3` | Samples with fewer species than this receive propagated labels |
 
 ### Learning Rate Schedule
@@ -95,7 +99,7 @@ $$
 \text{GeoScore} = \frac{\sum_{i} w_i \cdot s_i}{\sum_{i} w_i}
 $$
 
-where each $s_i$ is a component score normalised to $[0, 1]$ (higher = better):
+where each $s_i$ is a component score normalized to $[0, 1]$ (higher = better):
 
 | Component | Key | Weight | Transform |
 |---|---|---|---|
@@ -103,13 +107,13 @@ where each $s_i$ is a component score normalised to $[0, 1]$ (higher = better):
 | Classification quality | `F1 @ 10%` | 0.20 | as-is |
 | List-length calibration | `list_ratio @ 10%` | 0.15 | $\max(0,\; 1 - \lvert\ln(\text{LR})\rvert)$ |
 | Endemic species | `watchlist_mean_ap` | 0.10 | as-is |
-| Geographic generalisation | `holdout_map` | 0.10 | as-is (out-of-region mAP) |
+| Geographic generalization | `holdout_map` | 0.10 | as-is (out-of-region mAP) |
 | Density robustness | `mAP_density_ratio` | 0.20 | as-is (sparse / dense) |
 | Decorrelation | `pred_density_corr` | 0.05 | $\max(0,\; 1 - \lvert r\rvert)$ |
 
 !!! info "Why a composite metric?"
 
-    Optimising mAP alone can push the model toward over-predicting species
+    Optimizing mAP alone can push the model toward over-predicting species
     (inflating recall at the cost of precision) or ignoring rare/endemic
     species.  GeoScore guards against this by explicitly rewarding:
 
@@ -117,9 +121,9 @@ where each $s_i$ is a component score normalised to $[0, 1]$ (higher = better):
       species lists are close in length to observed lists.
     - **Endemic coverage** — watchlist AP prevents the model from focusing
       exclusively on common species.
-    - **Bias robustness** — density ratio and decorrelation penalise
+    - **Bias robustness** — density ratio and decorrelation penalize
       models that merely mirror observer effort patterns.
-    - **Geographic generalisation** — holdout mAP measures performance
+    - **Geographic generalization** — holdout mAP measures performance
       on geographically held-out regions, rewarding models that
       extrapolate beyond their training distribution.
 
@@ -163,6 +167,23 @@ When `--jitter` is passed, Gaussian noise is added to training coordinates every
 - **Each draw is independent** — the same sample receives different noise every epoch.
 - Latitude is clamped to $[-90, 90]$; longitude wraps at $\pm 180°$.
 
+### Data Preprocessing Cache
+
+Training caches the fully preprocessed train/val split to disk so that
+subsequent runs with the same data and preprocessing settings skip the
+expensive loading, normalization, and splitting steps.
+
+Cache files are stored in `<checkpoint_dir>/.data_cache/` and keyed by a
+SHA-256 hash of the input file identity (path, mtime, size) plus all
+CLI flags that affect data preprocessing (loss type, species thresholds,
+propagation settings, etc.).
+
+- **Automatic invalidation** — changing the data file or any preprocessing
+  flag produces a new hash, so a fresh cache is built.
+- **`--no_cache`** — disables caching entirely (always reprocesses).
+- **Safe writes** — cache files are written atomically via a temporary
+  file and rename.
+
 ### Region Hold-Out (Observation Bias Evaluation)
 
 | Flag | Default | Description |
@@ -205,8 +226,8 @@ quartile (Q1) and the dense quartile (Q4).
 
 | Metric | Description |
 |---|---|
-| **mAP\_sparse** | mAP for bottom-25% density locations |
-| **mAP\_dense** | mAP for top-25% density locations |
+| **mAP_sparse** | mAP for bottom-25% density locations |
+| **mAP_dense** | mAP for top-25% density locations |
 | **mAP density ratio** | sparse / dense (higher = more robust, 1.0 = no bias) |
 | **pred–density _r_** | Pearson correlation between obs density and predicted species count (lower = less biased) |
 
@@ -249,8 +270,8 @@ where $p_i = \sigma(z_i)$ and $p_m = \max(p_i - m,\, 0)$ is the probability afte
     severe, and aggressive negative suppression with γ-=4 can cause the model
     to under-predict rare species.  **γ-=2 is a conservative default** that
     still down-weights easy negatives while preserving enough gradient signal
-    from moderately-confident negatives.  The ablation study (A10) tests
-    γ-∈{2, 4, 6} to find the best trade-off.
+    from moderately-confident negatives.  Experimenting with
+    γ-∈{2, 4, 6} can help find the best trade-off for your dataset.
 
 ### BCE
 
@@ -335,7 +356,7 @@ assumed-negative species, and $\lambda$ controls positive up-weighting.
     checklists (eBird) with higher detection reliability, so strong positive
     up-weighting can amplify false positives.  **λ=4 is a conservative
     default** that balances positive/negative gradients without over-correcting.
-    Increase if recall is too low; the ablation autotune searches 1–64.
+    Increase if recall is too low; try values in the range 1–64.
 
 Enable with `--species_loss an`:
 
@@ -438,13 +459,13 @@ percentile positions (with default `pct_lo=1`, `pct_hi=99`,
 
 | Regional percentile | Label weight | Category |
 |---|---|---|
-| ≤ 1 (pct\_lo) | **0.01** | Rare — minimal gradient contribution |
+| ≤ 1 (pct_lo) | **0.01** | Rare — minimal gradient contribution |
 | 10 | 0.10 | Uncommon |
 | 25 | 0.25 | Below average |
 | 50 | 0.50 | Average |
 | 75 | 0.76 | Common |
 | 90 | 0.91 | Very common |
-| ≥ 99 (pct\_hi) | **1.00** | Abundant — full gradient contribution |
+| ≥ 99 (pct_hi) | **1.00** | Abundant — full gradient contribution |
 
 #### Parameters
 
@@ -452,8 +473,8 @@ percentile positions (with default `pct_lo=1`, `pct_hi=99`,
 |---|---|---|
 | `--label_freq_weight` | off | Enable region-normalized label weighting |
 | `--label_freq_weight_min` | `0.01` | Minimum weight assigned to rare species |
-| `--label_freq_weight_pct_lo` | `1` | Regional percentile at or below which species get min weight |
-| `--label_freq_weight_pct_hi` | `99` | Regional percentile at or above which species get weight 1.0 |
+| `--label_freq_weight_pct_lo` | `10` | Regional percentile at or below which species get min weight |
+| `--label_freq_weight_pct_hi` | `95` | Regional percentile at or above which species get weight 1.0 |
 
 ```bash
 python train.py --label_freq_weight --label_freq_weight_min 0.01
@@ -482,16 +503,19 @@ species encoding, so propagated species participate fully in training.
 2. **Normalize environmental features** — StandardScaler fit on all
    samples, NaN columns dropped.
 3. **Build a KD-tree** on the observed (non-sparse) samples'
-   normalised env vectors, grouped by week (each of the 48 weeks
+   normalized env vectors, grouped by week (each of the 48 weeks
    plus week 0 gets its own tree so that seasonal species don't
    leak across weeks).
 4. **Query** *k* nearest neighbors (`--propagate_k`, default 5) in
    env-feature space for each sparse sample.
 5. **Filter by geographic distance** — discard any neighbor farther than
    `--propagate_max_radius` km (default 2000) using haversine distance.
-   This prevents biogeographically nonsensical transfers (e.g. copying
-   Himalayan species to the Andes just because both are high-elevation).
-6. **Merge** the neighbor species into the sparse sample's list
+6. **Filter by species range** — for each species in a neighbor list,
+   check if the target cell is within `--propagate_max_spread` (default 2.0)
+   multiples of the species' observed range radius from its centroid.
+   This prevents island endemics (e.g. Hawaii-specific birds) from
+   leaking onto the mainland just because the environment matches.
+7. **Merge** the neighbor species into the sparse sample's list
    (union, no duplicates).
 
 #### Parameters
@@ -501,6 +525,7 @@ species encoding, so propagated species participate fully in training.
 | `--propagate_labels` | off | Enable env-neighbor label propagation |
 | `--propagate_k` | 5 | Number of nearest env-space neighbors |
 | `--propagate_max_radius` | 2000 | Geographic radius cap (km) |
+| `--propagate_max_spread` | 2.0 | Species range expansion multiplier |
 | `--propagate_min_obs` | 3 | Sparsity threshold (species count) |
 
 !!! tip
@@ -528,7 +553,7 @@ $$
 The environmental MSE loss regularizes the spatial embedding. Default weights: species=1.0, env=0.5.
 
 Environmental features with missing values (NaN) are excluded from the MSE
-computation via masked loss — the model is not penalised for positions where
+computation via masked loss — the model is not penalized for positions where
 the ground truth is unknown.
 
 ## Training Features
@@ -551,7 +576,7 @@ The trainer saves:
 
 - `checkpoint_latest.pt` — after every save interval and on early stopping
 - `checkpoint_best.pt` — whenever validation GeoScore improves
-- `labels.txt` — species vocabulary (taxonKey → scientific name → common name)
+- `labels.txt` — species vocabulary (species code → scientific name → common name)
 - `training_history.json` — per-epoch losses, learning rate, and evaluation metrics
 
 Each checkpoint contains the full model state, optimizer state, scheduler state, AMP scaler, and species vocabulary — everything needed to resume training or run inference.
@@ -579,7 +604,7 @@ During each validation epoch, the following metrics are computed and recorded:
 | **mAP density ratio** | sparse/dense ratio (1.0 = no observation bias effect) |
 | **pred–density _r_** | Pearson correlation between obs density and predicted species count |
 
-Metrics are printed after each epoch and saved in `training_history.json`. Use [`scripts/plot_training.py`](../plotting/training-curves.md) to visualise them.
+Metrics are printed after each epoch and saved in `training_history.json`. Use [`scripts/plot_training.py`](../plotting/training-curves.md) to visualize them.
 
 ### Watchlist Species
 
@@ -647,7 +672,7 @@ the CLI and stay fixed across all trials.
 | `--autotune_trials` | `30` | Number of Optuna trials |
 | `--autotune_epochs` | `15` | Epochs per trial |
 
-Each trial trains a fresh model and optimises towards validation GeoScore.  Optuna's `MedianPruner` kills unpromising trials early (after 3 warmup epochs).  Results are saved to `checkpoints/autotune/autotune_results.json`, and a suggested `train.py` command with the best parameters is printed.
+Each trial trains a fresh model and optimizes towards validation GeoScore.  Optuna's `MedianPruner` kills unpromising trials early (after 3 warmup epochs).  Results are saved to `checkpoints/autotune/autotune_results.json`, and a suggested `train.py` command with the best parameters is printed.
 
 ## References
 

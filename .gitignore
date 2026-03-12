@@ -1,3 +1,6 @@
+# Exclude species data
+species-data/
+
 # Exclude report dir
 report/
 

@@ -70,62 +70,16 @@ def load_taxonomy(taxonomy_path):
         common_names (dict): Mapping of sciName to common name (English).
     """
     df = pd.read_csv(taxonomy_path)
-    valid_names = set()
+    valid_names = set(df['sci_name'].dropna().unique())
     common_names: dict = {}
 
     # Build sciName → commonName lookup from primary name column
-    common_col = 'comNameEn (Clements/eBird/ML)'
-    fallback_col = 'comNameEn (IOC)'
+    for _, row in df.iterrows():
+        sci = str(row.get('sci_name', '')).strip()
+        com = str(row.get('com_name', '')).strip()
+        if sci:
+            common_names[sci] = com if com else sci
 
-    # Collect names from synonym lists (covers primary names too)
-    # and map each synonym to its row's common name.
-    # Two passes: first synonyms, then primary names (which always win).
-    primary_col = 'sciName (Clements/eBird/ML)'
-    if 'sciNameSynonyms' in df.columns:
-        for _, row in df.iterrows():
-            val = row.get('sciNameSynonyms')
-            if pd.isna(val):
-                continue
-            try:
-                names = ast.literal_eval(str(val))
-                if isinstance(names, list):
-                    valid_names.update(names)
-                    # Resolve common name: prefer Clements, fallback IOC, else sci name
-                    com = row.get(common_col)
-                    if pd.isna(com) or not str(com).strip():
-                        com = row.get(fallback_col)
-                    if pd.isna(com) or not str(com).strip():
-                        com = row.get(primary_col, '')
-                    com = str(com).strip() if not pd.isna(com) else ''
-                    for n in names:
-                        if n and n not in common_names:
-                            common_names[n] = com if com else n
-            except (ValueError, SyntaxError):
-                pass
-
-    # Second pass: primary scientific names always override synonym mappings.
-    # E.g. Vireo olivaceus is both a synonym of Vireo chivi AND a species in
-    # its own right (Red-eyed Vireo).  The primary entry must win.
-    if primary_col in df.columns:
-        for _, row in df.iterrows():
-            sci = row.get(primary_col)
-            if pd.isna(sci) or not str(sci).strip():
-                continue
-            sci = str(sci).strip()
-            com = row.get(common_col)
-            if pd.isna(com) or not str(com).strip():
-                com = row.get(fallback_col)
-            if pd.isna(com) or not str(com).strip():
-                continue  # no common name to override with
-            com = str(com).strip()
-            common_names[sci] = com  # unconditional override
-
-    # Also add explicit sci name columns as fallback
-    for col in ['sciName (Clements/eBird/ML)', 'sciName (GBIF)', 'sciName (IOC)']:
-        if col in df.columns:
-            valid_names.update(df[col].dropna().astype(str).values)
-
-    valid_names.discard('')
     logging.info(f"Loaded {len(valid_names)} valid species names from taxonomy")
     return valid_names, common_names
 
@@ -189,7 +143,8 @@ def _filter_block(block_bytes):
 
     # Filter to valid taxonomic classes
     if valid_classes_set and not chunk.empty:
-        chunk = chunk[chunk['class'].str.lower().isin(valid_classes_set)]
+        # Normalize GBIF class names to lowercase for comparison with taxonomy classes
+        chunk = chunk[chunk['class'].str.lower().isin([c.lower() for c in valid_classes_set])]
 
     # Keep only full species (exactly one space → binomial name)
     if not chunk.empty:
