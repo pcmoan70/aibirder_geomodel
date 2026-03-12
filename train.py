@@ -80,9 +80,9 @@ WATCHLIST_SPECIES: Dict[str, str] = {
     'tui1':    'Tui',
     'kokako3': 'North Island Kokako',
     # Galápagos endemics
-    'hawhaw-gal': 'Galápagos Hawk',  # eBird code for Galápagos subspecies/population fallback
+    'galhaw1':    'Galápagos Hawk',
     'galrai1':    'Galápagos Rail',
-    'galpet1':    'Galápagos Petrel',
+    'galpet':     'Galápagos Petrel',
     # Other restricted-range
     'kagu1':  'Kagu',
     'calcon': 'California Condor',
@@ -921,6 +921,11 @@ def run_autotune(args, device: torch.device):
     del loader
     gc.collect()
 
+    # Save pre-propagation species lists for frequency weight computation.
+    # Propagation inflates counts for common species and skews regional
+    # percentile estimates, so weights must be derived from original data.
+    species_lists_original = list(species_lists) if args.propagate_labels else None
+
     # Environmental neighbor label propagation (before preprocessing)
     if args.propagate_labels:
         print("   Propagating labels from observed to sparse cells...")
@@ -958,18 +963,21 @@ def run_autotune(args, device: torch.device):
         {'label_freq_weight_min', 'label_freq_weight_pct_lo',
          'label_freq_weight_pct_hi'} & set(tune_params)
     )
+    # Use pre-propagation species lists for freq weights so propagated
+    # pseudo-labels don't skew regional abundance percentiles.
+    _freq_sl = species_lists_original if species_lists_original is not None else species_lists
     _freq_weights = preprocessor.compute_species_freq_weights(
-        species_lists, min_weight=args.label_freq_weight_min,
+        _freq_sl, min_weight=args.label_freq_weight_min,
         pct_lo=args.label_freq_weight_pct_lo,
         pct_hi=args.label_freq_weight_pct_hi,
         lats=inputs['lat'], lons=inputs['lon'],
     )
-    _species_lists_ref = species_lists if _tune_freq_shape else None
+    _species_lists_ref = _freq_sl if _tune_freq_shape else None
     _lats_ref = inputs['lat'] if _tune_freq_shape else None
     _lons_ref = inputs['lon'] if _tune_freq_shape else None
 
     # Free species_lists — no longer needed after vocab + weights
-    del species_lists
+    del species_lists, species_lists_original, _freq_sl
     gc.collect()
 
     print("4. Splitting data...")
@@ -1447,6 +1455,11 @@ def main():
     del loader
     gc.collect()
 
+    # Save pre-propagation species lists for frequency weight computation.
+    # Propagation inflates counts for common species and skews regional
+    # percentile estimates, so weights must be derived from original data.
+    species_lists_original = list(species_lists) if args.propagate_labels else None
+
     # Environmental neighbor label propagation (before preprocessing)
     if args.propagate_labels:
         print("   Propagating labels from observed to sparse cells...")
@@ -1476,18 +1489,20 @@ def main():
     n_env = info['n_env_features']
     print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
 
-    # Frequency-based label weights (computed from original species_lists)
+    # Frequency-based label weights — use pre-propagation species lists
+    # so pseudo-labels don't skew regional abundance percentiles.
     freq_weights = None
     if args.label_freq_weight:
+        _freq_sl = species_lists_original if species_lists_original is not None else species_lists
         freq_weights = preprocessor.compute_species_freq_weights(
-            species_lists, min_weight=args.label_freq_weight_min,
+            _freq_sl, min_weight=args.label_freq_weight_min,
             pct_lo=args.label_freq_weight_pct_lo,
             pct_hi=args.label_freq_weight_pct_hi,
             lats=inputs['lat'], lons=inputs['lon'],
         )
 
     # Free species_lists — no longer needed after vocab + weights
-    del species_lists
+    del species_lists, species_lists_original
     gc.collect()
 
     print("4. Splitting data...")
