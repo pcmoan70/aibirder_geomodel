@@ -23,11 +23,13 @@ Usage:
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import math
 import os
+import pickle
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -56,6 +58,72 @@ TUNABLE_PARAMS = [
 ]
 
 
+
+
+# ---------------------------------------------------------------------------
+# Preprocessed data cache
+# ---------------------------------------------------------------------------
+
+# All CLI args that affect the final train/val split.  If any of these change,
+# the cache is invalidated.
+_DATA_CACHE_KEYS = [
+    'data_path',             # source parquet
+    'ocean_sample_rate',
+    'no_yearly',
+    'propagate_labels', 'propagate_k', 'propagate_max_radius',
+    'propagate_min_obs', 'propagate_max_spread',
+    'max_obs_per_species', 'min_obs_per_species',
+    'val_size', 'sample_fraction',
+    'holdout_regions',
+    'label_freq_weight', 'label_freq_weight_min',
+    'label_freq_weight_pct_lo', 'label_freq_weight_pct_hi',
+]
+
+
+def _data_cache_key(args) -> str:
+    """Build a deterministic hash from all args that affect preprocessing."""
+    h = hashlib.sha256()
+
+    # File identity: use mtime + size as a cheap fingerprint
+    p = Path(args.data_path)
+    stat = p.stat()
+    h.update(f"file:{p.resolve()}|mtime:{stat.st_mtime}|size:{stat.st_size}".encode())
+
+    # All data-affecting args
+    for key in _DATA_CACHE_KEYS:
+        val = getattr(args, key, None)
+        h.update(f"|{key}={val!r}".encode())
+
+    return h.hexdigest()[:16]
+
+
+def _data_cache_path(args) -> Path:
+    """Return the cache file path for the current data settings."""
+    digest = _data_cache_key(args)
+    cache_dir = Path(args.checkpoint_dir) / '.data_cache'
+    return cache_dir / f'preprocessed_{digest}.pkl'
+
+
+def _save_data_cache(path: Path, payload: dict) -> None:
+    """Persist preprocessed data to disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    with open(tmp, 'wb') as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.rename(path)  # atomic on POSIX
+
+
+def _load_data_cache(path: Path) -> Optional[dict]:
+    """Load preprocessed data from cache, or None if missing/corrupt."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except Exception as e:
+        print(f"   Cache load failed ({e}), reprocessing...")
+        path.unlink(missing_ok=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -902,101 +970,141 @@ def run_autotune(args, device: torch.device):
     print(f"  Objective:  GeoScore (maximize)")
     print(f"  Device:     {device}")
 
-    # -- Load data --------------------------------------------------------
-    print("\n1. Loading data...")
-    loader = H3DataLoader(args.data_path)
-    loader.load_data()
+    # -- Load data (with cache) ------------------------------------------
+    cache_path = _data_cache_path(args)
+    cached = None if args.no_cache else _load_data_cache(cache_path)
 
-    # Jitter scale is fixed by H3 resolution, compute once
-    _jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
+    if cached is not None:
+        print(f"\n   Using cached preprocessed data: {cache_path.name}")
+        train_in     = cached['train_in']
+        val_in       = cached['val_in']
+        train_tgt    = cached['train_tgt']
+        val_tgt      = cached['val_tgt']
+        preprocessor = cached['preprocessor']
+        _freq_weights = cached['freq_weights']
+        _jitter_std   = cached['jitter_std']
+        n_species     = cached['n_species']
+        n_env         = cached['n_env']
+        _species_lists_ref = cached.get('species_lists_ref')
+        _lats_ref     = cached.get('lats_ref')
+        _lons_ref     = cached.get('lons_ref')
+        print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}  |  "
+              f"Species: {n_species:,}  |  Env features: {n_env}")
+        del cached
+    else:
+        print("\n1. Loading data...")
+        loader = H3DataLoader(args.data_path)
+        loader.load_data()
 
-    # Build dataset once — data params are not tuned
-    print("2. Flattening to samples...")
-    lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
-        ocean_sample_rate=args.ocean_sample_rate,
-        include_yearly=not args.no_yearly,
-    )
+        # Jitter scale is fixed by H3 resolution, compute once
+        _jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
 
-    # Free the GeoDataFrame — no longer needed after flattening
-    del loader
-    gc.collect()
-
-    # Save pre-propagation species lists for frequency weight computation.
-    # Propagation inflates counts for common species and skews regional
-    # percentile estimates, so weights must be derived from original data.
-    species_lists_original = list(species_lists) if args.propagate_labels else None
-
-    # Environmental neighbor label propagation (before preprocessing)
-    if args.propagate_labels:
-        print("   Propagating labels from observed to sparse cells...")
-        
-        species_lists = H3DataPreprocessor.propagate_env_labels(
-            lats, lons, weeks, species_lists, env_features,
-            k=args.propagate_k,
-            max_radius_km=args.propagate_max_radius,
-            min_obs_threshold=args.propagate_min_obs,
-            max_spread_factor=args.propagate_max_spread,
+        # Build dataset once — data params are not tuned
+        print("2. Flattening to samples...")
+        lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
+            ocean_sample_rate=args.ocean_sample_rate,
+            include_yearly=not args.no_yearly,
         )
 
-    print("3. Preprocessing...")
-    preprocessor = H3DataPreprocessor()
-    inputs, targets = preprocessor.prepare_training_data(
-        lats, lons, weeks, species_lists, env_features, fit=True,
-        max_obs_per_species=args.max_obs_per_species,
-        min_obs_per_species=args.min_obs_per_species,
-    )
+        # Free the GeoDataFrame — no longer needed after flattening
+        del loader
+        gc.collect()
 
-    # Free raw flattened arrays — now encoded in inputs/targets
-    del lats, lons, weeks, env_features
-    gc.collect()
+        # Save pre-propagation species lists for frequency weight computation.
+        # Propagation inflates counts for common species and skews regional
+        # percentile estimates, so weights must be derived from original data.
+        species_lists_original = list(species_lists) if args.propagate_labels else None
 
-    info = preprocessor.get_preprocessing_info()
-    n_species = info['n_species']
-    n_env = info['n_env_features']
-    print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
+        # Environmental neighbor label propagation (before preprocessing)
+        if args.propagate_labels:
+            print("   Propagating labels from observed to sparse cells...")
+            
+            species_lists = H3DataPreprocessor.propagate_env_labels(
+                lats, lons, weeks, species_lists, env_features,
+                k=args.propagate_k,
+                max_radius_km=args.propagate_max_radius,
+                min_obs_threshold=args.propagate_min_obs,
+                max_spread_factor=args.propagate_max_spread,
+            )
 
-    # Pre-compute frequency-based label weights (cheap); per-trial
-    # decision whether to use them is made in the objective.
-    # When any weight shaping param is tuned, keep species_lists to
-    # recompute weights per trial with different values.
+        print("3. Preprocessing...")
+        preprocessor = H3DataPreprocessor()
+        inputs, targets = preprocessor.prepare_training_data(
+            lats, lons, weeks, species_lists, env_features, fit=True,
+            max_obs_per_species=args.max_obs_per_species,
+            min_obs_per_species=args.min_obs_per_species,
+        )
+
+        # Free raw flattened arrays — now encoded in inputs/targets
+        del lats, lons, weeks, env_features
+        gc.collect()
+
+        info = preprocessor.get_preprocessing_info()
+        n_species = info['n_species']
+        n_env = info['n_env_features']
+        print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
+
+        # Pre-compute frequency-based label weights (cheap); per-trial
+        # decision whether to use them is made in the objective.
+        # When any weight shaping param is tuned, keep species_lists to
+        # recompute weights per trial with different values.
+        _tune_freq_shape = bool(
+            {'label_freq_weight_min', 'label_freq_weight_pct_lo',
+             'label_freq_weight_pct_hi'} & set(tune_params)
+        )
+        # Use pre-propagation species lists for freq weights so propagated
+        # pseudo-labels don't skew regional abundance percentiles.
+        _freq_sl = species_lists_original if species_lists_original is not None else species_lists
+        _freq_weights = preprocessor.compute_species_freq_weights(
+            _freq_sl, min_weight=args.label_freq_weight_min,
+            pct_lo=args.label_freq_weight_pct_lo,
+            pct_hi=args.label_freq_weight_pct_hi,
+            lats=inputs['lat'], lons=inputs['lon'],
+        )
+        _species_lists_ref = _freq_sl if _tune_freq_shape else None
+        _lats_ref = inputs['lat'] if _tune_freq_shape else None
+        _lons_ref = inputs['lon'] if _tune_freq_shape else None
+
+        # Free species_lists — no longer needed after vocab + weights
+        del species_lists, species_lists_original, _freq_sl
+        gc.collect()
+
+        print("4. Splitting data...")
+        train_in, val_in, train_tgt, val_tgt = preprocessor.split_data(
+            inputs, targets, val_size=args.val_size,
+            random_state=42, split_by_location=True,
+        )
+
+        # Free unsplit data — now in train/val subsets
+        del inputs, targets
+        gc.collect()
+        # Subsample all splits once by location
+        if args.sample_fraction < 1.0:
+            train_in, train_tgt = preprocessor.subsample_by_location(
+                train_in, train_tgt, fraction=args.sample_fraction, random_state=42,
+            )
+            val_in, val_tgt = preprocessor.subsample_by_location(
+                val_in, val_tgt, fraction=args.sample_fraction, random_state=42,
+            )
+
+        # Save to cache for next run
+        print(f"   Saving preprocessed data cache: {cache_path.name}")
+        _save_data_cache(cache_path, {
+            'train_in': train_in, 'val_in': val_in,
+            'train_tgt': train_tgt, 'val_tgt': val_tgt,
+            'preprocessor': preprocessor,
+            'freq_weights': _freq_weights,
+            'jitter_std': _jitter_std,
+            'n_species': n_species, 'n_env': n_env,
+            'species_lists_ref': _species_lists_ref,
+            'lats_ref': _lats_ref, 'lons_ref': _lons_ref,
+        })
+
+    # _tune_freq_shape depends on tune_params; compute here (outside cache)
     _tune_freq_shape = bool(
         {'label_freq_weight_min', 'label_freq_weight_pct_lo',
          'label_freq_weight_pct_hi'} & set(tune_params)
     )
-    # Use pre-propagation species lists for freq weights so propagated
-    # pseudo-labels don't skew regional abundance percentiles.
-    _freq_sl = species_lists_original if species_lists_original is not None else species_lists
-    _freq_weights = preprocessor.compute_species_freq_weights(
-        _freq_sl, min_weight=args.label_freq_weight_min,
-        pct_lo=args.label_freq_weight_pct_lo,
-        pct_hi=args.label_freq_weight_pct_hi,
-        lats=inputs['lat'], lons=inputs['lon'],
-    )
-    _species_lists_ref = _freq_sl if _tune_freq_shape else None
-    _lats_ref = inputs['lat'] if _tune_freq_shape else None
-    _lons_ref = inputs['lon'] if _tune_freq_shape else None
-
-    # Free species_lists — no longer needed after vocab + weights
-    del species_lists, species_lists_original, _freq_sl
-    gc.collect()
-
-    print("4. Splitting data...")
-    train_in, val_in, train_tgt, val_tgt = preprocessor.split_data(
-        inputs, targets, val_size=args.val_size,
-        random_state=42, split_by_location=True,
-    )
-
-    # Free unsplit data — now in train/val subsets
-    del inputs, targets
-    gc.collect()
-    # Subsample all splits once by location
-    if args.sample_fraction < 1.0:
-        train_in, train_tgt = preprocessor.subsample_by_location(
-            train_in, train_tgt, fraction=args.sample_fraction, random_state=42,
-        )
-        val_in, val_tgt = preprocessor.subsample_by_location(
-            val_in, val_tgt, fraction=args.sample_fraction, random_state=42,
-        )
 
     # Verify watchlist species survived subsampling / splitting
     _check_watchlist_coverage(
@@ -1365,6 +1473,8 @@ def main():
                         help='Path to taxonomy CSV (produced by combine.py). Auto-detected if omitted.')
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--save_every', type=int, default=5)
+    parser.add_argument('--no_cache', action='store_true',
+                        help='Force reprocessing of data even if a valid cache exists')
 
     # Device
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'])
@@ -1434,109 +1544,141 @@ def main():
         print(f"  Holdout:    {', '.join(args.holdout_regions)}")
     print(f"  Device:     {device}")
 
-    # -- Data loading & preprocessing ---
-    print("\n1. Loading data...")
-    loader = H3DataLoader(args.data_path)
-    loader.load_data()
+    # -- Data loading & preprocessing (with cache) ---
+    cache_path = _data_cache_path(args)
+    cached = None if args.no_cache else _load_data_cache(cache_path)
 
-    print("2. Flattening to samples...")
-    lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
-        ocean_sample_rate=args.ocean_sample_rate,
-        include_yearly=not args.no_yearly,
-    )
+    if cached is not None:
+        print(f"\n   Using cached preprocessed data: {cache_path.name}")
+        train_in    = cached['train_in']
+        val_in      = cached['val_in']
+        train_tgt   = cached['train_tgt']
+        val_tgt     = cached['val_tgt']
+        holdout_in  = cached['holdout_in']
+        holdout_tgt = cached['holdout_tgt']
+        preprocessor = cached['preprocessor']
+        freq_weights = cached['freq_weights']
+        jitter_std   = cached['jitter_std']
+        n_species    = cached['n_species']
+        n_env        = cached['n_env']
+        print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}  |  "
+              f"Species: {n_species:,}  |  Env features: {n_env}")
+        del cached
+    else:
+        print("\n1. Loading data...")
+        loader = H3DataLoader(args.data_path)
+        loader.load_data()
 
-    # Coordinate jitter
-    jitter_std = 0.0
-    if args.jitter:
-        jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
-        print(f"   Coordinate jitter: ±{jitter_std:.4f}° std")
-
-    # Free the GeoDataFrame — no longer needed after flattening
-    del loader
-    gc.collect()
-
-    # Save pre-propagation species lists for frequency weight computation.
-    # Propagation inflates counts for common species and skews regional
-    # percentile estimates, so weights must be derived from original data.
-    species_lists_original = list(species_lists) if args.propagate_labels else None
-
-    # Environmental neighbor label propagation (before preprocessing)
-    if args.propagate_labels:
-        print("   Propagating labels from observed to sparse cells...")
-        
-        species_lists = H3DataPreprocessor.propagate_env_labels(
-            lats, lons, weeks, species_lists, env_features,
-            k=args.propagate_k,
-            max_radius_km=args.propagate_max_radius,
-            min_obs_threshold=args.propagate_min_obs,
-            max_spread_factor=args.propagate_max_spread,
+        print("2. Flattening to samples...")
+        lats, lons, weeks, species_lists, env_features = loader.flatten_to_samples(
+            ocean_sample_rate=args.ocean_sample_rate,
+            include_yearly=not args.no_yearly,
         )
 
-    print("3. Preprocessing...")
-    preprocessor = H3DataPreprocessor()
-    inputs, targets = preprocessor.prepare_training_data(
-        lats, lons, weeks, species_lists, env_features, fit=True,
-        max_obs_per_species=args.max_obs_per_species,
-        min_obs_per_species=args.min_obs_per_species,
-    )
+        # Coordinate jitter
+        jitter_std = 0.0
+        if args.jitter:
+            jitter_std = loader.compute_jitter_std(loader.get_h3_cells())
+            print(f"   Coordinate jitter: ±{jitter_std:.4f}° std")
 
-    # Free raw flattened arrays — now encoded in inputs/targets
-    del lats, lons, weeks, env_features
-    gc.collect()
+        # Free the GeoDataFrame — no longer needed after flattening
+        del loader
+        gc.collect()
 
-    info = preprocessor.get_preprocessing_info()
-    n_species = info['n_species']
-    n_env = info['n_env_features']
-    print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
+        # Save pre-propagation species lists for frequency weight computation.
+        # Propagation inflates counts for common species and skews regional
+        # percentile estimates, so weights must be derived from original data.
+        species_lists_original = list(species_lists) if args.propagate_labels else None
 
-    # Frequency-based label weights — use pre-propagation species lists
-    # so pseudo-labels don't skew regional abundance percentiles.
-    freq_weights = None
-    if args.label_freq_weight:
-        _freq_sl = species_lists_original if species_lists_original is not None else species_lists
-        freq_weights = preprocessor.compute_species_freq_weights(
-            _freq_sl, min_weight=args.label_freq_weight_min,
-            pct_lo=args.label_freq_weight_pct_lo,
-            pct_hi=args.label_freq_weight_pct_hi,
-            lats=inputs['lat'], lons=inputs['lon'],
+        # Environmental neighbor label propagation (before preprocessing)
+        if args.propagate_labels:
+            print("   Propagating labels from observed to sparse cells...")
+            
+            species_lists = H3DataPreprocessor.propagate_env_labels(
+                lats, lons, weeks, species_lists, env_features,
+                k=args.propagate_k,
+                max_radius_km=args.propagate_max_radius,
+                min_obs_threshold=args.propagate_min_obs,
+                max_spread_factor=args.propagate_max_spread,
+            )
+
+        print("3. Preprocessing...")
+        preprocessor = H3DataPreprocessor()
+        inputs, targets = preprocessor.prepare_training_data(
+            lats, lons, weeks, species_lists, env_features, fit=True,
+            max_obs_per_species=args.max_obs_per_species,
+            min_obs_per_species=args.min_obs_per_species,
         )
 
-    # Free species_lists — no longer needed after vocab + weights
-    del species_lists, species_lists_original
-    gc.collect()
+        # Free raw flattened arrays — now encoded in inputs/targets
+        del lats, lons, weeks, env_features
+        gc.collect()
 
-    print("4. Splitting data...")
-    train_in, val_in, train_tgt, val_tgt = preprocessor.split_data(
-        inputs, targets, val_size=args.val_size,
-        random_state=42, split_by_location=True,
-    )
-    print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}")
+        info = preprocessor.get_preprocessing_info()
+        n_species = info['n_species']
+        n_env = info['n_env_features']
+        print(f"   Samples: {len(inputs['lat']):,}  |  Species: {n_species:,}  |  Env features: {n_env}")
 
-    # Free unsplit data — now in train/val subsets
-    del inputs, targets
-    gc.collect()
+        # Frequency-based label weights — use pre-propagation species lists
+        # so pseudo-labels don't skew regional abundance percentiles.
+        freq_weights = None
+        if args.label_freq_weight:
+            _freq_sl = species_lists_original if species_lists_original is not None else species_lists
+            freq_weights = preprocessor.compute_species_freq_weights(
+                _freq_sl, min_weight=args.label_freq_weight_min,
+                pct_lo=args.label_freq_weight_pct_lo,
+                pct_hi=args.label_freq_weight_pct_hi,
+                lats=inputs['lat'], lons=inputs['lon'],
+            )
 
-    # Subsample once by location if fraction < 1 (all splits).
-    if args.sample_fraction < 1.0:
-        train_in, train_tgt = preprocessor.subsample_by_location(
-            train_in, train_tgt, fraction=args.sample_fraction, random_state=42,
+        # Free species_lists — no longer needed after vocab + weights
+        del species_lists, species_lists_original
+        gc.collect()
+
+        print("4. Splitting data...")
+        train_in, val_in, train_tgt, val_tgt = preprocessor.split_data(
+            inputs, targets, val_size=args.val_size,
+            random_state=42, split_by_location=True,
         )
-        val_in, val_tgt = preprocessor.subsample_by_location(
-            val_in, val_tgt, fraction=args.sample_fraction, random_state=42,
-        )
+        print(f"   Train: {len(train_in['lat']):,}  |  Val: {len(val_in['lat']):,}")
 
-    # -- Region hold-out ---
-    holdout_bboxes = resolve_holdout_regions(args.holdout_regions) if args.holdout_regions else []
-    holdout_in = holdout_tgt = None
-    if holdout_bboxes:
-        region_names = ', '.join(args.holdout_regions)
-        # Mask holdout regions out of the training set
-        train_in, train_tgt, holdout_in, holdout_tgt = preprocessor.mask_regions(
-            train_in, train_tgt, holdout_bboxes,
-        )
-        n_holdout = len(holdout_in['lat'])
-        print(f"   Holdout regions ({region_names}): {n_holdout:,} samples removed from training")
-        print(f"   Train after holdout: {len(train_in['lat']):,}")
+        # Free unsplit data — now in train/val subsets
+        del inputs, targets
+        gc.collect()
+
+        # Subsample once by location if fraction < 1 (all splits).
+        if args.sample_fraction < 1.0:
+            train_in, train_tgt = preprocessor.subsample_by_location(
+                train_in, train_tgt, fraction=args.sample_fraction, random_state=42,
+            )
+            val_in, val_tgt = preprocessor.subsample_by_location(
+                val_in, val_tgt, fraction=args.sample_fraction, random_state=42,
+            )
+
+        # -- Region hold-out ---
+        holdout_bboxes = resolve_holdout_regions(args.holdout_regions) if args.holdout_regions else []
+        holdout_in = holdout_tgt = None
+        if holdout_bboxes:
+            region_names = ', '.join(args.holdout_regions)
+            # Mask holdout regions out of the training set
+            train_in, train_tgt, holdout_in, holdout_tgt = preprocessor.mask_regions(
+                train_in, train_tgt, holdout_bboxes,
+            )
+            n_holdout = len(holdout_in['lat'])
+            print(f"   Holdout regions ({region_names}): {n_holdout:,} samples removed from training")
+            print(f"   Train after holdout: {len(train_in['lat']):,}")
+
+        # Save to cache for next run
+        print(f"   Saving preprocessed data cache: {cache_path.name}")
+        _save_data_cache(cache_path, {
+            'train_in': train_in, 'val_in': val_in,
+            'train_tgt': train_tgt, 'val_tgt': val_tgt,
+            'holdout_in': holdout_in, 'holdout_tgt': holdout_tgt,
+            'preprocessor': preprocessor,
+            'freq_weights': freq_weights,
+            'jitter_std': jitter_std,
+            'n_species': n_species, 'n_env': n_env,
+        })
 
     # Verify watchlist species survived subsampling / splitting
     _check_watchlist_coverage(
