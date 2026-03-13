@@ -60,3 +60,10 @@ graph LR
 - [Model Architecture](model/architecture.md) — how the neural network works
 - [API Reference](api/model.md) — Python API documentation
 - [GitHub Repository](https://github.com/birdnet-team/geomodel)
+
+## License
+
+The source code is licensed under the [MIT License](https://github.com/birdnet-team/geomodel/blob/main/LICENSE).
+
+Trained model weights are licensed under [Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons.org/licenses/by-sa/4.0/).
+See the [Terms of Use](https://github.com/birdnet-team/geomodel/blob/main/TERMS_OF_USE.md) for full terms.

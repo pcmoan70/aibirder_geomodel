@@ -456,6 +456,13 @@ def convert(
         shutil.copy2(labels_src, outpath / "labels.txt")
         print(f"Copied {labels_src.name} → {outpath / 'labels.txt'}")
 
+    # Copy MODEL_LICENSE.txt alongside exports
+    license_src = Path(__file__).resolve().parent / "MODEL_LICENSE.txt"
+    if license_src.exists():
+        import shutil
+        shutil.copy2(license_src, outpath / "MODEL_LICENSE.txt")
+        print(f"Copied MODEL_LICENSE.txt → {outpath / 'MODEL_LICENSE.txt'}")
+
     # Run conversions
     results: Dict[str, bool] = {}
     dispatch = {

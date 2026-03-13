@@ -167,7 +167,10 @@ Then open <http://localhost:8000/demo/> in your browser.
 ```
 
 ## License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+The source code is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
+Trained model weights are licensed under [Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons.org/licenses/by-sa/4.0/). See [TERMS_OF_USE.md](TERMS_OF_USE.md) for full terms.
 
 ## Funding
 
