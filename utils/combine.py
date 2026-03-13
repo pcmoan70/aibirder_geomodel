@@ -208,7 +208,12 @@ def combine_data(
                 temp_tax = pd.read_csv(taxonomy_path)
                 classes = temp_tax['class_name'].unique().tolist()
                 logging.info(f"Using classes from taxonomy: {classes}")
-            except Exception:
+            except Exception as e:
+                logging.warning(
+                    "Could not load class_name values from taxonomy at %s (%s); defaulting to ['Aves']",
+                    taxonomy_path,
+                    e,
+                )
                 classes = ['Aves']
         else:
             classes = ['Aves']

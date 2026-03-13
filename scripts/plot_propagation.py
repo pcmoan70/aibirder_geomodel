@@ -79,7 +79,7 @@ def find_nearest_cell(
     lats: np.ndarray,
     lons: np.ndarray,
 ) -> int:
-    """Find the index of the first sample at the nearest H3 cell centre."""
+    """Find the index of the first sample at the nearest H3 cell center."""
     # H3 cells repeat across weeks, so find the unique location nearest to target
     d = (lats - target_lat) ** 2 + (lons - target_lon) ** 2
     # Get unique locations

@@ -93,7 +93,10 @@ The training script handles the full pipeline automatically:
 
 GeoScore combines validation metrics into a single 0–1 value.
 It is the **primary optimization target**: early stopping, best-checkpoint
-selection, and Optuna autotune all maximise GeoScore.
+selection, and Optuna autotune all maximize GeoScore.
+
+Implementation note: the GeoScore computation lives in
+`model/metrics.py` (`compute_geoscore`) and is imported by `train.py`.
 
 $$
 \text{GeoScore} = \frac{\sum_{i} w_i \cdot s_i}{\sum_{i} w_i}
@@ -163,7 +166,7 @@ Key properties:
 
 When `--jitter` is passed, Gaussian noise is added to training coordinates every time a sample is drawn.  The noise standard deviation is derived automatically from the H3 cell resolution (40 % of the average edge length in degrees), so most jittered points stay inside their originating cell.
 
-- **Validation and test sets are never jittered** — they always use exact cell centres.
+- **Validation and test sets are never jittered** — they always use exact cell centers.
 - **Each draw is independent** — the same sample receives different noise every epoch.
 - Latitude is clamped to $[-90, 90]$; longitude wraps at $\pm 180°$.
 
@@ -245,7 +248,7 @@ quartile (Q1) and the dense quartile (Q4).
 
 ### Asymmetric Loss
 
-Asymmetric Loss (ASL; Ridnik et al., 2021) is a multi-label focal loss variant that applies **separate focusing parameters** to positive and negative samples.  In species distribution modelling the vast majority of labels are negative (a given species is absent from most locations), so ASL aggressively down-weights easy negatives while keeping all positive signal intact.
+Asymmetric Loss (ASL; Ridnik et al., 2021) is a multi-label focal loss variant that applies **separate focusing parameters** to positive and negative samples.  In species distribution modeling the vast majority of labels are negative (a given species is absent from most locations), so ASL aggressively down-weights easy negatives while keeping all positive signal intact.
 
 $$
 \mathcal{L}_{\text{ASL}} = \frac{1}{N}\sum_i
@@ -631,7 +634,10 @@ This loads the model, optimizer, scheduler, and scaler states and continues trai
 
 ## Hyperparameter Autotune
 
-Automatically search for optimal hyperparameters using [Optuna](https://optuna.org/) (Akiba et al., 2019; Bayesian optimisation with TPE sampler and median pruning).
+Automatically search for optimal hyperparameters using [Optuna](https://optuna.org/) (Akiba et al., 2019; Bayesian optimization with TPE sampler and median pruning).
+
+Implementation note: the autotune runner and parameter search space live in
+`model/autotune.py` and are called from top-level `train.py`.
 
 ```bash
 python train.py --data_path data.parquet --autotune                  # tune all params

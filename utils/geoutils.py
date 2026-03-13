@@ -225,7 +225,7 @@ def compute_environmental_data(h3_indexes: Iterable[str], scale: int = 30, field
     # available. We prefer `USGS/GMTED2010_FULL` then fall back to the
     # legacy `USGS/GMTED2010` name if needed. If neither fallback is
     # available the pipeline will still use SRTM and the existing silent
-    # nearest-neighbour fill will attempt to improve coverage.
+    # nearest-neighbor fill will attempt to improve coverage.
     elev_img = None
     if 'elevation' in fields:
         try:
@@ -506,8 +506,8 @@ def compute_environmental_data(h3_indexes: Iterable[str], scale: int = 30, field
             try:
                 if built_frac_f is not None and built_frac_f > 0.5:
                     lc_class = 13
-            except Exception:
-                pass
+            except Exception as e:
+                LOG.debug('Could not coerce built fraction %r to landcover class: %s', built_frac_f, e)
             row['landcover_class'] = lc_class
         if 'canopy' in fields:
             row['canopy_height_m'] = canopy_m
@@ -578,12 +578,12 @@ def export_geoparquet(gdf: gpd.GeoDataFrame, out_path: str) -> None:
 
 def fill_missing_with_nearest(gdf: gpd.GeoDataFrame, columns: Optional[List[str]] = None) -> gpd.GeoDataFrame:
     """Fill missing values in `gdf` by copying the value from the nearest
-    neighbour that has a non-missing value.
+    neighbor that has a non-missing value.
 
     - `columns`: list of columns to process. If None, all non-geometry, non-id
       columns will be considered.
 
-    This uses centroids of geometries and a simple nearest-neighbour search
+    This uses centroids of geometries and a simple nearest-neighbor search
     implemented with NumPy; it's memory-efficient for moderate-sized GeoDataFrames.
     """
     if columns is None:
@@ -812,8 +812,8 @@ def combine_parquet_parts(parts_dir: str, out_path: Optional[str] = None, patter
                             if new_geom is not None and not new_geom.is_valid:
                                 try:
                                     new_geom = new_geom.buffer(0)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    LOG.debug('Failed to repair normalized geometry at index %s: %s', idx, e)
                             combined.at[idx, 'geometry'] = new_geom
                         except Exception:
                             LOG.debug('Failed normalizing geometry at index %s', idx)
@@ -965,8 +965,8 @@ def run_global_in_chunks(target_km: int = 10, out_dir: Optional[str] = None, bou
     if progress is not None:
         try:
             progress.close()
-        except Exception:
-            pass
+        except Exception as e:
+            LOG.debug('Failed to close progress bar cleanly: %s', e)
 
     return written
 

@@ -18,7 +18,7 @@ python convert.py --formats all                      # everything
 | ONNX FP16 | `onnx_fp16` | ~9 MB | Half-precision ONNX (default) |
 | TFLite FP32 | `tflite` | ~19 MB | TensorFlow Lite, full precision |
 | TFLite FP16 | `tflite_fp16` | ~10 MB | TensorFlow Lite, half precision |
-| TFLite INT8 | `tflite_int8` | ~5 MB | TensorFlow Lite, dynamic-range quantisation |
+| TFLite INT8 | `tflite_int8` | ~5 MB | TensorFlow Lite, dynamic-range quantization |
 | TF SavedModel | `tf` | ~19 MB | TensorFlow SavedModel directory |
 
 Use `--formats all` to export everything at once.
@@ -93,6 +93,12 @@ TFLite and TF SavedModel additionally require:
 ```bash
 pip install tensorflow onnx2tf
 ```
+
+!!! note "TFLite runtime requirement"
+    This model uses GELU, which maps to `tf.Erf` during conversion. TFLite
+    therefore emits Select TF Ops (`FlexErf`) for FP32/FP16 exports. Run
+    these models with a TensorFlow Lite runtime that includes the Flex
+    delegate (`SELECT_TF_OPS`).
 
 The script will print a clear error message if a required package is missing — it does not fail silently.
 

@@ -203,7 +203,7 @@ class SpatioTemporalEncoder(nn.Module):
         for block, film_gen in zip(self.blocks, self.film_generators):
             film = film_gen(week_features)        # (batch, 2*embed_dim)
             gamma, beta = film.chunk(2, dim=1)    # each (batch, embed_dim)
-            gamma = gamma + 1.0                   # centre around identity
+            gamma = gamma + 1.0                   # center around identity
             x = block(x) * gamma + beta
 
         return self.norm(x)

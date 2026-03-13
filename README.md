@@ -79,7 +79,7 @@ A multi-task neural network that learns spatial-temporal patterns from coordinat
 - **Input:** Raw (lat, lon, week) — circular encoding is handled inside the model
 - **Primary task:** Multi-label species classification (BCE default; ASL, focal, AN also available)
 - **Auxiliary task:** Environmental feature regression (training only, acts as regularizer)
-- **Habitat head** (optional, `--habitat_head`)**:** predicted env features → species logits, combined with direct head via learned gate — makes environment→species relationships explicit
+- **Habitat head** (optional, `--habitat_head`): predicted env features → species logits, combined with direct head via learned gate — makes environment→species relationships explicit
 - **Scalable:** ~1.8M (scale=0.5) to ~36M (scale=2.0) parameters with ~12K species (default scale=1.0 ≈ 7M)
 - **Tiny footprint:** Under 10 MB (≈ 7 MB at FP16) — replaces hundreds of MB of raw eBird/iNat observation data while interpolating into survey gaps and smoothing geographic biases
 
@@ -116,21 +116,28 @@ geomodel/
 ├── convert.py               # Export to ONNX / TFLite / TF SavedModel
 ├── model/
 │   ├── model.py             # Neural network architecture
-│   └── loss.py              # Multi-task loss functions
+│   ├── loss.py              # Multi-task loss functions
+│   ├── metrics.py           # GeoScore and validation metric helpers
+│   └── autotune.py          # Optuna hyperparameter autotune runner
 ├── utils/
 │   ├── geoutils.py          # H3 grid + Earth Engine (Stage 1)
 │   ├── gbifutils.py         # GBIF processing (Stage 2)
 │   ├── combine.py           # Join geodata + GBIF (Stage 3)
-│   └── data.py              # Dataset / DataLoader / preprocessing
+│   ├── data.py              # Dataset / DataLoader / preprocessing
+│   ├── regions.py           # Holdout region definitions
+│   └── taxonomy.py          # Taxonomy utilities
 ├── scripts/                 # Plotting & diagnostic scripts
 ├── docs/                    # MkDocs documentation source
 │   └── demo/                # Interactive web demo (ONNX Runtime Web)
+├── exports/                 # Exported model files + labels + license
 └── checkpoints/             # Model checkpoints + labels.txt
 ```
 
 ## Interactive Demo
 
 An interactive web demo is included under `docs/demo/`. It runs the ONNX FP16 model entirely client-side using [ONNX Runtime Web](https://onnxruntime.ai/docs/tutorials/web/) — no server-side inference needed.
+
+Demo model assets are produced with top-level `convert.py` and then copied into `docs/demo/` (`geomodel_fp16.onnx`, `labels.txt`).
 
 Features:
 - **Range Map** — select a species to see its predicted occurrence probability on a Leaflet map. Resolution adapts to the zoom level (coarser when zoomed out, finer when zoomed in).
