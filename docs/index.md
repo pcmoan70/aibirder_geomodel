@@ -8,6 +8,11 @@
 
 BirdNET Geomodel predicts which species are likely to occur at a given location and time of year. It uses a multi-task neural network trained on [GBIF](https://www.gbif.org/) occurrence data and environmental features from [Google Earth Engine](https://earthengine.google.com/), producing species occurrence probabilities that serve as a prior for filtering acoustic detection results from [BirdNET](https://birdnet.cornell.edu/).
 
+<p align="center">
+  <img src="demo_migrants.gif" alt="Animated range maps of 12 migratory species across 48 weeks" width="100%">
+</p>
+Figure 1: Animated range maps of 12 migratory species across 48 weeks of the year. Each frame shows predicted occurrence probabilities for a single week, with darker colors indicating higher probabilities.
+
 ## What It Is — and What It Isn't
 
 The geomodel is a **convenience tool for casual users and citizen scientists** who want to get the most out of BirdNET without expert ornithological knowledge. If you don't know which birds to expect at your recording location, the geomodel provides a reasonable prior that helps BirdNET suppress unlikely species and surface the most plausible detections.
@@ -55,3 +60,10 @@ graph LR
 - [Model Architecture](model/architecture.md) — how the neural network works
 - [API Reference](api/model.md) — Python API documentation
 - [GitHub Repository](https://github.com/birdnet-team/geomodel)
+
+## License
+
+The source code is licensed under the [MIT License](https://github.com/birdnet-team/geomodel/blob/main/LICENSE).
+
+Trained model weights are licensed under [Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons.org/licenses/by-sa/4.0/).
+See the [Terms of Use](https://github.com/birdnet-team/geomodel/blob/main/TERMS_OF_USE.md) for full terms.

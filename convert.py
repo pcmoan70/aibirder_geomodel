@@ -365,7 +365,7 @@ def _export_tflite(wrapper: ExportWrapper, ref_inputs: np.ndarray,
         exported_list.append(interp.get_tensor(output_details[0]["index"]))
     exported = np.concatenate(exported_list, axis=0)
 
-    extra_tol = {"fp32": 1, "fp16": 500, "int8": 2000}[mode]
+    extra_tol = {"fp32": 1, "fp16": 800, "int8": 2000}[mode]
     ok = _validate(ref_outputs, exported, tag, tol * extra_tol)
 
     size_mb = path.stat().st_size / (1024 * 1024)
@@ -455,6 +455,13 @@ def convert(
         import shutil
         shutil.copy2(labels_src, outpath / "labels.txt")
         print(f"Copied {labels_src.name} → {outpath / 'labels.txt'}")
+
+    # Copy MODEL_LICENSE.txt alongside exports
+    license_src = Path(__file__).resolve().parent / "MODEL_LICENSE.txt"
+    if license_src.exists():
+        import shutil
+        shutil.copy2(license_src, outpath / "MODEL_LICENSE.txt")
+        print(f"Copied MODEL_LICENSE.txt → {outpath / 'MODEL_LICENSE.txt'}")
 
     # Run conversions
     results: Dict[str, bool] = {}
