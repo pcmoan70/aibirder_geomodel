@@ -137,6 +137,8 @@ geomodel/
 
 An interactive web demo is included under `docs/demo/`. It runs the ONNX FP16 model entirely client-side using [ONNX Runtime Web](https://onnxruntime.ai/docs/tutorials/web/) — no server-side inference needed.
 
+Demo model assets are produced with top-level `convert.py` and then copied into `docs/demo/` (`geomodel_fp16.onnx`, `labels.txt`).
+
 Features:
 - **Range Map** — select a species to see its predicted occurrence probability on a Leaflet map. Resolution adapts to the zoom level (coarser when zoomed out, finer when zoomed in).
 - **Richness Map** — predicted species count per grid cell, color-coded from low to high.

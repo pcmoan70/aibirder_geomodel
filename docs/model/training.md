@@ -166,7 +166,7 @@ Key properties:
 
 When `--jitter` is passed, Gaussian noise is added to training coordinates every time a sample is drawn.  The noise standard deviation is derived automatically from the H3 cell resolution (40 % of the average edge length in degrees), so most jittered points stay inside their originating cell.
 
-- **Validation and test sets are never jittered** — they always use exact cell centres.
+- **Validation and test sets are never jittered** — they always use exact cell centers.
 - **Each draw is independent** — the same sample receives different noise every epoch.
 - Latitude is clamped to $[-90, 90]$; longitude wraps at $\pm 180°$.
 
