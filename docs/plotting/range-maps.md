@@ -76,7 +76,7 @@ When `--data_path` is provided, H3 cells where the species was observed in the t
 
 A single animated GIF (e.g., `range_Barn-Swallow_House-Sparrow.gif`) where:
 
-- Each frame shows one of the 48 weeks, labelled with the week number and approximate month.
+- Each frame shows one of the 48 weeks, labeled with the week number and approximate month.
 - All requested species appear as subplots in a rows × cols grid.
 - Color scale is consistent across all 48 frames (per-species 99th percentile vmax).
 - A shared colorbar is shown at the bottom.

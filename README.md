@@ -79,7 +79,7 @@ A multi-task neural network that learns spatial-temporal patterns from coordinat
 - **Input:** Raw (lat, lon, week) — circular encoding is handled inside the model
 - **Primary task:** Multi-label species classification (BCE default; ASL, focal, AN also available)
 - **Auxiliary task:** Environmental feature regression (training only, acts as regularizer)
-- **Habitat head** (optional, `--habitat_head`)**:** predicted env features → species logits, combined with direct head via learned gate — makes environment→species relationships explicit
+- **Habitat head** (optional, `--habitat_head`): predicted env features → species logits, combined with direct head via learned gate — makes environment→species relationships explicit
 - **Scalable:** ~1.8M (scale=0.5) to ~36M (scale=2.0) parameters with ~12K species (default scale=1.0 ≈ 7M)
 - **Tiny footprint:** Under 10 MB (≈ 7 MB at FP16) — replaces hundreds of MB of raw eBird/iNat observation data while interpolating into survey gaps and smoothing geographic biases
 
