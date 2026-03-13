@@ -114,6 +114,9 @@ def _init_worker(header_bytes, valid_species_list, valid_classes_list, common_na
     _wctx['header'] = header_bytes
     _wctx['valid_species'] = set(valid_species_list) if valid_species_list else None
     _wctx['valid_classes'] = set(valid_classes_list) if valid_classes_list else None
+    _wctx['valid_classes_lower'] = (
+        {c.lower() for c in valid_classes_list} if valid_classes_list else None
+    )
     _wctx['common_names'] = dict(common_names_dict) if common_names_dict else {}
 
 
@@ -121,7 +124,7 @@ def _filter_block(block_bytes):
     """Parse a raw TSV byte block, filter rows, return (csv_str, n_rows, block_len)."""
     header = _wctx['header']
     valid_species = _wctx['valid_species']
-    valid_classes_set = _wctx['valid_classes']
+    valid_classes_set = _wctx.get('valid_classes_lower')
     common_names = _wctx['common_names']
 
     block_len = len(block_bytes)
@@ -130,7 +133,8 @@ def _filter_block(block_bytes):
     try:
         chunk = pd.read_csv(io.BytesIO(data), sep='\t', dtype=str,
                             usecols=REQUIRED_COLUMNS, on_bad_lines='skip')
-    except Exception:
+    except Exception as e:
+        logging.debug("Skipping GBIF block due to parse/read error: %s", e)
         return '', 0, block_len
 
     n_rows = len(chunk)
@@ -143,8 +147,8 @@ def _filter_block(block_bytes):
 
     # Filter to valid taxonomic classes
     if valid_classes_set and not chunk.empty:
-        # Normalize GBIF class names to lowercase for comparison with taxonomy classes
-        chunk = chunk[chunk['class'].str.lower().isin([c.lower() for c in valid_classes_set])]
+        # Normalize GBIF class names once and compare to pre-lowercased taxonomy classes.
+        chunk = chunk[chunk['class'].str.lower().isin(valid_classes_set)]
 
     # Keep only full species (exactly one space → binomial name)
     if not chunk.empty:

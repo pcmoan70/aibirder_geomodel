@@ -95,6 +95,9 @@ GeoScore combines validation metrics into a single 0–1 value.
 It is the **primary optimization target**: early stopping, best-checkpoint
 selection, and Optuna autotune all maximize GeoScore.
 
+Implementation note: the GeoScore computation lives in
+`model/metrics.py` (`compute_geoscore`) and is imported by `train.py`.
+
 $$
 \text{GeoScore} = \frac{\sum_{i} w_i \cdot s_i}{\sum_{i} w_i}
 $$
@@ -632,6 +635,9 @@ This loads the model, optimizer, scheduler, and scaler states and continues trai
 ## Hyperparameter Autotune
 
 Automatically search for optimal hyperparameters using [Optuna](https://optuna.org/) (Akiba et al., 2019; Bayesian optimization with TPE sampler and median pruning).
+
+Implementation note: the autotune runner and parameter search space live in
+`model/autotune.py` and are called from top-level `train.py`.
 
 ```bash
 python train.py --data_path data.parquet --autotune                  # tune all params

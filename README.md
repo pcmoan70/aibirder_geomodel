@@ -116,7 +116,9 @@ geomodel/
 ├── convert.py               # Export to ONNX / TFLite / TF SavedModel
 ├── model/
 │   ├── model.py             # Neural network architecture
-│   └── loss.py              # Multi-task loss functions
+│   ├── loss.py              # Multi-task loss functions
+│   ├── metrics.py           # GeoScore and validation metric helpers
+│   └── autotune.py          # Optuna hyperparameter autotune runner
 ├── utils/
 │   ├── geoutils.py          # H3 grid + Earth Engine (Stage 1)
 │   ├── gbifutils.py         # GBIF processing (Stage 2)

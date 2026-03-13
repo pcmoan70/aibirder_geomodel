@@ -106,6 +106,8 @@ nav:
   - API Reference:
       - model: api/model.md
       - model.loss: api/loss.md
+      - model.metrics: api/metrics.md
+      - model.autotune: api/autotune.md
       - utils.data: api/data.md
       - utils.geoutils: api/geoutils.md
       - utils.gbifutils: api/gbifutils.md
