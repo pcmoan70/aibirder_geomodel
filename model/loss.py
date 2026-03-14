@@ -161,11 +161,13 @@ class AssumeNegativeLoss(nn.Module):
         pos_lambda: float = 4.0,
         neg_samples: int = 1024,
         label_smoothing: float = 0.0,
+        logit_clip: float = 30.0,
     ):
         super().__init__()
         self.pos_lambda = pos_lambda
         self.neg_samples = neg_samples
         self.label_smoothing = label_smoothing
+        self.logit_clip = logit_clip
 
     def forward(
         self,
@@ -183,6 +185,13 @@ class AssumeNegativeLoss(nn.Module):
         """
         batch_size, n_species = logits.shape
 
+        # Compute AN loss in float32 for numerical stability under AMP.
+        logits = logits.float()
+        targets = targets.float()
+        if self.logit_clip > 0:
+            logits = logits.clamp(min=-self.logit_clip, max=self.logit_clip)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=self.logit_clip, neginf=-self.logit_clip)
+
         # Masks are computed from the original binary targets
         pos_mask = targets > 0.5   # (B, S)
         neg_mask = ~pos_mask       # (B, S)
@@ -193,10 +202,11 @@ class AssumeNegativeLoss(nn.Module):
 
         # Per-element BCE (unreduced)
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        bce = torch.nan_to_num(bce, nan=0.0, posinf=1e6, neginf=0.0)
 
         # --- Positive loss (weighted by λ) ---
         # Mean per-sample positive BCE, then mean across batch
-        pos_bce = bce * pos_mask.float()
+        pos_bce = torch.where(pos_mask, bce, torch.zeros_like(bce))
         pos_count = pos_mask.sum(dim=1).clamp(min=1).float()  # (B,)
         pos_loss = (pos_bce.sum(dim=1) / pos_count).mean()
 
@@ -204,7 +214,7 @@ class AssumeNegativeLoss(nn.Module):
         M = self.neg_samples
         if M <= 0 or M >= n_species:
             # Use all negatives
-            neg_bce = bce * neg_mask.float()
+            neg_bce = torch.where(neg_mask, bce, torch.zeros_like(bce))
             neg_count = neg_mask.sum(dim=1).clamp(min=1).float()
             neg_loss = (neg_bce.sum(dim=1) / neg_count).mean()
         else:
@@ -217,11 +227,15 @@ class AssumeNegativeLoss(nn.Module):
             sampled_targets = torch.gather(targets, 1, rand_indices)   # (B, M)
             # Only count the negatives among the sampled indices
             sampled_neg_mask = sampled_targets < 0.5
-            neg_bce = sampled_bce * sampled_neg_mask.float()
+            neg_bce = torch.where(sampled_neg_mask, sampled_bce, torch.zeros_like(sampled_bce))
             neg_count = sampled_neg_mask.sum(dim=1).clamp(min=1).float()
             neg_loss = (neg_bce.sum(dim=1) / neg_count).mean()
 
-        return self.pos_lambda * pos_loss + neg_loss
+        total = self.pos_lambda * pos_loss + neg_loss
+        if not torch.isfinite(total):
+            # Final guard: return finite value instead of propagating NaNs.
+            total = torch.nan_to_num(total, nan=0.0, posinf=1e6, neginf=0.0)
+        return total
 
 
 def masked_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
