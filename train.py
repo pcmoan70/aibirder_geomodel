@@ -346,7 +346,7 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            total_loss += _total.item()
+            total_loss += losses['total'].item()
             total_species += losses['species'].item()
             total_env += losses['env'].item()
             if 'habitat' in losses:
