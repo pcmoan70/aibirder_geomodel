@@ -13,6 +13,10 @@
    sync. If a feature is added or changed, update the matching docs page. Use
    Google-style docstrings. Add inline comments only where the *why* isn't obvious.
 
+3. **Use American English.** All prose — code comments, docstrings, documentation,
+   and report text — must use American English spelling (e.g. "modeling" not
+   "modelling", "optimization" not "optimisation", "maximize" not "maximise").
+
 ## Overview
 
 Spatiotemporal species occurrence prediction using H3 geospatial cells and weekly

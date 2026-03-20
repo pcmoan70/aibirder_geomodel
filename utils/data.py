@@ -309,6 +309,7 @@ class H3DataPreprocessor:
         self,
         species_lists: List[List[str]],
         min_obs_per_species: int = 0,
+        max_species: int = 0,
     ) -> None:
         """Build vocabulary of all unique species codes.
 
@@ -317,6 +318,9 @@ class H3DataPreprocessor:
                 for birds, iNat IDs for non-birds).
             min_obs_per_species: If >0, exclude species observed in fewer
                 than this many samples.  Default 0 (keep all).
+            max_species: If >0, randomly subsample the vocabulary to at
+                most this many species (after min-obs filtering).  Uses a
+                fixed seed for reproducibility.  Default 0 (keep all).
         """
         from collections import Counter
 
@@ -338,6 +342,11 @@ class H3DataPreprocessor:
                       f"({len(all_species):,} species kept)")
         else:
             all_species = set(counts.keys())
+
+        if max_species > 0 and len(all_species) > max_species:
+            rng = np.random.RandomState(42)
+            all_species = set(rng.choice(sorted(all_species), size=max_species, replace=False))
+            print(f"   Max-species filter: randomly selected {max_species:,} species")
 
         self.species_vocab = all_species
         self.species_to_idx = {s: i for i, s in enumerate(sorted(all_species))}
@@ -783,6 +792,7 @@ class H3DataPreprocessor:
         fit: bool = True,
         max_obs_per_species: int = 0,
         min_obs_per_species: int = 0,
+        max_species: int = 0,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         """Run full preprocessing: encode inputs, normalize targets, build vocab.
 
@@ -793,12 +803,15 @@ class H3DataPreprocessor:
                 dropped randomly.  Default 0 (no cap).
             min_obs_per_species: If >0, exclude species observed in fewer than
                 this many samples from the vocabulary.  Default 0 (keep all).
+            max_species: If >0, randomly subsample the vocabulary to at most
+                this many species.  Default 0 (keep all).
         """
         normalized_env = self.normalize_environmental_features(env_features, fit=fit)
         if fit:
             self.build_species_vocabulary(
                 species_lists,
                 min_obs_per_species=min_obs_per_species,
+                max_species=max_species,
             )
 
         # --- observation cap per species ---

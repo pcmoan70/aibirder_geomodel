@@ -56,7 +56,7 @@ _DATA_CACHE_KEYS = [
     'no_yearly',
     'propagate_labels', 'propagate_k', 'propagate_max_radius',
     'propagate_min_obs', 'propagate_max_spread',
-    'max_obs_per_species', 'min_obs_per_species',
+    'max_obs_per_species', 'min_obs_per_species', 'max_species',
     'val_size', 'sample_fraction',
     'holdout_regions',
     'label_freq_weight', 'label_freq_weight_min',
@@ -881,6 +881,8 @@ def main():
                         help='Cap observations per species to reduce common-species dominance (default: 0, 0=no cap)')
     parser.add_argument('--min_obs_per_species', type=int, default=50,
                         help='Exclude species with fewer than N observations (default: 50, 0=keep all)')
+    parser.add_argument('--max_species', type=int, default=0,
+                        help='Randomly subsample vocabulary to at most N species (default: 0, 0=all)')
     parser.add_argument('--ocean_sample_rate', type=float, default=1.0,
                         help='Fraction of ocean cells (water_fraction > 0.9) to keep (default: 1.0, 1.0=keep all)')
     parser.add_argument('--no_yearly', action='store_true',
@@ -1091,6 +1093,7 @@ def main():
             lats, lons, weeks, species_lists, env_features, fit=True,
             max_obs_per_species=args.max_obs_per_species,
             min_obs_per_species=args.min_obs_per_species,
+            max_species=args.max_species,
         )
 
         # Free raw flattened arrays — now encoded in inputs/targets
