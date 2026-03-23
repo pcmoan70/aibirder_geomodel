@@ -24,6 +24,8 @@ TUNABLE_PARAMS = [
     'focal_alpha', 'focal_gamma',
     'label_freq_weight', 'label_freq_weight_min',
     'label_freq_weight_pct_lo', 'label_freq_weight_pct_hi',
+    'propagate_k', 'propagate_max_radius',
+    'propagate_min_obs', 'propagate_max_spread',
 ]
 
 
@@ -63,6 +65,14 @@ def _suggest_param(trial, name: str, args):
         return trial.suggest_float('label_freq_weight_pct_lo', 1.0, 25.0)
     if name == 'label_freq_weight_pct_hi':
         return trial.suggest_float('label_freq_weight_pct_hi', 75.0, 99.0)
+    if name == 'propagate_k':
+        return trial.suggest_int('propagate_k', 1, 20)
+    if name == 'propagate_max_radius':
+        return trial.suggest_float('propagate_max_radius', 100.0, 5000.0, log=True)
+    if name == 'propagate_min_obs':
+        return trial.suggest_int('propagate_min_obs', 1, 20)
+    if name == 'propagate_max_spread':
+        return trial.suggest_float('propagate_max_spread', 0.5, 10.0)
     raise ValueError(f"Unknown tunable param: {name}")
 
 
@@ -91,6 +101,9 @@ def run_autotune(
         print(f"Available: {TUNABLE_PARAMS}")
         return
 
+    _PROPAGATION_PARAMS = {'propagate_k', 'propagate_max_radius', 'propagate_min_obs', 'propagate_max_spread'}
+    _tune_propagation = bool(_PROPAGATION_PARAMS & set(tune_params))
+
     n_trials = args.autotune_trials
     n_epochs = args.autotune_epochs
 
@@ -103,8 +116,12 @@ def run_autotune(
     print(f"  Objective:  GeoScore (maximize)")
     print(f"  Device:     {device}")
 
+    # Raw data references for per-trial re-propagation (set in fresh-load path).
+    _raw_lats = _raw_lons = _raw_weeks = _raw_species_lists = _raw_env = None
+
     cache_path = data_cache_path_fn(args)
-    cached = None if args.no_cache else load_data_cache_fn(cache_path)
+    # Skip cache when tuning propagation params — cached data has fixed propagation.
+    cached = None if (args.no_cache or _tune_propagation) else load_data_cache_fn(cache_path)
 
     if cached is not None:
         print(f"\n   Using cached preprocessed data: {cache_path.name}")
@@ -143,6 +160,16 @@ def run_autotune(
 
         species_lists_original = list(species_lists) if args.propagate_labels else None
 
+        # When tuning propagation params, save raw data before propagation.
+        # Each trial will re-propagate with its own suggested params.
+        if _tune_propagation:
+            import copy as _copy
+            _raw_lats = lats.copy()
+            _raw_lons = lons.copy()
+            _raw_weeks = weeks.copy()
+            _raw_species_lists = _copy.deepcopy(species_lists)
+            _raw_env = env_features.copy()
+
         if args.propagate_labels:
             print("   Propagating labels from observed to sparse cells...")
             species_lists = H3DataPreprocessor.propagate_env_labels(
@@ -171,6 +198,8 @@ def run_autotune(
         )
 
         del lats, lons, weeks, env_features
+        if not _tune_propagation:
+            del species_lists
         gc.collect()
 
         info = preprocessor.get_preprocessing_info()
@@ -286,22 +315,61 @@ def run_autotune(
         else:
             _trial_freq_weights = None
 
+        # -- Per-trial data when tuning propagation params ----------------
+        _t_train_in = train_in
+        _t_val_in = val_in
+        _t_train_tgt = train_tgt
+        _t_val_tgt = val_tgt
+        _t_n_species = n_species
+        _t_n_env = n_env
+
+        if _tune_propagation and _raw_species_lists is not None:
+            import copy as _copy
+            _trial_sl = _copy.deepcopy(_raw_species_lists)
+            _trial_sl = H3DataPreprocessor.propagate_env_labels(
+                _raw_lats, _raw_lons, _raw_weeks,
+                _trial_sl, _raw_env,
+                k=int(p['propagate_k']),
+                max_radius_km=float(p['propagate_max_radius']),
+                min_obs_threshold=int(p['propagate_min_obs']),
+                max_spread_factor=float(p['propagate_max_spread']),
+            )
+            _trial_pp = H3DataPreprocessor()
+            _trial_inputs, _trial_targets = _trial_pp.prepare_training_data(
+                _raw_lats, _raw_lons, _raw_weeks,
+                _trial_sl, _raw_env,
+                fit=True,
+                max_obs_per_species=args.max_obs_per_species,
+                min_obs_per_species=args.min_obs_per_species,
+            )
+            _t_info = _trial_pp.get_preprocessing_info()
+            _t_n_species = _t_info['n_species']
+            _t_n_env = _t_info['n_env_features']
+            _t_train_in, _t_val_in, _t_train_tgt, _t_val_tgt = _trial_pp.split_data(
+                _trial_inputs, _trial_targets,
+                val_size=args.val_size,
+                random_state=42,
+                split_by_location=True,
+            )
+            del _trial_sl, _trial_inputs, _trial_targets, _trial_pp
+            gc.collect()
+
         t_loader, v_loader = create_dataloaders(
-            train_in,
-            train_tgt,
-            val_in,
-            val_tgt,
+            _t_train_in,
+            _t_train_tgt,
+            _t_val_in,
+            _t_val_tgt,
             batch_size=batch_size,
             num_workers=args.num_workers,
             pin_memory=(device.type == 'cuda'),
-            n_species=n_species,
+            n_species=_t_n_species,
             jitter_std=jitter_std,
             species_freq_weights=_trial_freq_weights,
         )
 
         model = create_model(
-            n_species=n_species,
-            n_env_features=n_env,
+            n_species=_t_n_species,
+            n_env_features=_t_n_env,
             model_scale=float(p.get('model_scale', args.model_scale)),
             coord_harmonics=int(p.get('coord_harmonics', args.coord_harmonics)),
             week_harmonics=int(p.get('week_harmonics', args.week_harmonics)),
