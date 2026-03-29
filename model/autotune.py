@@ -31,7 +31,16 @@ TUNABLE_PARAMS = [
 
 
 def _suggest_param(trial, name: str, args):
-    """Suggest a value for *name* using the Optuna trial."""
+    """Suggest a value for *name* using the Optuna trial.
+
+    If ``args.autotune_ranges`` contains an override for *name*, use those
+    bounds instead of the defaults.  The override format per parameter is
+    ``[lo, hi]`` for float/int params or a list of allowed values for
+    categoricals.
+    """
+    overrides: dict = getattr(args, 'autotune_ranges', None) or {}
+    ov = overrides.get(name)
+
     if name == 'pos_lambda':
         return trial.suggest_float('pos_lambda', 1.0, 64.0, log=True)
     if name == 'neg_samples':
@@ -67,17 +76,23 @@ def _suggest_param(trial, name: str, args):
     if name == 'label_freq_weight_pct_hi':
         return trial.suggest_float('label_freq_weight_pct_hi', 75.0, 99.0)
     if name == 'propagate_k':
-        return trial.suggest_int('propagate_k', 1, 20)
+        lo, hi = (ov[0], ov[1]) if ov else (1, 20)
+        return trial.suggest_int('propagate_k', lo, hi)
     if name == 'propagate_max_radius':
-        return trial.suggest_float('propagate_max_radius', 100.0, 1500.0, log=True)
+        lo, hi = (ov[0], ov[1]) if ov else (100.0, 1500.0)
+        return trial.suggest_float('propagate_max_radius', lo, hi, log=True)
     if name == 'propagate_min_obs':
-        return trial.suggest_int('propagate_min_obs', 1, 20)
+        lo, hi = (ov[0], ov[1]) if ov else (1, 20)
+        return trial.suggest_int('propagate_min_obs', lo, hi)
     if name == 'propagate_max_spread':
-        return trial.suggest_float('propagate_max_spread', 0.5, 3.0)
+        lo, hi = (ov[0], ov[1]) if ov else (0.5, 3.0)
+        return trial.suggest_float('propagate_max_spread', lo, hi)
     if name == 'propagate_env_dist_max':
-        return trial.suggest_float('propagate_env_dist_max', 0.5, 5.0)
+        lo, hi = (ov[0], ov[1]) if ov else (0.5, 5.0)
+        return trial.suggest_float('propagate_env_dist_max', lo, hi)
     if name == 'propagate_range_cap':
-        return trial.suggest_float('propagate_range_cap', 200.0, 2000.0)
+        lo, hi = (ov[0], ov[1]) if ov else (200.0, 2000.0)
+        return trial.suggest_float('propagate_range_cap', lo, hi)
     raise ValueError(f"Unknown tunable param: {name}")
 
 
@@ -421,6 +436,11 @@ def run_autotune(
             else:
                 scheduler = cosine
 
+        species_vocab = {
+            'species_to_idx': preprocessor.species_to_idx,
+            'idx_to_species': preprocessor.idx_to_species,
+        }
+
         trainer = trainer_cls(
             model=model,
             criterion=criterion,
@@ -429,6 +449,8 @@ def run_autotune(
             device=device,
             checkpoint_dir=Path(args.checkpoint_dir) / 'autotune',
             patience=0,
+            species_vocab=species_vocab,
+            watchlist=watchlist_species,
         )
 
         best_geoscore = 0.0

@@ -906,21 +906,21 @@ def main():
     parser.add_argument('--propagate_labels', action='store_true',
                         help='Propagate species labels from observed to sparse/unobserved '
                              'cells using environmental feature similarity (KNN in env space)')
-    parser.add_argument('--propagate_k', type=int, default=5,
-                        help='Number of nearest env-space neighbors for label propagation (default: 5)')
-    parser.add_argument('--propagate_max_radius', type=float, default=2000.0,
-                        help='Geographic radius cap in km for label propagation (default: 2000)')
-    parser.add_argument('--propagate_min_obs', type=int, default=3,
-                        help='Samples with fewer species than this receive propagated labels (default: 3)')
+    parser.add_argument('--propagate_k', type=int, default=10,
+                        help='Number of nearest env-space neighbors for label propagation (default: 10)')
+    parser.add_argument('--propagate_max_radius', type=float, default=1000.0,
+                        help='Geographic radius cap in km for label propagation (default: 1000)')
+    parser.add_argument('--propagate_min_obs', type=int, default=10,
+                        help='Samples with fewer species than this receive propagated labels (default: 10)')
     parser.add_argument('--propagate_max_spread', type=float, default=2.0,
                         help='Restrict propagation distance by observed species range radius '
                              'multiplied by this factor (default: 2.0).  Set to 0 to disable.')
-    parser.add_argument('--propagate_env_dist_max', type=float, default=0.0,
+    parser.add_argument('--propagate_env_dist_max', type=float, default=2.0,
                         help='Max env-space Euclidean distance (post-StandardScaler) for a '
-                             'neighbor to contribute labels. 0 = disabled (default: 0).')
-    parser.add_argument('--propagate_range_cap', type=float, default=0.0,
-                        help='Hard cap in km on per-species propagation distance regardless '
-                             'of bounding-box range. 0 = disabled (default: 0).')
+                             'neighbor to contribute labels. 0 = disabled (default: 2.0).')
+    parser.add_argument('--propagate_range_cap', type=float, default=500.0,
+                        help='Hard cap in km on per-species propagation distance from '
+                             'nearest observation. 0 = disabled (default: 500).')
 
     # LR schedule
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],
@@ -972,8 +972,16 @@ def main():
                         help='Number of Optuna trials (default: 30)')
     parser.add_argument('--autotune_epochs', type=int, default=15,
                         help='Epochs per trial (default: 15)')
+    parser.add_argument('--autotune_ranges', type=str, default=None,
+                        help='JSON dict of search range overrides per param, '
+                             'e.g. \'{"propagate_k": [10, 20], "propagate_min_obs": [10, 20]}\'')
 
     args = parser.parse_args()
+
+    # Parse autotune_ranges JSON if provided
+    if args.autotune_ranges is not None:
+        import json as _json
+        args.autotune_ranges = _json.loads(args.autotune_ranges)
 
     device = torch.device(
         'cuda' if args.device == 'auto' and torch.cuda.is_available()

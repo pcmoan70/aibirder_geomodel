@@ -49,21 +49,22 @@ zero-init output layers. Encoder uses pre-norm residual blocks
 KNN-based label propagation fills sparse H3 cells from environmentally similar
 neighbors (`utils/data.py: H3DataPreprocessor.propagate_env_labels()`).
 
-Key parameters and their ecological constraints:
-- `--propagate_k` [1–20]: number of env-space neighbors
-- `--propagate_max_radius` [100–1500] km: geographic search radius
-- `--propagate_min_obs` [1–20]: minimum observations for a species to be donor-eligible
-- `--propagate_max_spread` [0.5–3.0]: per-species range cap as multiple of bounding-box diagonal
-- `--propagate_env_dist_max` [0.5–5.0]: Euclidean distance threshold in StandardScaler
+Key parameters and their ecological constraints (interim defaults, pending Stage K re-tune):
+- `--propagate_k` 10 [3–20]: number of env-space neighbors
+- `--propagate_max_radius` 1000 [200–1500] km: geographic search radius
+- `--propagate_min_obs` 10 [3–25]: minimum observations for a species to be donor-eligible
+- `--propagate_max_spread` 2.0 [0.5–3.0]: per-species range cap as multiple of bounding-box diagonal
+- `--propagate_env_dist_max` 2.0 [0.5–4.0]: Euclidean distance threshold in StandardScaler
   env space — rejects KNN neighbors too dissimilar environmentally
-- `--propagate_range_cap` [200–2000] km: hard km ceiling on per-species propagation
-  distance regardless of species range extent
+- `--propagate_range_cap` 500 [100–1000] km: hard km ceiling on per-species propagation
+  distance from nearest original observation
 
-**Critical lesson (ablation Stage H):** unconstrained propagation tuning pushes
-parameters to search-space bounds (radius ≈ 5000 km, max_spread ≈ 10) because the
-density_ratio component of GeoScore rewards aggressive propagation. This is
-Goodhart's law — the metric is gamed, not the ecology improved. The `env_dist_max`
-and `range_cap` guardrails were added to prevent this.
+**Range check fix (pre-Stage K):** Stages H–J tuned propagation with a centroid-based
+per-species range check (distance to species centroid). This was incorrect — the code
+now uses distance to the nearest original observation of that species, as documented.
+For migratory species (e.g. Common Swift, centroid at 42°N), the old code excluded the
+entire wintering range. The fix makes propagation ~3× more aggressive with the same
+params, so Stage K re-tunes with tighter intervals (especially `range_cap` ∈ [100, 1000]).
 
 ## Data
 
@@ -97,10 +98,10 @@ report/collect_ablation_results.py    — Results aggregation script
 Weighted composite (defined in `model/metrics.py`):
 - `map` (0.20) — mean average precision
 - `f1_10` (0.20) — F1 at 10% threshold
-- `list_ratio_10` (0.15) — `1 - |log(predicted/true species count)|`
+- `list_ratio_10` (0.15) — `exp(-|log(predicted/true species count)|)` (smooth, never zero)
 - `watchlist_mean_ap` (0.10) — mean AP over endemic/watchlist species
 - `holdout_map` (0.10) — mAP on spatially held-out regions
-- `map_density_ratio` (0.20) — sparse-region mAP / dense-region mAP
+- `map_density_ratio` (0.20) — `min(r, 1/r)` where r = sparse mAP / dense mAP (peaks at 1.0)
 - `pred_density_corr` (0.05) — `1 - |Pearson r(predictions, obs density)|`
 
 Components missing from a run are skipped and weights renormalized.
@@ -127,4 +128,9 @@ Staged ablation with winner carry-forward:
 - **F**: Observation cap per species (diagnostic)
 - **G**: Species vocabulary size (diagnostic)
 - **H**: Unconstrained propagation Optuna (15 trials) — revealed Goodhart's law
-- **I**: Ecologically constrained propagation Optuna (15 trials, tightened bounds)
+- **I**: Ecologically constrained propagation Optuna (15 trials) — best discrimination
+  (mAP 0.752, F1@10% 0.594), near-perfect spatial balance (density ratio 0.994);
+  had autotune watchlist bug (watchlist_mean_ap always 0.0)
+- **J**: Constrained propagation with watchlist fix (10 trials) — highest GeoScore (0.6365);
+  recommended defaults (Trial 9): k=15, radius=1400, min_obs=15, spread=3.0, edm=3.3, cap=1100
+- **K**: Re-tune propagation after nearest-obs range fix (20 trials) — pending

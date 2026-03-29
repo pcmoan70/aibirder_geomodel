@@ -601,8 +601,8 @@ class H3DataPreprocessor:
 
         # --- Species Range Computation (vectorized with reduceat) ---
         R = 6371.0
+        sp_trees: dict = {}
         centroids_lat = np.zeros(n_sp, dtype=np.float64)
-        centroids_lon = np.zeros(n_sp, dtype=np.float64)
         # Default max propagation distance = floor radius × spread factor
         sp_max_dist = np.full(
             n_sp,
@@ -633,11 +633,9 @@ class H3DataPreprocessor:
                 uniq_sp, starts, counts = np.unique(
                     sorted_sp, return_index=True, return_counts=True)
 
-                # Centroids via reduceat (sum / count)
+                # Centroids via reduceat (latitude needed for lon→km)
                 lat_sums = np.add.reduceat(sorted_lats, starts)
-                lon_sums = np.add.reduceat(sorted_lons, starts)
                 centroids_lat[uniq_sp] = lat_sums / counts
-                centroids_lon[uniq_sp] = lon_sums / counts
 
                 # Range radius from bounding box diagonal
                 lat_mins = np.minimum.reduceat(sorted_lats, starts)
@@ -658,7 +656,29 @@ class H3DataPreprocessor:
                 if range_cap_km > 0:
                     np.minimum(sp_max_dist, range_cap_km, out=sp_max_dist)
 
+                # Build per-species KDTrees in 3-D Cartesian coords for
+                # nearest-observation range checks.  Euclidean distance
+                # in 3-D ≈ chord distance, monotonically related to
+                # great-circle distance.
+                _obs_lat_r = np.radians(sorted_lats)
+                _obs_lon_r = np.radians(sorted_lons)
+                _obs_xyz = np.column_stack([
+                    R * np.cos(_obs_lat_r) * np.cos(_obs_lon_r),
+                    R * np.cos(_obs_lat_r) * np.sin(_obs_lon_r),
+                    R * np.sin(_obs_lat_r),
+                ])
+                sp_trees = {}
+                for _j in range(len(uniq_sp)):
+                    _s, _c = int(starts[_j]), int(counts[_j])
+                    sp_trees[int(uniq_sp[_j])] = cKDTree(
+                        _obs_xyz[_s:_s + _c])
+                del _obs_xyz, _obs_lat_r, _obs_lon_r
+
             del obs_idx, obs_lats, obs_lons, obs_mem
+
+        # Convert sp_max_dist to chord distance for 3-D KDTree queries
+        sp_max_chord = 2.0 * R * np.sin(
+            np.clip(sp_max_dist / (2.0 * R), 0.0, 1.0))
 
         # --- Normalize environmental features ---
         env_arr = env_features.values.astype(np.float64)
@@ -751,25 +771,35 @@ class H3DataPreprocessor:
             if len(cand_rows) == 0:
                 continue
 
-            # Vectorized range filter (haversine to species centroids)
-            if max_spread_factor > 0:
-                t_lats = lats[sparse_in[cand_rows]]
-                t_lons = lons[sparse_in[cand_rows]]
-                c_lats = centroids_lat[cand_cols]
-                c_lons = centroids_lon[cand_cols]
+            # Range filter: distance to nearest original observation
+            if max_spread_factor > 0 and sp_trees:
+                t_lat_r = np.radians(lats[sparse_in[cand_rows]])
+                t_lon_r = np.radians(lons[sparse_in[cand_rows]])
+                t_xyz = np.column_stack([
+                    R * np.cos(t_lat_r) * np.cos(t_lon_r),
+                    R * np.cos(t_lat_r) * np.sin(t_lon_r),
+                    R * np.sin(t_lat_r),
+                ])
 
-                d_lat = np.radians(t_lats - c_lats)
-                d_lon = np.radians(t_lons - c_lons)
-                a = (np.sin(d_lat * 0.5) ** 2 +
-                     np.cos(np.radians(c_lats)) *
-                     np.cos(np.radians(t_lats)) *
-                     np.sin(d_lon * 0.5) ** 2)
-                dist_cent = R * 2.0 * np.arcsin(
-                    np.sqrt(np.clip(a, 0.0, 1.0)))
+                # Sort candidates by species for grouped tree queries
+                _order = np.argsort(cand_cols)
+                _sc = cand_cols[_order]
+                _usp, _ustart, _ucount = np.unique(
+                    _sc, return_index=True, return_counts=True)
+                keep_s = np.ones(len(cand_rows), dtype=bool)
+                for _i in range(len(_usp)):
+                    sp = int(_usp[_i])
+                    if sp not in sp_trees:
+                        continue
+                    s = _ustart[_i]
+                    c = _ucount[_i]
+                    idx = _order[s:s + c]
+                    dists_nn, _ = sp_trees[sp].query(t_xyz[idx], k=1)
+                    keep_s[idx] = dists_nn <= sp_max_chord[sp]
+                del t_xyz
 
-                keep = dist_cent <= sp_max_dist[cand_cols]
-                cand_rows = cand_rows[keep]
-                cand_cols = cand_cols[keep]
+                cand_rows = cand_rows[keep_s]
+                cand_cols = cand_cols[keep_s]
 
             if len(cand_rows) == 0:
                 continue
