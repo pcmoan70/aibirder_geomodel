@@ -504,13 +504,13 @@ class H3DataPreprocessor:
         weeks: np.ndarray,
         species_lists: List[List[str]],
         env_features: pd.DataFrame,
-        k: int = 5,
-        max_radius_km: float = 2000.0,
-        min_obs_threshold: int = 3,
+        k: int = 10,
+        max_radius_km: float = 1000.0,
+        min_obs_threshold: int = 10,
         soft_weight: float = 0.5,
         max_spread_factor: float = 2.0,
-        env_dist_max: float = 0.0,
-        range_cap_km: float = 0.0,
+        env_dist_max: float = 2.0,
+        range_cap_km: float = 500.0,
     ) -> List[List[str]]:
         """Propagate species labels from observed to sparse/unobserved cells.
 
@@ -530,10 +530,10 @@ class H3DataPreprocessor:
             weeks: Per-sample week numbers (0-48).
             species_lists: Per-sample species occurrence lists (mutable).
             env_features: Per-sample environmental feature DataFrame.
-            k: Number of nearest neighbors to consider (default 5).
-            max_radius_km: Geographic radius cap in km (default 2000).
+            k: Number of nearest neighbors to consider (default 10).
+            max_radius_km: Geographic radius cap in km (default 1000).
             min_obs_threshold: Samples with fewer species than this are
-                considered sparse and receive propagated labels (default 3).
+                considered sparse and receive propagated labels (default 10).
             soft_weight: Reserved for future soft-label support.
             max_spread_factor: Restrict species propagation based on their
                 observed geographic range.  A species will only propagate to a
@@ -544,12 +544,12 @@ class H3DataPreprocessor:
                 env-feature space between a sparse cell and its KNN neighbor
                 for that neighbor to contribute labels.  Neighbors further
                 away in env space are dropped even if within *max_radius_km*.
-                Set to 0 to disable (default 0.0).
+                Set to 0 to disable (default 2.0).
             range_cap_km: Hard cap in km on the per-species propagation
-                distance computed from *max_spread_factor*.  Even if a species'
-                bounding-box range would allow propagation farther, it is
-                clamped to at most *range_cap_km*.  Set to 0 to disable
-                (default 0.0).
+                distance from the nearest original observation.  Even if a
+                species' bounding-box range would allow propagation farther,
+                it is clamped to at most *range_cap_km*.  Set to 0 to disable
+                (default 500).
 
         Returns:
             Modified species_lists with propagated labels (also mutated

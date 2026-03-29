@@ -76,10 +76,12 @@ The training script handles the full pipeline automatically:
 | `--label_freq_weight_pct_lo` | `10` | Lower percentile threshold (species at or below get min weight) |
 | `--label_freq_weight_pct_hi` | `95` | Upper percentile threshold (species at or above get weight 1.0) |
 | `--propagate_labels` | off | Propagate species labels from observed to sparse cells via env similarity |
-| `--propagate_k` | `5` | Number of nearest env-space neighbors for propagation |
-| `--propagate_max_radius` | `2000` | Geographic radius cap in km for propagation |
+| `--propagate_k` | `10` | Number of nearest env-space neighbors for propagation |
+| `--propagate_max_radius` | `1000` | Geographic radius cap in km for propagation |
 | `--propagate_max_spread` | `2.0` | Species range expansion multiplier (0 = disable range check) |
-| `--propagate_min_obs` | `3` | Samples with fewer species than this receive propagated labels |
+| `--propagate_min_obs` | `10` | Samples with fewer species than this receive propagated labels |
+| `--propagate_env_dist_max` | `2.0` | Max env-space Euclidean distance (post-StandardScaler) for a neighbor to contribute labels (0 = disabled) |
+| `--propagate_range_cap` | `500` | Hard cap in km on per-species propagation distance from nearest observation (0 = disabled) |
 
 ### Learning Rate Schedule
 
@@ -502,23 +504,29 @@ species encoding, so propagated species participate fully in training.
 #### Algorithm
 
 1. **Identify sparse samples** — any sample whose species list has fewer
-   than `--propagate_min_obs` (default 3) species.
+   than `--propagate_min_obs` (default 10) species.
 2. **Normalize environmental features** — StandardScaler fit on all
    samples, NaN columns dropped.
 3. **Build a KD-tree** on the observed (non-sparse) samples'
    normalized env vectors, grouped by week (each of the 48 weeks
    plus week 0 gets its own tree so that seasonal species don't
    leak across weeks).
-4. **Query** *k* nearest neighbors (`--propagate_k`, default 5) in
+4. **Query** *k* nearest neighbors (`--propagate_k`, default 10) in
    env-feature space for each sparse sample.
 5. **Filter by geographic distance** — discard any neighbor farther than
-   `--propagate_max_radius` km (default 2000) using haversine distance.
-6. **Filter by species range** — for each species in a neighbor list,
+   `--propagate_max_radius` km (default 1000) using haversine distance.
+6. **Filter by environmental distance** — discard any neighbor whose
+   Euclidean distance in standardized env space exceeds
+   `--propagate_env_dist_max` (default 2.0). This rejects neighbors
+   that are geographically close but environmentally dissimilar.
+7. **Filter by species range** — for each species in a neighbor list,
    check if the target cell is within `--propagate_max_spread` (default 2.0)
-   multiples of the species' observed range radius from its centroid.
-   This prevents island endemics (e.g. Hawaii-specific birds) from
-   leaking onto the mainland just because the environment matches.
-7. **Merge** the neighbor species into the sparse sample's list
+   multiples of the species' observed range radius from its nearest
+   original observation. A hard cap of `--propagate_range_cap` km
+   (default 500) is also applied. This prevents island endemics
+   (e.g. Hawaii-specific birds) from leaking onto the mainland just
+   because the environment matches.
+8. **Merge** the neighbor species into the sparse sample's list
    (union, no duplicates).
 
 #### Parameters
@@ -526,16 +534,18 @@ species encoding, so propagated species participate fully in training.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--propagate_labels` | off | Enable env-neighbor label propagation |
-| `--propagate_k` | 5 | Number of nearest env-space neighbors |
-| `--propagate_max_radius` | 2000 | Geographic radius cap (km) |
+| `--propagate_k` | 10 | Number of nearest env-space neighbors |
+| `--propagate_max_radius` | 1000 | Geographic radius cap (km) |
 | `--propagate_max_spread` | 2.0 | Species range expansion multiplier |
-| `--propagate_min_obs` | 3 | Sparsity threshold (species count) |
+| `--propagate_min_obs` | 10 | Sparsity threshold (species count) |
+| `--propagate_env_dist_max` | 2.0 | Max env-space distance for neighbor eligibility |
+| `--propagate_range_cap` | 500 | Hard km ceiling on per-species propagation distance |
 
 !!! tip
     Start with defaults and check whether the model's predictions in
-    previously blank areas improve.  Lowering `--propagate_max_radius`
-    to 500–1000 km is sensible for island endemics where long-distance
-    transfers are inappropriate.
+    previously blank areas improve.  For island endemics where long-distance
+    transfers are inappropriate, lowering `--propagate_max_radius`
+    (e.g. to 500 km) and `--propagate_range_cap` limits geographic reach.
 
 ### References
 
