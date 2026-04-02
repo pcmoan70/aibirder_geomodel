@@ -9,6 +9,7 @@
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg" alt="PyTorch"></a>
   <a href="https://birdnet-team.github.io/geomodel/"><img src="https://img.shields.io/badge/docs-mkdocs-blue.svg" alt="Documentation"></a>
+  <img src="https://img.shields.io/badge/species-12%2C012-brightgreen" alt="12,012 species">
 </p>
 
 <p align="center">
@@ -17,11 +18,11 @@
 </p>
 
 <p align="center">
-  <img src="demo_migrants.gif" alt="Animated range maps of 12 migratory species across 48 weeks" width="100%">
+  <img src="demo_migrants.gif" alt="Animated range maps of 9 migratory species across 48 weeks" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://birdnet-team.github.io/geomodel/"><b>Documentation</b></a> · <a href="CONTRIBUTING.md"><b>Contributing</b></a> · <a href="LICENSE"><b>License</b></a>
+  <a href="https://github.com/birdnet-team/geomodel/releases/latest"><b>Download</b></a> · <a href="https://birdnet-team.github.io/geomodel/"><b>Documentation</b></a> · <a href="CONTRIBUTING.md"><b>Contributing</b></a> · <a href="LICENSE"><b>License</b></a>
 </p>
 
 ## Setup

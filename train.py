@@ -837,10 +837,10 @@ def main():
     parser.add_argument('--data_path', type=str, help='Path to H3-aggregated training data (Parquet files)', required=True)
 
     # Model
-    parser.add_argument('--model_scale', type=float, default=0.5,
+    parser.add_argument('--model_scale', type=float, default=0.75,
                         help='Model size scaling factor (1.0 ≈ 7M params, 0.5 ≈ 1.8M, 2.0 ≈ 36M)')
-    parser.add_argument('--coord_harmonics', type=int, default=4,
-                        help='Number of harmonics for lat/lon circular encoding (default: 4)')
+    parser.add_argument('--coord_harmonics', type=int, default=8,
+                        help='Number of harmonics for lat/lon circular encoding (default: 8)')
     parser.add_argument('--week_harmonics', type=int, default=8,
                         help='Number of harmonics for week circular encoding (default: 8)')
     parser.add_argument('--habitat_head', action='store_true',
@@ -857,8 +857,10 @@ def main():
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=1e-3)
-    parser.add_argument('--species_weight', type=float, default=1.0)
-    parser.add_argument('--env_weight', type=float, default=0.5)
+    parser.add_argument('--species_weight', type=float, default=1.0, 
+                        help='Relative weight for species prediction loss (default: 1.0)')
+    parser.add_argument('--env_weight', type=float, default=0.1, 
+                        help='Relative weight for environment feature loss (default: 0.1)')
     parser.add_argument('--species_loss', type=str, default='bce', choices=['asl', 'bce', 'focal', 'an'],
                         help='Species loss function: bce (default), asl (asymmetric), focal, or an')
     parser.add_argument('--asl_gamma_pos', type=float, default=0.0,
@@ -875,8 +877,8 @@ def main():
                         help='Positive up-weighting λ for assume-negative loss (default: 4)')
     parser.add_argument('--neg_samples', type=int, default=1024,
                         help='Number of negative species to sample per example for AN loss (default: 1024, 0=all)')
-    parser.add_argument('--label_smoothing', type=float, default=0.0,
-                        help='Smooth binary targets to prevent overconfident predictions (default: 0.0, 0=off)')
+    parser.add_argument('--label_smoothing', type=float, default=0.05,
+                        help='Smooth binary targets to prevent overconfident predictions (default: 0.05, 0=off)')
     parser.add_argument('--max_obs_per_species', type=int, default=0,
                         help='Cap observations per species to reduce common-species dominance (default: 0, 0=no cap)')
     parser.add_argument('--min_obs_per_species', type=int, default=50,
@@ -906,21 +908,21 @@ def main():
     parser.add_argument('--propagate_labels', action='store_true',
                         help='Propagate species labels from observed to sparse/unobserved '
                              'cells using environmental feature similarity (KNN in env space)')
-    parser.add_argument('--propagate_k', type=int, default=10,
-                        help='Number of nearest env-space neighbors for label propagation (default: 10)')
+    parser.add_argument('--propagate_k', type=int, default=20,
+                        help='Number of nearest env-space neighbors for label propagation (default: 20)')
     parser.add_argument('--propagate_max_radius', type=float, default=1000.0,
                         help='Geographic radius cap in km for label propagation (default: 1000)')
-    parser.add_argument('--propagate_min_obs', type=int, default=10,
-                        help='Samples with fewer species than this receive propagated labels (default: 10)')
-    parser.add_argument('--propagate_max_spread', type=float, default=2.0,
+    parser.add_argument('--propagate_min_obs', type=int, default=12,
+                        help='Samples with fewer species than this receive propagated labels (default: 12)')
+    parser.add_argument('--propagate_max_spread', type=float, default=1.0,
                         help='Restrict propagation distance by observed species range radius '
-                             'multiplied by this factor (default: 2.0).  Set to 0 to disable.')
-    parser.add_argument('--propagate_env_dist_max', type=float, default=2.0,
+                             'multiplied by this factor (default: 1.0).  Set to 0 to disable.')
+    parser.add_argument('--propagate_env_dist_max', type=float, default=5.0,
                         help='Max env-space Euclidean distance (post-StandardScaler) for a '
-                             'neighbor to contribute labels. 0 = disabled (default: 2.0).')
-    parser.add_argument('--propagate_range_cap', type=float, default=500.0,
+                             'neighbor to contribute labels. 0 = disabled (default: 5.0).')
+    parser.add_argument('--propagate_range_cap', type=float, default=1500.0,
                         help='Hard cap in km on per-species propagation distance from '
-                             'nearest observation. 0 = disabled (default: 500).')
+                             'nearest observation. 0 = disabled (default: 1500).')
 
     # LR schedule
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],

@@ -214,8 +214,8 @@ def _render_frame(
 
     # Tight layout with minimal padding
     fig.subplots_adjust(
-        left=0.01, right=0.99, top=0.91, bottom=0.07,
-        wspace=0.02, hspace=0.15,
+        left=0.01, right=0.99, top=0.93, bottom=0.01,
+        wspace=0.02, hspace=0.08,
     )
 
     # Grid dimensions for reshaping
@@ -279,35 +279,14 @@ def _render_frame(
         r, c = divmod(idx, n_cols)
         axes[r][c].set_visible(False)
 
-    # Week label – large, bold, centered at top
+    # Title: version + week label
     fig.suptitle(
-        _week_label(week),
+        f"Geomodel Predictions — {_week_label(week)}",
         fontsize=max(10, int(fig_w / dpi * 1.1)),
         fontweight="bold",
         color="#333333",
         y=0.97,
     )
-
-    # Shared colorbar at bottom
-    global_vmax = max(vmax_per_species) if vmax_per_species else 1.0
-    norm_cb = mpl.colors.Normalize(vmin=0.0, vmax=global_vmax)
-    sm = plt.cm.ScalarMappable(norm=norm_cb, cmap=cmap)
-    cbar = fig.colorbar(
-        sm,
-        ax=axes,
-        orientation="horizontal",
-        fraction=0.02,
-        pad=0.02,
-        shrink=0.4,
-        aspect=40,
-    )
-    cbar.set_label(
-        "Predicted occurrence probability",
-        fontsize=max(6, int(fig_w / dpi * 0.6)),
-        color="#555555",
-    )
-    cbar.ax.tick_params(labelsize=max(5, int(fig_w / dpi * 0.5)), colors="#555555")
-    cbar.outline.set_linewidth(0.3)
 
     # Render to PIL image at exact pixel dimensions
     buf = io.BytesIO()
