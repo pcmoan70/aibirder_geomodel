@@ -611,9 +611,9 @@ def create_model(
 
     Rough parameter-count landmarks (with 12 K species):
 
-    * 0.5  → ~1.8 M  (≈ former *small*)
+    * 0.5  → ~1.5 M  (≈ former *small*)
     * 1.0  → ~7.2 M  (≈ former *medium*)
-    * 2.0  → ~36 M   (≈ former *large*)
+    * 2.0  → ~47 M   (≈ former *large*)
 
     Args:
         n_species: Number of target species.

@@ -277,12 +277,17 @@ def generate_common_species(
     print(f"\nScoring {len(regions)} regions (grid_step={grid_step}°, weeks=1/13/26/39)")
 
     # Per-region ranked lists: birds and non-birds
+    presence_threshold = 0.01  # species with mean prob > this are "present"
     region_bird_ranks: List[List[int]] = []
     region_other_ranks: List[List[int]] = []
+    region_present: List[set] = []  # species indices present per region
 
     for i, (name, bbox) in enumerate(regions):
         print(f"  [{i+1}/{len(regions)}] {name} ...", end=" ", flush=True)
         scores = _compute_region_scores(model, dev, bbox, n_species, grid_step)
+
+        present = {idx for idx in range(n_species) if scores[idx] > presence_threshold}
+        region_present.append(present)
 
         bird_scores = [(idx, scores[idx]) for idx in range(n_species) if idx in bird_indices]
         other_scores = [(idx, scores[idx]) for idx in range(n_species) if idx not in bird_indices]
@@ -292,12 +297,14 @@ def generate_common_species(
 
         region_bird_ranks.append([idx for idx, _ in bird_scores])
         region_other_ranks.append([idx for idx, _ in other_scores])
-        print(f"done (top bird: {labels[bird_scores[0][0]][2]}, "
+        print(f"done ({len(present)} species present, "
+              f"top bird: {labels[bird_scores[0][0]][2]}, "
               f"top other: {labels[other_scores[0][0]][2]})")
 
     # Round-robin selection: 4 birds + 1 other per region per round
     selected: set = set()
     result_order: List[int] = []
+    region_contrib = [0] * len(regions)  # count of species contributed per region
     # Track position in each region's ranked list
     bird_pos = [0] * len(regions)
     other_pos = [0] * len(regions)
@@ -306,7 +313,7 @@ def generate_common_species(
     while len(result_order) < num_species:
         made_progress = False
         for r in range(len(regions)):
-            # Pick up to 3 birds from this region
+            # Pick up to 4 birds from this region
             added_birds = 0
             while added_birds < 4 and bird_pos[r] < len(region_bird_ranks[r]):
                 idx = region_bird_ranks[r][bird_pos[r]]
@@ -314,6 +321,7 @@ def generate_common_species(
                 if idx not in selected:
                     selected.add(idx)
                     result_order.append(idx)
+                    region_contrib[r] += 1
                     added_birds += 1
                     made_progress = True
                     if len(result_order) >= num_species:
@@ -328,6 +336,7 @@ def generate_common_species(
                 if idx not in selected:
                     selected.add(idx)
                     result_order.append(idx)
+                    region_contrib[r] += 1
                     made_progress = True
                     break
             if len(result_order) >= num_species:
@@ -336,6 +345,15 @@ def generate_common_species(
         if not made_progress:
             print(f"  Exhausted all regions at {len(result_order)} species")
             break
+
+    total = len(result_order)
+    print(f"\n  Regional coverage (species selected / species present):")
+    for r, (name, _) in enumerate(regions):
+        present = region_present[r]
+        covered = len(present & selected)
+        n_present = len(present)
+        pct = 100.0 * covered / n_present if n_present else 0
+        print(f"    {name:20s}  {covered:5d} / {n_present:5d}  ({pct:5.1f}%)")
 
     species_list = []
     for idx in result_order:
