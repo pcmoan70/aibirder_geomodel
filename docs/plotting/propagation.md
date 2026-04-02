@@ -25,9 +25,12 @@ python scripts/plot_propagation.py --data_path outputs/combined.parquet --lat 50
 | `--lon` | — | Longitude for per-cell comparison |
 | `--week` | — | Show detailed species diff for this week |
 | `--taxonomy` | auto-detected | Taxonomy CSV for species name lookup |
-| `--propagate_k` | `5` | Number of env-space neighbors |
-| `--propagate_max_radius` | `2000` | Max geographic radius in km |
-| `--propagate_min_obs` | `3` | Sparsity threshold (species count below which a sample receives propagated labels) |
+| `--propagate_k` | `10` | Number of env-space neighbors |
+| `--propagate_max_radius` | `1000` | Max geographic radius in km |
+| `--propagate_min_obs` | `10` | Sparsity threshold (species count below which a sample receives propagated labels) |
+| `--propagate_max_spread` | `2.0` | Species range expansion multiplier (0 = disable range check) |
+| `--propagate_env_dist_max` | `2.0` | Max env-space distance for neighbor eligibility (0 = disabled) |
+| `--propagate_range_cap` | `500` | Hard km ceiling on per-species propagation distance from nearest observation (0 = disabled) |
 | `--no_yearly` | off | Exclude yearly (week 0) samples |
 | `--outdir` | `outputs/plots/propagation` | Output directory |
 

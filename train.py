@@ -56,7 +56,7 @@ _DATA_CACHE_KEYS = [
     'no_yearly',
     'propagate_labels', 'propagate_k', 'propagate_max_radius',
     'propagate_min_obs', 'propagate_max_spread',
-    'max_obs_per_species', 'min_obs_per_species',
+    'max_obs_per_species', 'min_obs_per_species', 'max_species',
     'val_size', 'sample_fraction',
     'holdout_regions',
     'label_freq_weight', 'label_freq_weight_min',
@@ -67,6 +67,9 @@ _DATA_CACHE_KEYS = [
 def _data_cache_key(args) -> str:
     """Build a deterministic hash from all args that affect preprocessing."""
     h = hashlib.sha256()
+
+    # Cache format version — bump when internal encoding changes
+    h.update(b"cache_version:2")
 
     # File identity: use mtime + size as a cheap fingerprint
     p = Path(args.data_path)
@@ -84,7 +87,9 @@ def _data_cache_key(args) -> str:
 def _data_cache_path(args) -> Path:
     """Return the cache file path for the current data settings."""
     digest = _data_cache_key(args)
-    cache_dir = Path(args.checkpoint_dir) / '.data_cache'
+    # Use a shared cache directory so multi-run experiments (ablation/autotune)
+    # can reuse preprocessing across different checkpoint dirs.
+    cache_dir = Path(args.data_cache_dir)
     return cache_dir / f'preprocessed_{digest}.pkl'
 
 
@@ -162,14 +167,8 @@ def _check_watchlist_coverage(
         sp = tgt['species']
         if isinstance(sp, np.ndarray) and sp.ndim == 2:
             return set(np.where(sp.any(axis=0))[0].tolist())
-        elif isinstance(sp, list):
-            present: set = set()
-            for row in sp:
-                if hasattr(row, 'tolist'):
-                    present.update(row.tolist())
-                else:
-                    present.update(row)
-            return present
+        elif isinstance(sp, dict) and 'values' in sp:
+            return set(sp['values'].tolist())
         return set()
 
     train_present = _present_indices(train_tgt)
@@ -243,7 +242,8 @@ class Trainer:
         self.patience = patience
         self.log_interval = log_interval
 
-        # AMP scaler — only active on CUDA
+        # AMP scaler — AN loss guards (logit clamp + nan_to_num in
+        # AssumeNegativeLoss.forward) handle FP16 overflow safely.
         self.use_amp = device.type == 'cuda'
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
@@ -305,6 +305,7 @@ class Trainer:
         self.model.train()
         total_loss = total_species = total_env = total_habitat = 0.0
         n_batches = 0
+        n_skipped_nonfinite = 0
         n_total = len(train_loader)
 
         # When tqdm is disabled (e.g. TQDM_DISABLE=1), print phase markers
@@ -325,6 +326,19 @@ class Trainer:
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 outputs = self.model(lat, lon, week, return_env=True)
                 losses = self.criterion(outputs, {'species': species_t, 'env_features': env_t})
+
+            # Skip non-finite batches to avoid corrupting optimizer/model state.
+            _loss_vals = [losses['total'], losses['species']]
+            if 'env' in losses:
+                _loss_vals.append(losses['env'])
+            if 'habitat' in losses:
+                _loss_vals.append(losses['habitat'])
+            if not all(torch.isfinite(v).item() for v in _loss_vals):
+                n_skipped_nonfinite += 1
+                if n_skipped_nonfinite <= 3:
+                    print(f"  Warning: skipping non-finite batch at idx={batch_idx} "
+                          f"(epoch {self.current_epoch + 1})", flush=True)
+                continue
 
             self.scaler.scale(losses['total']).backward()
             self.scaler.unscale_(self.optimizer)
@@ -349,11 +363,16 @@ class Trainer:
                     postfix['habitat'] = f"{losses['habitat'].item():.4f}"
                 pbar.set_postfix(**postfix)
 
-        result = {'loss': total_loss / n_batches,
-                  'species_loss': total_species / n_batches,
-                  'env_loss': total_env / n_batches}
+        if n_batches == 0:
+            result = {'loss': float('nan'), 'species_loss': float('nan'), 'env_loss': float('nan')}
+        else:
+            result = {'loss': total_loss / n_batches,
+                      'species_loss': total_species / n_batches,
+                      'env_loss': total_env / n_batches}
         if total_habitat > 0:
             result['habitat_loss'] = total_habitat / n_batches
+        if n_skipped_nonfinite > 0:
+            print(f"  Skipped non-finite train batches: {n_skipped_nonfinite}/{n_total}", flush=True)
         return result
 
     @torch.no_grad()
@@ -430,15 +449,18 @@ class Trainer:
                 outputs = self.model(lat, lon, week, return_env=True)
                 losses = self.criterion(outputs, {'species': species_t, 'env_features': env_t})
 
-            total_loss += losses['total'].item()
-            total_species += losses['species'].item()
-            total_env += losses['env'].item()
-            if 'habitat' in losses:
-                total_habitat += losses['habitat'].item()
-            n_batches += 1
+            # Accumulate loss only for finite batches (FP16 overflow → skip)
+            if torch.isfinite(losses['total']):
+                total_loss += losses['total'].item()
+                total_species += losses['species'].item()
+                total_env += losses['env'].item()
+                if 'habitat' in losses:
+                    total_habitat += losses['habitat'].item()
+                n_batches += 1
 
             # --- Species prediction metrics ---
-            logits = outputs['species_logits'].float()
+            # Clamp logits to prevent inf→NaN in sigmoid for metric computation
+            logits = outputs['species_logits'].float().clamp(-30, 30)
             probs = torch.sigmoid(logits)
             pos_mask = species_t > 0.5
             n_pos = pos_mask.sum(dim=1)  # (B,)
@@ -514,15 +536,15 @@ class Trainer:
             return 2 * prec * rec / max(prec + rec, 1e-8)
 
         metrics = {
-            'loss': total_loss / n_batches,
-            'species_loss': total_species / n_batches,
-            'env_loss': total_env / n_batches,
+            'loss': total_loss / max(n_batches, 1),
+            'species_loss': total_species / max(n_batches, 1),
+            'env_loss': total_env / max(n_batches, 1),
             'map': ap_sum / max(ap_count, 1),
             'top10_recall': total_hits_10 / max(total_positives, 1),
             'top30_recall': total_hits_30 / max(total_positives, 1),
         }
         if total_habitat > 0:
-            metrics['habitat_loss'] = total_habitat / n_batches
+            metrics['habitat_loss'] = total_habitat / max(n_batches, 1)
         for t in THRESHOLDS:
             pct = int(t * 100)
             tp, fp, fn = thresh_tp[t], thresh_fp[t], thresh_fn[t]
@@ -675,6 +697,8 @@ class Trainer:
         print(f"\nTraining for {num_epochs} epochs on {self.device}")
         if self.use_amp:
             print("  Mixed precision (AMP): enabled")
+        elif self.device.type == 'cuda':
+            print("  Mixed precision (AMP): disabled for numerical stability")
         if self.patience:
             print(f"  Early stopping patience: {self.patience}")
         print(f"  Train: {len(train_loader.dataset):,} samples  |  Val: {len(val_loader.dataset):,} samples")
@@ -813,10 +837,10 @@ def main():
     parser.add_argument('--data_path', type=str, help='Path to H3-aggregated training data (Parquet files)', required=True)
 
     # Model
-    parser.add_argument('--model_scale', type=float, default=0.5,
+    parser.add_argument('--model_scale', type=float, default=0.75,
                         help='Model size scaling factor (1.0 ≈ 7M params, 0.5 ≈ 1.8M, 2.0 ≈ 36M)')
-    parser.add_argument('--coord_harmonics', type=int, default=4,
-                        help='Number of harmonics for lat/lon circular encoding (default: 4)')
+    parser.add_argument('--coord_harmonics', type=int, default=8,
+                        help='Number of harmonics for lat/lon circular encoding (default: 8)')
     parser.add_argument('--week_harmonics', type=int, default=8,
                         help='Number of harmonics for week circular encoding (default: 8)')
     parser.add_argument('--habitat_head', action='store_true',
@@ -833,8 +857,10 @@ def main():
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=1e-3)
-    parser.add_argument('--species_weight', type=float, default=1.0)
-    parser.add_argument('--env_weight', type=float, default=0.5)
+    parser.add_argument('--species_weight', type=float, default=1.0, 
+                        help='Relative weight for species prediction loss (default: 1.0)')
+    parser.add_argument('--env_weight', type=float, default=0.1, 
+                        help='Relative weight for environment feature loss (default: 0.1)')
     parser.add_argument('--species_loss', type=str, default='bce', choices=['asl', 'bce', 'focal', 'an'],
                         help='Species loss function: bce (default), asl (asymmetric), focal, or an')
     parser.add_argument('--asl_gamma_pos', type=float, default=0.0,
@@ -851,12 +877,14 @@ def main():
                         help='Positive up-weighting λ for assume-negative loss (default: 4)')
     parser.add_argument('--neg_samples', type=int, default=1024,
                         help='Number of negative species to sample per example for AN loss (default: 1024, 0=all)')
-    parser.add_argument('--label_smoothing', type=float, default=0.0,
-                        help='Smooth binary targets to prevent overconfident predictions (default: 0.0, 0=off)')
+    parser.add_argument('--label_smoothing', type=float, default=0.05,
+                        help='Smooth binary targets to prevent overconfident predictions (default: 0.05, 0=off)')
     parser.add_argument('--max_obs_per_species', type=int, default=0,
                         help='Cap observations per species to reduce common-species dominance (default: 0, 0=no cap)')
     parser.add_argument('--min_obs_per_species', type=int, default=50,
                         help='Exclude species with fewer than N observations (default: 50, 0=keep all)')
+    parser.add_argument('--max_species', type=int, default=0,
+                        help='Randomly subsample vocabulary to at most N species (default: 0, 0=all)')
     parser.add_argument('--ocean_sample_rate', type=float, default=1.0,
                         help='Fraction of ocean cells (water_fraction > 0.9) to keep (default: 1.0, 1.0=keep all)')
     parser.add_argument('--no_yearly', action='store_true',
@@ -880,15 +908,21 @@ def main():
     parser.add_argument('--propagate_labels', action='store_true',
                         help='Propagate species labels from observed to sparse/unobserved '
                              'cells using environmental feature similarity (KNN in env space)')
-    parser.add_argument('--propagate_k', type=int, default=5,
-                        help='Number of nearest env-space neighbors for label propagation (default: 5)')
-    parser.add_argument('--propagate_max_radius', type=float, default=2000.0,
-                        help='Geographic radius cap in km for label propagation (default: 2000)')
-    parser.add_argument('--propagate_min_obs', type=int, default=3,
-                        help='Samples with fewer species than this receive propagated labels (default: 3)')
-    parser.add_argument('--propagate_max_spread', type=float, default=2.0,
+    parser.add_argument('--propagate_k', type=int, default=20,
+                        help='Number of nearest env-space neighbors for label propagation (default: 20)')
+    parser.add_argument('--propagate_max_radius', type=float, default=1000.0,
+                        help='Geographic radius cap in km for label propagation (default: 1000)')
+    parser.add_argument('--propagate_min_obs', type=int, default=12,
+                        help='Samples with fewer species than this receive propagated labels (default: 12)')
+    parser.add_argument('--propagate_max_spread', type=float, default=1.0,
                         help='Restrict propagation distance by observed species range radius '
-                             'multiplied by this factor (default: 2.0).  Set to 0 to disable.')
+                             'multiplied by this factor (default: 1.0).  Set to 0 to disable.')
+    parser.add_argument('--propagate_env_dist_max', type=float, default=5.0,
+                        help='Max env-space Euclidean distance (post-StandardScaler) for a '
+                             'neighbor to contribute labels. 0 = disabled (default: 5.0).')
+    parser.add_argument('--propagate_range_cap', type=float, default=1500.0,
+                        help='Hard cap in km on per-species propagation distance from '
+                             'nearest observation. 0 = disabled (default: 1500).')
 
     # LR schedule
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'none'],
@@ -922,6 +956,9 @@ def main():
     parser.add_argument('--save_every', type=int, default=5)
     parser.add_argument('--no_cache', action='store_true',
                         help='Force reprocessing of data even if a valid cache exists')
+    parser.add_argument('--data_cache_dir', type=str, default='checkpoints/.data_cache',
+                        help='Directory for shared preprocessed-data cache files '
+                             '(default: checkpoints/.data_cache)')
 
     # Device
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'])
@@ -937,8 +974,16 @@ def main():
                         help='Number of Optuna trials (default: 30)')
     parser.add_argument('--autotune_epochs', type=int, default=15,
                         help='Epochs per trial (default: 15)')
+    parser.add_argument('--autotune_ranges', type=str, default=None,
+                        help='JSON dict of search range overrides per param, '
+                             'e.g. \'{"propagate_k": [10, 20], "propagate_min_obs": [10, 20]}\'')
 
     args = parser.parse_args()
+
+    # Parse autotune_ranges JSON if provided
+    if args.autotune_ranges is not None:
+        import json as _json
+        args.autotune_ranges = _json.loads(args.autotune_ranges)
 
     device = torch.device(
         'cuda' if args.device == 'auto' and torch.cuda.is_available()
@@ -1056,6 +1101,8 @@ def main():
                 max_radius_km=args.propagate_max_radius,
                 min_obs_threshold=args.propagate_min_obs,
                 max_spread_factor=args.propagate_max_spread,
+                env_dist_max=args.propagate_env_dist_max,
+                range_cap_km=args.propagate_range_cap,
             )
 
         print("3. Preprocessing...")
@@ -1064,6 +1111,7 @@ def main():
             lats, lons, weeks, species_lists, env_features, fit=True,
             max_obs_per_species=args.max_obs_per_species,
             min_obs_per_species=args.min_obs_per_species,
+            max_species=args.max_species,
         )
 
         # Free raw flattened arrays — now encoded in inputs/targets

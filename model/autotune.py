@@ -24,11 +24,23 @@ TUNABLE_PARAMS = [
     'focal_alpha', 'focal_gamma',
     'label_freq_weight', 'label_freq_weight_min',
     'label_freq_weight_pct_lo', 'label_freq_weight_pct_hi',
+    'propagate_k', 'propagate_max_radius',
+    'propagate_min_obs', 'propagate_max_spread',
+    'propagate_env_dist_max', 'propagate_range_cap',
 ]
 
 
 def _suggest_param(trial, name: str, args):
-    """Suggest a value for *name* using the Optuna trial."""
+    """Suggest a value for *name* using the Optuna trial.
+
+    If ``args.autotune_ranges`` contains an override for *name*, use those
+    bounds instead of the defaults.  The override format per parameter is
+    ``[lo, hi]`` for float/int params or a list of allowed values for
+    categoricals.
+    """
+    overrides: dict = getattr(args, 'autotune_ranges', None) or {}
+    ov = overrides.get(name)
+
     if name == 'pos_lambda':
         return trial.suggest_float('pos_lambda', 1.0, 64.0, log=True)
     if name == 'neg_samples':
@@ -63,6 +75,24 @@ def _suggest_param(trial, name: str, args):
         return trial.suggest_float('label_freq_weight_pct_lo', 1.0, 25.0)
     if name == 'label_freq_weight_pct_hi':
         return trial.suggest_float('label_freq_weight_pct_hi', 75.0, 99.0)
+    if name == 'propagate_k':
+        lo, hi = (ov[0], ov[1]) if ov else (1, 20)
+        return trial.suggest_int('propagate_k', lo, hi)
+    if name == 'propagate_max_radius':
+        lo, hi = (ov[0], ov[1]) if ov else (100.0, 1500.0)
+        return trial.suggest_float('propagate_max_radius', lo, hi, log=True)
+    if name == 'propagate_min_obs':
+        lo, hi = (ov[0], ov[1]) if ov else (1, 20)
+        return trial.suggest_int('propagate_min_obs', lo, hi)
+    if name == 'propagate_max_spread':
+        lo, hi = (ov[0], ov[1]) if ov else (0.5, 3.0)
+        return trial.suggest_float('propagate_max_spread', lo, hi)
+    if name == 'propagate_env_dist_max':
+        lo, hi = (ov[0], ov[1]) if ov else (0.5, 5.0)
+        return trial.suggest_float('propagate_env_dist_max', lo, hi)
+    if name == 'propagate_range_cap':
+        lo, hi = (ov[0], ov[1]) if ov else (200.0, 2000.0)
+        return trial.suggest_float('propagate_range_cap', lo, hi)
     raise ValueError(f"Unknown tunable param: {name}")
 
 
@@ -91,6 +121,9 @@ def run_autotune(
         print(f"Available: {TUNABLE_PARAMS}")
         return
 
+    _PROPAGATION_PARAMS = {'propagate_k', 'propagate_max_radius', 'propagate_min_obs', 'propagate_max_spread', 'propagate_env_dist_max', 'propagate_range_cap'}
+    _tune_propagation = bool(_PROPAGATION_PARAMS & set(tune_params))
+
     n_trials = args.autotune_trials
     n_epochs = args.autotune_epochs
 
@@ -103,8 +136,12 @@ def run_autotune(
     print(f"  Objective:  GeoScore (maximize)")
     print(f"  Device:     {device}")
 
+    # Raw data references for per-trial re-propagation (set in fresh-load path).
+    _raw_lats = _raw_lons = _raw_weeks = _raw_species_lists = _raw_env = None
+
     cache_path = data_cache_path_fn(args)
-    cached = None if args.no_cache else load_data_cache_fn(cache_path)
+    # Skip cache when tuning propagation params — cached data has fixed propagation.
+    cached = None if (args.no_cache or _tune_propagation) else load_data_cache_fn(cache_path)
 
     if cached is not None:
         print(f"\n   Using cached preprocessed data: {cache_path.name}")
@@ -143,6 +180,16 @@ def run_autotune(
 
         species_lists_original = list(species_lists) if args.propagate_labels else None
 
+        # When tuning propagation params, save raw data before propagation.
+        # Each trial will re-propagate with its own suggested params.
+        if _tune_propagation:
+            import copy as _copy
+            _raw_lats = lats.copy()
+            _raw_lons = lons.copy()
+            _raw_weeks = weeks.copy()
+            _raw_species_lists = _copy.deepcopy(species_lists)
+            _raw_env = env_features.copy()
+
         if args.propagate_labels:
             print("   Propagating labels from observed to sparse cells...")
             species_lists = H3DataPreprocessor.propagate_env_labels(
@@ -155,6 +202,8 @@ def run_autotune(
                 max_radius_km=args.propagate_max_radius,
                 min_obs_threshold=args.propagate_min_obs,
                 max_spread_factor=args.propagate_max_spread,
+                env_dist_max=args.propagate_env_dist_max,
+                range_cap_km=args.propagate_range_cap,
             )
 
         print("3. Preprocessing...")
@@ -171,6 +220,8 @@ def run_autotune(
         )
 
         del lats, lons, weeks, env_features
+        if not _tune_propagation:
+            del species_lists
         gc.collect()
 
         info = preprocessor.get_preprocessing_info()
@@ -286,22 +337,63 @@ def run_autotune(
         else:
             _trial_freq_weights = None
 
+        # -- Per-trial data when tuning propagation params ----------------
+        _t_train_in = train_in
+        _t_val_in = val_in
+        _t_train_tgt = train_tgt
+        _t_val_tgt = val_tgt
+        _t_n_species = n_species
+        _t_n_env = n_env
+
+        if _tune_propagation and _raw_species_lists is not None:
+            import copy as _copy
+            _trial_sl = _copy.deepcopy(_raw_species_lists)
+            _trial_sl = H3DataPreprocessor.propagate_env_labels(
+                _raw_lats, _raw_lons, _raw_weeks,
+                _trial_sl, _raw_env,
+                k=int(p['propagate_k']),
+                max_radius_km=float(p['propagate_max_radius']),
+                min_obs_threshold=int(p['propagate_min_obs']),
+                max_spread_factor=float(p['propagate_max_spread']),
+                env_dist_max=float(p.get('propagate_env_dist_max', args.propagate_env_dist_max)),
+                range_cap_km=float(p.get('propagate_range_cap', args.propagate_range_cap)),
+            )
+            _trial_pp = H3DataPreprocessor()
+            _trial_inputs, _trial_targets = _trial_pp.prepare_training_data(
+                _raw_lats, _raw_lons, _raw_weeks,
+                _trial_sl, _raw_env,
+                fit=True,
+                max_obs_per_species=args.max_obs_per_species,
+                min_obs_per_species=args.min_obs_per_species,
+            )
+            _t_info = _trial_pp.get_preprocessing_info()
+            _t_n_species = _t_info['n_species']
+            _t_n_env = _t_info['n_env_features']
+            _t_train_in, _t_val_in, _t_train_tgt, _t_val_tgt = _trial_pp.split_data(
+                _trial_inputs, _trial_targets,
+                val_size=args.val_size,
+                random_state=42,
+                split_by_location=True,
+            )
+            del _trial_sl, _trial_inputs, _trial_targets, _trial_pp
+            gc.collect()
+
         t_loader, v_loader = create_dataloaders(
-            train_in,
-            train_tgt,
-            val_in,
-            val_tgt,
+            _t_train_in,
+            _t_train_tgt,
+            _t_val_in,
+            _t_val_tgt,
             batch_size=batch_size,
             num_workers=args.num_workers,
             pin_memory=(device.type == 'cuda'),
-            n_species=n_species,
+            n_species=_t_n_species,
             jitter_std=jitter_std,
             species_freq_weights=_trial_freq_weights,
         )
 
         model = create_model(
-            n_species=n_species,
-            n_env_features=n_env,
+            n_species=_t_n_species,
+            n_env_features=_t_n_env,
             model_scale=float(p.get('model_scale', args.model_scale)),
             coord_harmonics=int(p.get('coord_harmonics', args.coord_harmonics)),
             week_harmonics=int(p.get('week_harmonics', args.week_harmonics)),
@@ -344,6 +436,11 @@ def run_autotune(
             else:
                 scheduler = cosine
 
+        species_vocab = {
+            'species_to_idx': preprocessor.species_to_idx,
+            'idx_to_species': preprocessor.idx_to_species,
+        }
+
         trainer = trainer_cls(
             model=model,
             criterion=criterion,
@@ -352,6 +449,8 @@ def run_autotune(
             device=device,
             checkpoint_dir=Path(args.checkpoint_dir) / 'autotune',
             patience=0,
+            species_vocab=species_vocab,
+            watchlist=watchlist_species,
         )
 
         best_geoscore = 0.0
@@ -389,6 +488,20 @@ def run_autotune(
                     'val_list_ratio_5': val_m['list_ratio_5'],
                     'val_list_ratio_10': val_m['list_ratio_10'],
                     'val_list_ratio_25': val_m['list_ratio_25'],
+                    # GeoScore component metrics
+                    'val_map_sparse': val_m.get('map_sparse', 0.0),
+                    'val_map_dense': val_m.get('map_dense', 0.0),
+                    'val_map_density_ratio': val_m.get('map_density_ratio', 0.0),
+                    'val_pred_density_corr': val_m.get('pred_density_corr', 0.0),
+                    'val_watchlist_mean_ap': val_m.get('watchlist_mean_ap', 0.0),
+                    # Precision / recall detail
+                    'val_precision_5': val_m.get('precision_5', 0.0),
+                    'val_precision_10': val_m.get('precision_10', 0.0),
+                    'val_precision_25': val_m.get('precision_25', 0.0),
+                    'val_recall_5': val_m.get('recall_5', 0.0),
+                    'val_recall_10': val_m.get('recall_10', 0.0),
+                    'val_recall_25': val_m.get('recall_25', 0.0),
+                    'val_mean_list_len_10': val_m.get('mean_list_len_10', 0.0),
                 }
             )
             trial.set_user_attr('epoch_history', epoch_history)

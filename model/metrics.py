@@ -23,6 +23,15 @@ def compute_geoscore(metrics: Dict[str, float]) -> float:
     """Compute the GeoScore composite quality metric.
 
     Missing components are skipped and weights are renormalized.
+
+    Component transforms (all map to [0, 1], higher = better):
+    - map, f1_10, watchlist_mean_ap, holdout_map: used directly (already [0, 1])
+    - list_ratio_10: exp(-|log(r)|) — symmetric penalty around ratio=1,
+      equivalent to min(r, 1/r); never collapses to zero for finite ratios
+    - map_density_ratio: min(r, 1/r) — peaks at 1.0 for perfect
+      sparse/dense balance; penalizes both sparse-dominant and dense-dominant
+      bias symmetrically
+    - pred_density_corr: 1 - |r| — lower absolute correlation is better
     """
     scored: List[Tuple[float, float]] = []
 
@@ -33,7 +42,13 @@ def compute_geoscore(metrics: Dict[str, float]) -> float:
 
         if key == 'list_ratio_10':
             # Symmetric penalty for over/under prediction around ratio=1.
-            val = max(0.0, 1.0 - abs(math.log(max(raw, 1e-8))))
+            # exp(-|log(r)|) = min(r, 1/r): smooth, never zero for finite r.
+            val = math.exp(-abs(math.log(max(raw, 1e-8))))
+        elif key == 'map_density_ratio':
+            # Perfect balance (ratio=1.0) scores 1.0; deviations in either
+            # direction are penalized equally.  Prevents gaming via
+            # aggressive propagation that makes sparse > dense.
+            val = min(raw, 1.0 / max(raw, 1e-8))
         elif key == 'pred_density_corr':
             # Lower absolute correlation is better.
             val = max(0.0, 1.0 - abs(raw))

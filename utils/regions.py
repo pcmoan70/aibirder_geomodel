@@ -31,6 +31,37 @@ REGION_BOUNDS = {
     'south eastern asia': (92.0, -11.0, 151.0, 23.0),
 }
 
+# Non-overlapping regions tiling global land masses for representative sampling.
+# Each is (lon_min, lat_min, lon_max, lat_max).
+GLOBAL_SAMPLING_REGIONS: Dict[str, Tuple[float, float, float, float]] = {
+    # North America
+    'na_west':          (-170.0, 25.0, -105.0, 72.0),
+    'na_east':          (-105.0, 25.0, -50.0, 72.0),
+    'central_america':  (-120.0, 7.0, -60.0, 25.0),
+    # South America
+    'sa_north':         (-82.0, -5.0, -34.0, 13.0),
+    'sa_central':       (-82.0, -25.0, -34.0, -5.0),
+    'sa_south':         (-82.0, -56.0, -34.0, -25.0),
+    'pantanal':         (-59.0, -22.0, -54.0, -15.0),
+    # Europe
+    'europe_west':      (-12.0, 36.0, 15.0, 62.0),
+    'europe_east':      (15.0, 36.0, 40.0, 62.0),
+    'scandinavia':      (4.0, 55.0, 32.0, 72.0),
+    # Africa
+    'africa_north':     (-18.0, 15.0, 52.0, 37.0),
+    'africa_west':      (-18.0, -5.0, 20.0, 15.0),
+    'africa_east':      (20.0, -5.0, 52.0, 15.0),
+    'africa_south':     (-18.0, -35.0, 52.0, -5.0),
+    # Asia
+    'middle_east':      (25.0, 12.0, 60.0, 42.0),
+    'central_asia':     (40.0, 35.0, 90.0, 55.0),
+    'south_asia':       (60.0, 5.0, 98.0, 35.0),
+    'east_asia':        (98.0, 20.0, 145.0, 55.0),
+    'southeast_asia':   (92.0, -11.0, 145.0, 20.0),
+    # Oceania
+    'australia':        (112.0, -44.0, 154.0, -10.0),
+}
+
 
 # Well-surveyed regions suitable for spatial generalisation testing.
 # These can be held out from training and used to evaluate how well

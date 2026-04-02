@@ -15,7 +15,8 @@ Usage:
 
     # Adjust propagation parameters
     python scripts/plot_propagation.py --data_path outputs/combined.parquet --lat 50.83 --lon 12.92 \
-        --propagate_k 5 --propagate_max_radius 2000 --propagate_min_obs 3
+        --propagate_k 10 --propagate_max_radius 1000 --propagate_min_obs 10 \
+        --propagate_env_dist_max 2.0 --propagate_range_cap 500
 """
 
 import argparse
@@ -281,14 +282,18 @@ def main():
                         help='Show detailed species diff for this week')
     parser.add_argument('--taxonomy', type=str, default=None,
                         help='Taxonomy CSV for species name lookup')
-    parser.add_argument('--propagate_k', type=int, default=5,
-                        help='Number of env-space neighbors (default: 5)')
-    parser.add_argument('--propagate_max_radius', type=float, default=2000.0,
-                        help='Max geographic radius in km (default: 2000)')
-    parser.add_argument('--propagate_min_obs', type=int, default=3,
-                        help='Sparsity threshold (default: 3)')
+    parser.add_argument('--propagate_k', type=int, default=10,
+                        help='Number of env-space neighbors (default: 10)')
+    parser.add_argument('--propagate_max_radius', type=float, default=1000.0,
+                        help='Max geographic radius in km (default: 1000)')
+    parser.add_argument('--propagate_min_obs', type=int, default=10,
+                        help='Sparsity threshold (default: 10)')
     parser.add_argument('--propagate_max_spread', type=float, default=2.0,
                         help='Restrict propagation distance by species range radius factor')
+    parser.add_argument('--propagate_env_dist_max', type=float, default=2.0,
+                        help='Max environmental distance for neighbor eligibility (default: 2.0)')
+    parser.add_argument('--propagate_range_cap', type=float, default=500.0,
+                        help='Hard km ceiling on per-species propagation distance (default: 500)')
     parser.add_argument('--no_yearly', action='store_true',
                         help='Exclude yearly (week 0) samples')
     parser.add_argument('--outdir', type=str, default='outputs/plots/propagation',
@@ -323,6 +328,8 @@ def main():
         max_radius_km=args.propagate_max_radius,
         min_obs_threshold=args.propagate_min_obs,
         max_spread_factor=args.propagate_max_spread,
+        env_dist_max=args.propagate_env_dist_max,
+        range_cap_km=args.propagate_range_cap,
     )
 
     # Global summary plot
