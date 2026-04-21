@@ -15,6 +15,9 @@ Usage::
 
     # Restrict to a named region
     python scripts/plot_environmental.py --input data.parquet --bounds europe
+
+    # Fit the map to whatever the data covers (no global frame)
+    python scripts/plot_environmental.py --input data.parquet --auto-extent
 """
 
 
@@ -104,6 +107,7 @@ def plot_variable(
     discrete: bool = False,
     figsize: Tuple[int, int] = (16, 9),
     sample_limit: Optional[int] = 200000,
+    extent: Optional[Tuple[float, float, float, float]] = None,
 ):
     """Plot a single column from a GeoDataFrame and save PNG to ``out_path``.
 
@@ -144,13 +148,22 @@ def plot_variable(
         gdf_plot = gdf.sample(n=sample_limit, random_state=42)
     print(f"Plotting '{column}' ({len(gdf_plot)} cells) -> {out_path}")
 
-    proj = ccrs.Robinson()
+    # PlateCarree for regional extents (faithful rectangles); Robinson for global.
+    if extent is not None:
+        lon_min, lat_min, lon_max, lat_max = extent
+        mid_lon = 0.5 * (lon_min + lon_max)
+        proj = ccrs.PlateCarree(central_longitude=mid_lon)
+    else:
+        proj = ccrs.Robinson()
     fig, ax = plt.subplots(1, 1, figsize=figsize, subplot_kw=dict(projection=proj))
     # Use figure size and subplots_adjust for wide layout; avoid forcing box
     # aspect on map projections (this distorts Robinson and causes cropping).
     fig.subplots_adjust(left=0.02, right=0.98, top=0.95, bottom=0.05)
-    ax.set_global()
-    ax.set_extent([-180, 180, -90, 90], crs=ccrs.PlateCarree())
+    if extent is not None:
+        ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+    else:
+        ax.set_global()
+        ax.set_extent([-180, 180, -90, 90], crs=ccrs.PlateCarree())
     ax.add_feature(cfeature.OCEAN, zorder=0)
     ax.add_feature(cfeature.LAND, zorder=0, edgecolor="black", linewidth=0.2)
     ax.add_feature(cfeature.COASTLINE, linewidth=0.4)
@@ -232,7 +245,7 @@ def plot_variable(
     print(f"Saved {out_path}")
 
 
-def plot_all(input_path: str, outdir: str, sample_limit: Optional[int] = 200000, columns: Optional[List[str]] = None, bounds: Optional[Tuple[float, float, float, float]] = None):
+def plot_all(input_path: str, outdir: str, sample_limit: Optional[int] = 200000, columns: Optional[List[str]] = None, bounds: Optional[Tuple[float, float, float, float]] = None, auto_extent: bool = False, padding: float = 2.0):
     gdf = load_gdf(input_path)
     # If bounds provided, filter to cells whose centroids fall within bbox
     if bounds is not None:
@@ -240,6 +253,22 @@ def plot_all(input_path: str, outdir: str, sample_limit: Optional[int] = 200000,
         cent = gdf.geometry.centroid
         mask = (cent.x >= lon_min) & (cent.x <= lon_max) & (cent.y >= lat_min) & (cent.y <= lat_max)
         gdf = gdf[mask]
+
+    # Compute map extent: explicit bounds, else data-driven when --auto-extent.
+    extent: Optional[Tuple[float, float, float, float]] = None
+    if bounds is not None:
+        extent = tuple(bounds)  # (lon_min, lat_min, lon_max, lat_max)
+    elif auto_extent and len(gdf) > 0:
+        b = gdf.geometry.total_bounds  # (minx, miny, maxx, maxy)
+        extent = (
+            max(-180.0, float(b[0]) - padding),
+            max(-90.0,  float(b[1]) - padding),
+            min( 180.0, float(b[2]) + padding),
+            min(  90.0, float(b[3]) + padding),
+        )
+        print(f"Auto-extent: lon [{extent[0]:.2f}, {extent[2]:.2f}]  "
+              f"lat [{extent[1]:.2f}, {extent[3]:.2f}]")
+
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -267,7 +296,7 @@ def plot_all(input_path: str, outdir: str, sample_limit: Optional[int] = 200000,
 
     for col in plot_cols:
         cmap = next((cm for c, cm in targets if c == col), None)
-        plot_variable(gdf, col, outdir / f"{col}.png", cmap=(cmap or "viridis"), discrete=(col == "landcover_class"), sample_limit=sample_limit)
+        plot_variable(gdf, col, outdir / f"{col}.png", cmap=(cmap or "viridis"), discrete=(col == "landcover_class"), sample_limit=sample_limit, extent=extent)
 
 
 def parse_columns(s: Optional[str]) -> Optional[List[str]]:
@@ -283,12 +312,19 @@ def main():
     parser.add_argument("--sample-limit", type=lambda s: None if s in ("None", "none", "-1") else int(s), default=200000, help='Max cells to plot (random sample). Use "None" or -1 for no downsampling')
     parser.add_argument("--bounds", nargs='+', help='Optional bounding box (4 floats) or named region: usa,europe,arctic,...')
     parser.add_argument("--columns", help="Comma-separated list of columns to plot (default: standard set)")
+    parser.add_argument("--auto-extent", action="store_true",
+                        help="Zoom the map to the data extent instead of plotting a global map. "
+                             "Ignored when --bounds is given (the bounds are used directly).")
+    parser.add_argument("--padding", type=float, default=2.0,
+                        help="Degrees of padding around the data extent when --auto-extent is set (default: 2.0)")
     args = parser.parse_args()
 
     cols = parse_columns(args.columns)
     bounds = resolve_bounds_arg(args.bounds)
 
-    plot_all(args.input, args.outdir, sample_limit=args.sample_limit, columns=cols, bounds=bounds)
+    plot_all(args.input, args.outdir, sample_limit=args.sample_limit,
+             columns=cols, bounds=bounds,
+             auto_extent=args.auto_extent, padding=args.padding)
 
 
 if __name__ == "__main__":

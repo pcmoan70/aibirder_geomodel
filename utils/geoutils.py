@@ -576,73 +576,113 @@ def export_geoparquet(gdf: gpd.GeoDataFrame, out_path: str) -> None:
     return
 
 
-def fill_missing_with_nearest(gdf: gpd.GeoDataFrame, columns: Optional[List[str]] = None) -> gpd.GeoDataFrame:
-    """Fill missing values in `gdf` by copying the value from the nearest
-    neighbor that has a non-missing value.
+def fill_missing_with_nearest(
+    gdf: gpd.GeoDataFrame,
+    columns: Optional[List[str]] = None,
+    k: int = 3,
+    skip_empty_rows: bool = False,
+    zero_as_missing: Optional[List[str]] = None,
+) -> gpd.GeoDataFrame:
+    """Fill missing values in ``gdf`` from the ``k`` nearest non-missing neighbours.
 
-    - `columns`: list of columns to process. If None, all non-geometry, non-id
-      columns will be considered.
+    Uses ``scipy.spatial.cKDTree`` for batched nearest-neighbour queries
+    instead of a per-cell Python loop, cutting runtime from hours to seconds
+    on parquets with ~100k cells.
 
-    This uses centroids of geometries and a simple nearest-neighbor search
-    implemented with NumPy; it's memory-efficient for moderate-sized GeoDataFrames.
+    Parameters
+    ----------
+    gdf : GeoDataFrame
+        Input frame with geometries and value columns.
+    columns : list of str, optional
+        Columns to process. If None, all non-geometry / non-id columns are
+        considered.
+    k : int
+        Number of nearest neighbours whose values are averaged (numeric) or
+        voted on (categorical). Default 3.
+    skip_empty_rows : bool
+        If True, skip rows that are missing *every* considered column
+        (e.g. cells where EE sampling failed entirely). Default False —
+        those rows are filled too, because an H3 cell in the grid is
+        presumed to need a value even if its EE reducer returned nothing.
+    zero_as_missing : list of str, optional
+        Column names where value ``0`` should also be treated as missing
+        (typical for EE-masked rasters that encode no-data as 0, e.g.
+        ``canopy_height_m``). Default None.
     """
+    from scipy.spatial import cKDTree
+
     if columns is None:
-        # exclude common metadata columns
         exclude = {'geometry', 'h3_index', 'h3_resolution', 'target_km'}
         columns = [c for c in gdf.columns if c not in exclude]
 
-    if gdf.empty:
+    if gdf.empty or not columns:
         return gdf
 
-    # Precompute centroid coordinates
-    coords = np.array([[geom.centroid.x, geom.centroid.y] for geom in gdf.geometry])
+    # Use bounding-box centres as cell positions. For H3 hexagons this is
+    # effectively the centroid, but uses only vectorised numeric ops (no
+    # shapely centroid call) which also sidesteps the geographic-CRS
+    # centroid warning from GeoPandas.
+    b = gdf.geometry.bounds
+    coords = np.column_stack([
+        ((b['minx'] + b['maxx']) * 0.5).to_numpy(),
+        ((b['miny'] + b['maxy']) * 0.5).to_numpy(),
+    ])
 
-    # Determine rows that have at least one non-missing value across the
-    # considered columns. We only fill missing values for rows that are not
-    # completely empty (rows that might correspond to missing EE cells).
-    if columns:
+    if skip_empty_rows:
         rows_with_any = (~gdf[columns].isna()).any(axis=1).to_numpy()
     else:
-        rows_with_any = np.array([False] * len(gdf))
+        rows_with_any = np.ones(len(gdf), dtype=bool)
 
-    for col in columns:
+    zero_cols = set(zero_as_missing or [])
+
+    summary: List[str] = []
+    pbar = tqdm(columns, desc='Filling missing (nearest)', unit='col')
+    for col in pbar:
         if col not in gdf.columns:
             continue
+        pbar.set_postfix_str(col)
+        col_vals = gdf[col].to_numpy()
         missing_mask = gdf[col].isna().to_numpy()
-        if not missing_mask.any():
+        if col in zero_cols and ptypes.is_numeric_dtype(gdf[col].dtype):
+            missing_mask = missing_mask | (col_vals == 0)
+        n_missing_before = int(missing_mask.sum())
+        if n_missing_before == 0:
             continue
         non_missing_idx = np.where(~missing_mask)[0]
-        missing_idx = np.where(missing_mask)[0]
         if non_missing_idx.size == 0:
-            # nothing to fill from
+            summary.append(f'  {col}: no source values — skipped '
+                           f'({n_missing_before} remain NaN)')
+            continue
+        fillable_idx = np.where(missing_mask & rows_with_any)[0]
+        if fillable_idx.size == 0:
             continue
 
-        # Only attempt to fill rows that have at least one other value present.
-        # Skip rows that are completely empty across the considered columns.
-        k = 3
-        for mi in missing_idx:
-            if not rows_with_any[mi]:
-                continue
-            # squared distances to non-missing points
-            dists = np.sum((coords[non_missing_idx] - coords[mi]) ** 2, axis=1)
-            # indices of the k nearest non-missing points
-            order = np.argsort(dists)[:k]
-            nearest_idx = non_missing_idx[order]
-            try:
-                vals = gdf.iloc[nearest_idx][col].dropna().to_numpy()
-                if vals.size == 0:
-                    continue
-                # Numeric: use mean of nearest values. Categorical: use mode.
-                if ptypes.is_numeric_dtype(gdf[col].dtype):
-                    fill_val = float(np.mean(vals.astype(float)))
-                else:
-                    # simple mode from nearest neighbours
-                    uniq, counts = np.unique(vals, return_counts=True)
-                    fill_val = uniq[int(np.argmax(counts))]
-                gdf.at[gdf.index[mi], col] = fill_val
-            except Exception:
-                # best-effort: skip on any assignment error
-                continue
+        kk = int(min(k, non_missing_idx.size))
+        tree = cKDTree(coords[non_missing_idx])
+        _, nn_local = tree.query(coords[fillable_idx], k=kk)
+        if nn_local.ndim == 1:
+            nn_local = nn_local[:, None]
+        nn_global = non_missing_idx[nn_local]
+        neighbour_vals = col_vals[nn_global]  # (M, kk)
+
+        if ptypes.is_numeric_dtype(gdf[col].dtype):
+            fill_vals = np.nanmean(neighbour_vals.astype(float), axis=1)
+        else:
+            fill_vals = np.empty(fillable_idx.size, dtype=object)
+            for i, row in enumerate(neighbour_vals):
+                uniq, counts = np.unique(row, return_counts=True)
+                fill_vals[i] = uniq[int(np.argmax(counts))]
+
+        col_vals = col_vals.copy()
+        col_vals[fillable_idx] = fill_vals
+        gdf[col] = col_vals
+
+        remaining = int(gdf[col].isna().sum())
+        summary.append(f'  {col}: filled {fillable_idx.size}/{n_missing_before} '
+                       f'(remaining NaN: {remaining})')
+
+    if summary:
+        LOG.info('Fill summary:\n%s', '\n'.join(summary))
 
     return gdf
 
@@ -983,7 +1023,27 @@ if __name__ == '__main__':
     parser.add_argument('--combine', action='store_true', help='Combine chunk parquet files into a single parquet after processing')
     parser.add_argument('--combined-out', type=str, default=None, help='Path to write combined parquet (when --combine used)')
     parser.add_argument('--fraction', type=float, default=1.0, help='Random fraction (0-1] of all H3 cells to process (useful for quick tests)')
+    parser.add_argument('--fill-only', type=str, default=None, help='Skip EE sampling and only run fill_missing_with_nearest on the given existing parquet. Writes back in place unless --combined-out is given.')
+    parser.add_argument('--skip-empty-rows', action='store_true', help='When filling, skip H3 cells whose values are NaN in every column (old behaviour). Default: fill them too.')
+    parser.add_argument('--zero-as-missing', type=str, default='canopy_height_m', help='Comma-separated column names where value 0 is treated as missing and filled from neighbours (typical for EE-masked rasters). Default: canopy_height_m. Pass "" to disable.')
     args = parser.parse_args()
+
+    # --fill-only: skip EE entirely, just run the nearest-neighbour fill.
+    if args.fill_only:
+        in_path = args.fill_only
+        out_path = args.combined_out or in_path
+        LOG.info('Fill-only mode: loading %s', in_path)
+        gdf = gpd.read_parquet(in_path)
+        LOG.info('Loaded %d rows, filling missing values...', len(gdf))
+        zero_cols = [c.strip() for c in args.zero_as_missing.split(',') if c.strip()]
+        gdf_filled = fill_missing_with_nearest(
+            gdf,
+            skip_empty_rows=args.skip_empty_rows,
+            zero_as_missing=zero_cols or None,
+        )
+        export_geoparquet(gdf_filled, out_path)
+        LOG.info('Fill-missing complete: %s', out_path)
+        sys.exit(0)
 
     # Initialize EE (will raise if not authenticated)
     initialize_ee()

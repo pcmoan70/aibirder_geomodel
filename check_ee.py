@@ -1,0 +1,11 @@
+import geopandas as gpd                                   
+g = gpd.read_parquet('/media/pc/HD1/aibirder_model_data/EE/norway_5km_ee.parquet')
+df = g.drop(columns='geometry')                                                                                                                                                       
+print('rows:', len(g))
+print()                                                                                                                                                                               
+print('NaN counts per column:')                           
+print(df.isna().sum())                                                                                                                                                                
+print()                                                   
+print('Zero counts per numeric column:')
+num = df.select_dtypes(include='number')                                                                                                                                              
+print((num == 0).sum())

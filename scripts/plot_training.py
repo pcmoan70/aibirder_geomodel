@@ -23,6 +23,7 @@ import numpy as np
 def plot_training(
     history_path: str = 'checkpoints/training_history.json',
     outdir: str = 'outputs/plots',
+    start_epoch: int = 1,
 ):
     """Plot training curves from a training history JSON file.
 
@@ -37,11 +38,24 @@ def plot_training(
     Args:
         history_path: Path to ``training_history.json``.
         outdir: Directory for the output PNG.
+        start_epoch: First epoch to plot (1-indexed). Useful for skipping the
+            warmup phase where losses dominate the y-axis and mask later
+            improvement.
     """
     with open(history_path) as f:
         history = json.load(f)
 
-    epochs = np.arange(1, len(history['train_loss']) + 1)
+    n_total = len(history['train_loss'])
+    start = max(1, int(start_epoch))
+    if start > n_total:
+        raise ValueError(f'--start {start} exceeds trained epochs ({n_total})')
+    offset = start - 1
+    if offset:
+        history = {
+            k: (v[offset:] if isinstance(v, list) else v)
+            for k, v in history.items()
+        }
+    epochs = np.arange(start, n_total + 1)
 
     has_metrics = 'val_map' in history and len(history['val_map']) > 0
     has_f1 = any(f'val_f1_{p}' in history and len(history.get(f'val_f1_{p}', [])) > 0
@@ -178,13 +192,17 @@ def main():
                         help='Path to training_history.json')
     parser.add_argument('--outdir', type=str, default='outputs/plots',
                         help='Output directory for the PNG')
+    parser.add_argument('--start', type=int, default=1,
+                        help='First epoch to plot (1-indexed). Skip early '
+                             'warmup epochs whose losses dominate the y-axis.')
     args = parser.parse_args()
 
     if not Path(args.history).exists():
         print(f"Error: {args.history} not found")
         sys.exit(1)
 
-    plot_training(history_path=args.history, outdir=args.outdir)
+    plot_training(history_path=args.history, outdir=args.outdir,
+                  start_epoch=args.start)
 
 
 if __name__ == '__main__':

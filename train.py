@@ -28,6 +28,7 @@ import json
 import math
 import os
 import pickle
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -230,6 +231,7 @@ class Trainer:
         log_interval: int = 10,
         watchlist: Optional[Dict[int, str]] = None,
         holdout_loader: Optional[DataLoader] = None,
+        use_amp: Optional[bool] = None,
     ):
         self.model = model.to(device)
         self.criterion = criterion
@@ -244,7 +246,7 @@ class Trainer:
 
         # AMP scaler — AN loss guards (logit clamp + nan_to_num in
         # AssumeNegativeLoss.forward) handle FP16 overflow safely.
-        self.use_amp = device.type == 'cuda'
+        self.use_amp = (device.type == 'cuda') if use_amp is None else bool(use_amp)
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -936,6 +938,10 @@ def main():
     parser.add_argument('--patience', type=int, default=10,
                         help='Early stopping patience (0 = disabled)')
 
+    parser.add_argument('--no_amp', action='store_true',
+                        help='Disable mixed precision (AMP). Recommended on Pascal GPUs '
+                             '(GTX 10xx) where FP16 throughput is 1/64 of FP32.')
+
     # Data split
     parser.add_argument('--val_size', type=float, default=0.1)
     parser.add_argument('--sample_fraction', type=float, default=1.0,
@@ -979,6 +985,9 @@ def main():
                              'e.g. \'{"propagate_k": [10, 20], "propagate_min_obs": [10, 20]}\'')
 
     args = parser.parse_args()
+
+    if args.resume and not Path(args.resume).is_file():
+        sys.exit(f"error: --resume checkpoint not found: {args.resume}")
 
     # Parse autotune_ranges JSON if provided
     if args.autotune_ranges is not None:
@@ -1329,6 +1338,7 @@ def main():
         patience=args.patience,
         watchlist=WATCHLIST_SPECIES,
         holdout_loader=holdout_loader,
+        use_amp=not args.no_amp,
     )
 
     if args.resume:
