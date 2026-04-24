@@ -310,6 +310,16 @@ class Trainer:
         n_skipped_nonfinite = 0
         n_total = len(train_loader)
 
+        # Bad-batch detection: dump a parquet of the offending batch for
+        # offline inspection. Triggers on (a) non-finite loss or (b) loss
+        # that exceeds 3× the running EMA once the EMA has warmed up.
+        ema_loss = None
+        ema_alpha = 0.1
+        ema_warmup = 20
+        spike_ratio = 3.0
+        n_bad_dumped = 0
+        max_bad_dumps = 20  # cap per epoch to avoid filling disk
+
         # When tqdm is disabled (e.g. TQDM_DISABLE=1), print phase markers
         _tqdm_off = os.environ.get('TQDM_DISABLE', '').strip() in ('1', 'true', 'True')
         if _tqdm_off:
@@ -340,6 +350,12 @@ class Trainer:
                 if n_skipped_nonfinite <= 3:
                     print(f"  Warning: skipping non-finite batch at idx={batch_idx} "
                           f"(epoch {self.current_epoch + 1})", flush=True)
+                if n_bad_dumped < max_bad_dumps:
+                    self._dump_bad_batch(
+                        inputs, targets, batch_idx, reason='nonfinite',
+                        loss_val=float('nan'),
+                    )
+                    n_bad_dumped += 1
                 continue
 
             self.scaler.scale(losses['total']).backward()
@@ -348,7 +364,21 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            total_loss += losses['total'].item()
+            loss_val = losses['total'].item()
+            # Spike detection: flag batches whose loss is >spike_ratio× the
+            # running EMA. Wait until EMA has warmed up before checking.
+            if ema_loss is not None and batch_idx >= ema_warmup:
+                if loss_val > spike_ratio * ema_loss and n_bad_dumped < max_bad_dumps:
+                    self._dump_bad_batch(
+                        inputs, targets, batch_idx, reason='spike',
+                        loss_val=loss_val, ema=ema_loss,
+                    )
+                    n_bad_dumped += 1
+            ema_loss = loss_val if ema_loss is None else (
+                ema_alpha * loss_val + (1 - ema_alpha) * ema_loss
+            )
+
+            total_loss += loss_val
             total_species += losses['species'].item()
             total_env += losses['env'].item()
             if 'habitat' in losses:
@@ -684,6 +714,96 @@ class Trainer:
             self.scaler.load_state_dict(ckpt['scaler_state_dict'])
         print(f"Resumed from epoch {self.current_epoch + 1}")
 
+    def _dump_bad_batch(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        batch_idx: int,
+        reason: str,
+        loss_val: float,
+        ema: Optional[float] = None,
+    ) -> None:
+        """Persist a batch to parquet for offline inspection when it trips the
+        bad-batch detector (non-finite loss or a spike above the running EMA).
+
+        Writes ``<checkpoint_dir>/bad_batches/bad_ep<E>_b<B>_<reason>.parquet``
+        with one row per sample: lat, lon, week, indices of present species,
+        and the raw env-features vector.
+        """
+        import pandas as pd
+        bad_dir = self.checkpoint_dir / 'bad_batches'
+        bad_dir.mkdir(parents=True, exist_ok=True)
+
+        lat = inputs['lat'].detach().cpu().numpy()
+        lon = inputs['lon'].detach().cpu().numpy()
+        week = inputs['week'].detach().cpu().numpy()
+        species_t = targets['species'].detach().cpu().numpy()
+        env_t = targets['env_features'].detach().cpu().numpy()
+
+        df = pd.DataFrame({'lat': lat, 'lon': lon, 'week': week})
+        df['species_present'] = [row.nonzero()[0].tolist() for row in species_t]
+        df['env_features'] = [row.tolist() for row in env_t]
+
+        meta = {
+            'epoch': self.current_epoch + 1,
+            'batch_idx': batch_idx,
+            'reason': reason,
+            'loss': loss_val,
+        }
+        if ema is not None:
+            meta['ema_loss'] = ema
+        # pandas attrs are preserved in pyarrow metadata when writing parquet
+        df.attrs = {k: str(v) for k, v in meta.items()}
+
+        fname = f"bad_ep{self.current_epoch + 1:03d}_b{batch_idx:05d}_{reason}.parquet"
+        out_path = bad_dir / fname
+        df.to_parquet(out_path, index=False)
+        info = f"loss={loss_val:.4f}" if not math.isnan(loss_val) else "loss=NaN"
+        if ema is not None:
+            info += f" (ema={ema:.4f}, ratio={loss_val / max(ema, 1e-12):.1f}×)"
+        print(
+            f"  [bad_batch] ep {self.current_epoch + 1} batch {batch_idx} "
+            f"reason={reason} {info} → {out_path}",
+            flush=True,
+        )
+
+    def reset_schedule(
+        self,
+        new_lr: float,
+        new_warmup: int,
+        remaining_epochs: int,
+        lr_min: float,
+    ) -> None:
+        """Override the loaded LR and rebuild the scheduler from scratch.
+
+        Used when resuming but wanting a different LR trajectory than the
+        one saved in the checkpoint. Call *after* ``load_checkpoint``.
+        """
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = new_lr
+            pg['initial_lr'] = new_lr
+        cosine_epochs = max(remaining_epochs - new_warmup, 1)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=cosine_epochs, eta_min=lr_min,
+        )
+        if new_warmup > 0:
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer,
+                start_factor=1.0 / max(new_warmup, 1),
+                end_factor=1.0,
+                total_iters=new_warmup,
+            )
+            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer, schedulers=[warmup, cosine],
+                milestones=[new_warmup],
+            )
+        else:
+            self.scheduler = cosine
+        print(
+            f"Schedule reset: lr={new_lr} (warmup {new_warmup} ep), "
+            f"cosine T_max={cosine_epochs}, eta_min={lr_min}"
+        )
+
     # -- main loop --------------------------------------------------------
 
     def train(self, train_loader: DataLoader, val_loader: DataLoader,
@@ -933,6 +1053,10 @@ def main():
                         help='Minimum LR for cosine schedule')
     parser.add_argument('--lr_warmup', type=int, default=3,
                         help='Linear LR warmup epochs before cosine schedule (default: 3, 0=off)')
+    parser.add_argument('--reset_schedule', action='store_true',
+                        help='On --resume, discard the loaded optimizer LR and scheduler '
+                             'state and rebuild them with the current --lr / --lr_warmup / '
+                             '--lr_min from the resumed epoch. Lets you change LR mid-run.')
 
     # Early stopping
     parser.add_argument('--patience', type=int, default=10,
@@ -955,7 +1079,12 @@ def main():
                              f'Available: {", ".join(sorted(HOLDOUT_REGIONS.keys()))}')
 
     # Checkpoints
-    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
+    parser.add_argument('--run_name', type=str, required=True,
+                        help='Name of this training run. Checkpoints and history '
+                             'land in <checkpoint_dir>/<run_name>/, keeping runs '
+                             'from clobbering each other.')
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
+                        help='Base directory; runs live in <checkpoint_dir>/<run_name>/.')
     parser.add_argument('--taxonomy', type=str, default=None,
                         help='Path to taxonomy CSV (produced by combine.py). Auto-detected if omitted.')
     parser.add_argument('--resume', type=str, default=None)
@@ -1253,7 +1382,7 @@ def main():
         'idx_to_species': preprocessor.idx_to_species,
     }
 
-    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir = Path(args.checkpoint_dir) / args.run_name
 
     # Save labels file from taxonomy CSV (produced by combine.py)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -1290,10 +1419,15 @@ def main():
 
     with open(labels_path, 'w', encoding='utf-8') as f:
         for idx in range(n_species):
-            pid = preprocessor.idx_to_species[idx]
-            sci, com = name_map.get(pid, (str(pid), str(pid)))
+            # idx_to_species values are numpy.int64; taxonomy keys are
+            # plain strings — normalize before the lookup.
+            pid = str(int(preprocessor.idx_to_species[idx]))
+            sci, com = name_map.get(pid, (pid, pid))
             f.write(f"{pid}\t{sci}\t{com}\n")
-    named = sum(1 for idx in range(n_species) if preprocessor.idx_to_species[idx] in name_map)
+    named = sum(
+        1 for idx in range(n_species)
+        if str(int(preprocessor.idx_to_species[idx])) in name_map
+    )
     print(f"   Saved {n_species} labels ({named} with names) to {labels_path}")
 
     # -- Criterion, optimizer, scheduler --
@@ -1343,6 +1477,16 @@ def main():
 
     if args.resume:
         trainer.load_checkpoint(Path(args.resume))
+        if args.reset_schedule:
+            remaining = max(args.num_epochs - trainer.current_epoch, 1)
+            trainer.reset_schedule(
+                new_lr=args.lr,
+                new_warmup=args.lr_warmup,
+                remaining_epochs=remaining,
+                lr_min=args.lr_min,
+            )
+    elif args.reset_schedule:
+        print("Warning: --reset_schedule has no effect without --resume.")
 
     # -- Train ---
     print("\n" + "=" * 70)

@@ -11,6 +11,9 @@ import logging
 import multiprocessing as mp
 import os
 import zipfile
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -176,8 +179,21 @@ def _filter_block(block_bytes):
 # Main processing entry point
 # ---------------------------------------------------------------------------
 
+def _find_occurrence_in_zip(z: zipfile.ZipFile) -> Optional[str]:
+    """Return the path to ``occurrence.txt`` inside *z*, or None if absent.
+
+    GBIF DwC-A zips typically nest it inside a subdir named after the
+    archive (e.g. ``gbif_norway_2025/occurrence.txt``).
+    """
+    for name in z.namelist():
+        if name.endswith('/occurrence.txt') or name == 'occurrence.txt':
+            return name
+    return None
+
+
 def process_gbif_file(gbif_zip_path, file, output_csv_path, valid_classes=None,
-                      taxonomy_path=None, max_rows=None, n_workers=None):
+                      taxonomy_path=None, max_rows=None, n_workers=None,
+                      append=False, valid_species=None, common_names=None):
     """Process a GBIF Darwin Core Archive zip using parallel workers.
 
     Reads raw byte blocks from the zip sequentially, then distributes
@@ -185,37 +201,54 @@ def process_gbif_file(gbif_zip_path, file, output_csv_path, valid_classes=None,
 
     Args:
         gbif_zip_path (str): Path to the GBIF Darwin Core Archive zip file.
-        file (str): Name of the CSV/TSV file inside the zip.
+        file (str): Name of the CSV/TSV file inside the zip. Pass ``None``
+            to auto-detect ``occurrence.txt``.
         output_csv_path (str): Output path for the processed CSV.
         valid_classes (list[str] | None): List of taxonomic classes to keep.
-        taxonomy_path (str | None): Path to taxonomy CSV for filtering.
+        taxonomy_path (str | None): Path to taxonomy CSV for filtering. Ignored
+            when ``valid_species`` is already provided (to avoid re-reading
+            the CSV for every archive in a batch run).
         max_rows (int | None): Maximum number of rows to process.
         n_workers (int | None): Number of parallel worker processes.
             Default: ``min(cpu_count - 1, 8)``.
+        append (bool): If True, open the output in append mode and skip the
+            header. Used when concatenating multiple archives into one file.
+        valid_species, common_names: Preloaded taxonomy data (see ``taxonomy_path``).
     """
     if n_workers is None:
         n_workers = min(max(1, os.cpu_count() - 1), 8)
 
     valid_classes_list = [c.lower() for c in valid_classes] if valid_classes else None
-    if taxonomy_path:
-        valid_species, common_names = load_taxonomy(taxonomy_path)
-    else:
-        valid_species, common_names = None, {}
+    if valid_species is None and common_names is None:
+        if taxonomy_path:
+            valid_species, common_names = load_taxonomy(taxonomy_path)
+        else:
+            valid_species, common_names = None, {}
 
     use_gzip = str(output_csv_path).endswith('.gz')
 
     with zipfile.ZipFile(gbif_zip_path, 'r') as z:
-        file_size = z.getinfo(file).file_size
+        resolved_file = file
+        if resolved_file is None:
+            resolved_file = _find_occurrence_in_zip(z)
+            if resolved_file is None:
+                raise FileNotFoundError(
+                    f"occurrence.txt not found inside {gbif_zip_path}"
+                )
+            logging.info(f"  auto-detected {resolved_file!r} inside {gbif_zip_path}")
+        file_size = z.getinfo(resolved_file).file_size
 
-        with z.open(file) as f:
+        with z.open(resolved_file) as f:
             header_line = f.readline().rstrip(b'\n\r')
 
             # Open output stream
+            mode = 'at' if append else 'wt'
             if use_gzip:
-                out = gzip.open(output_csv_path, 'wt', encoding='utf-8', compresslevel=6)
+                out = gzip.open(output_csv_path, mode, encoding='utf-8', compresslevel=6)
             else:
-                out = open(output_csv_path, 'w', encoding='utf-8')
-            out.write(','.join(OUTPUT_COLUMNS) + '\n')
+                out = open(output_csv_path, 'a' if append else 'w', encoding='utf-8')
+            if not append:
+                out.write(','.join(OUTPUT_COLUMNS) + '\n')
 
             init_args = (
                 header_line,
@@ -234,7 +267,7 @@ def process_gbif_file(gbif_zip_path, file, output_csv_path, valid_classes=None,
                     results = pool.imap(_filter_block, blocks, chunksize=1)
 
                     with tqdm(total=file_size,
-                              desc=f"Processing GBIF ({n_workers} workers)",
+                              desc=f"Processing {Path(gbif_zip_path).name} ({n_workers} workers)",
                               unit='B', unit_scale=True) as pbar:
                         for csv_str, n_rows, block_len in results:
                             if csv_str:
@@ -251,15 +284,20 @@ def process_gbif_file(gbif_zip_path, file, output_csv_path, valid_classes=None,
 
     logging.info(f"Processed {total_rows:,} rows, wrote {rows_written:,} records "
                  f"to {output_csv_path}")
+    return total_rows, rows_written
 
 
 if __name__ == '__main__':
     import argparse
     logging.basicConfig(level=logging.INFO)
 
-    parser = argparse.ArgumentParser(description='Process the zipped GBIF file and extract relevant columns.')
-    parser.add_argument('--gbif', type=str, default="gbif_dev.zip", help='Path to the zipped GBIF file')
-    parser.add_argument('--file', type=str, default="gbif_dev.csv", help='Name of the CSV file inside the zip')
+    parser = argparse.ArgumentParser(description='Process one or more zipped GBIF archives and concatenate into a single CSV.')
+    parser.add_argument('--gbif', type=str, nargs='+', required=True,
+                        help='Path(s) to the zipped GBIF archive(s). Multiple archives '
+                             'are processed in sequence and concatenated into --output.')
+    parser.add_argument('--file', type=str, default=None,
+                        help='Name of the CSV/TSV file inside each zip. If omitted, '
+                             'occurrence.txt is auto-detected in each archive.')
     parser.add_argument('--output', type=str, default="./outputs/gbif_processed.gz", help='Output gzipped CSV file')
     parser.add_argument('--valid_classes', nargs='*', default=['aves', 'amphibia', 'insecta', 'mammalia', 'reptilia'],
                         help='List of classes to include (default: aves, amphibia, insecta, mammalia, reptilia)')
@@ -270,10 +308,31 @@ if __name__ == '__main__':
                         help='Number of parallel workers (default: min(cpu_count-1, 8))')
     args = parser.parse_args()
 
-    process_gbif_file(
-        args.gbif, args.file, args.output,
-        valid_classes=[cls.lower() for cls in args.valid_classes],
-        taxonomy_path=args.taxonomy,
-        max_rows=args.max_rows,
-        n_workers=args.workers,
-    )
+    # Load taxonomy once, reuse across archives.
+    if args.taxonomy:
+        valid_species, common_names = load_taxonomy(args.taxonomy)
+    else:
+        valid_species, common_names = None, {}
+
+    classes_list = [cls.lower() for cls in args.valid_classes]
+    n_archives = len(args.gbif)
+    grand_rows = 0
+    grand_written = 0
+    for i, zip_path in enumerate(args.gbif):
+        logging.info(f"--- Archive {i+1}/{n_archives}: {zip_path} ---")
+        rows, written = process_gbif_file(
+            zip_path, args.file, args.output,
+            valid_classes=classes_list,
+            taxonomy_path=None,  # already resolved above
+            max_rows=args.max_rows,
+            n_workers=args.workers,
+            append=(i > 0),
+            valid_species=valid_species,
+            common_names=common_names,
+        )
+        grand_rows += rows
+        grand_written += written
+
+    if n_archives > 1:
+        logging.info(f"TOTAL across {n_archives} archives: processed {grand_rows:,} rows, "
+                     f"wrote {grand_written:,} records to {args.output}")

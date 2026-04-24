@@ -47,9 +47,100 @@ from model.model import create_model
 from predict import load_labels
 from utils.regions import resolve_bounds_arg
 
-# The four weeks to plot (roughly Jan, Apr, Jul, Oct)
-PLOT_WEEKS = [1, 13, 26, 39]
-WEEK_LABELS = {1: "Week 1 (Jan)", 13: "Week 13 (Apr)", 26: "Week 26 (Jul)", 39: "Week 39 (Oct)"}
+DEFAULT_WEEK_STRIDE = 12
+
+# Weeks excluded from plots by default. Week 48 shares its sin/cos encoding
+# with the synthetic "yearly" sample (week=0) inserted by the data loader
+# when ``include_yearly=True``. Any model trained with those samples sees
+# week 48 as the union-of-all-species target, so its predictions there are
+# contaminated. Override with --skip_weeks on the CLI (pass '' to disable).
+DEFAULT_SKIP_WEEKS: Tuple[int, ...] = (48,)
+
+
+def compute_plot_weeks(stride: int, skip: Tuple[int, ...] = DEFAULT_SKIP_WEEKS) -> List[int]:
+    """Return the weeks to plot, starting from 1 with the given stride.
+
+    ``stride=12`` → ``[1, 13, 25, 37]`` (4 panels, roughly seasonal).
+    ``stride=6``  → ``[1, 7, 13, …, 43]`` (8 panels, bimonthly).
+    ``stride=4``  → 12 panels (monthly).
+
+    Any week in ``skip`` is dropped from the output — e.g. to avoid rendering
+    week 48, which shares its Fourier encoding with the yearly-bag sample.
+    """
+    if stride < 1:
+        raise ValueError(f'week stride must be ≥ 1, got {stride}')
+    skip_set = set(skip or ())
+    return [w for w in range(1, 49, stride) if w not in skip_set]
+
+
+def _layout_rows_cols(n: int) -> Tuple[int, int]:
+    """Pick a grid (rows, cols) that's close to square but biased towards
+    more columns than rows for better aspect on maps."""
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    return rows, cols
+
+NORMALIZATION_CHOICES = ('raw', 'max', 'sum', 'percentile', 'log')
+
+
+def apply_normalization(values: np.ndarray, mode: str) -> np.ndarray:
+    """Transform raw probabilities according to the selected display mode.
+
+    Normalization is always applied jointly over the values passed in —
+    typically all cells × all weeks for a single species — so each species'
+    map is comparable with itself across time and space.
+
+    Modes
+    -----
+    raw
+        No transform. Renders the raw sigmoid probability.
+    max
+        Divide by the maximum value in the pool → [0, 1]. Makes each
+        species fill the full colour range regardless of absolute level.
+    sum
+        *Per-point* normalization: at each (cell, week), divide this
+        species' probability by the sum of **all** species' probabilities
+        at that same point. Each cell then shows the share of total
+        predicted activity that this species represents. Requires the
+        full-vocabulary logits, so upstream prediction must produce them.
+    percentile
+        Rank-transform: each value is mapped to its empirical percentile
+        within the pool → [0, 1]. Robust to extreme outliers and makes
+        maps across species/sites visually comparable.
+    log
+        ``log10(value + eps)``. Useful when probabilities span orders of
+        magnitude (e.g. well-surveyed lowlands vs sparse uplands).
+    """
+    if mode == 'raw':
+        return values
+    arr = np.asarray(values, dtype=float)
+    if mode == 'max':
+        m = float(arr.max()) if arr.size else 0.0
+        return arr / m if m > 0 else arr
+    if mode == 'sum':
+        # Per-point normalization is handled in predict_grid (requires
+        # full-vocab logits); here we just pass the values through.
+        return arr
+    if mode == 'percentile':
+        flat = arr.ravel()
+        order = flat.argsort()
+        ranks = np.empty_like(order, dtype=float)
+        ranks[order] = np.arange(1, flat.size + 1)
+        return (ranks / flat.size).reshape(arr.shape)
+    if mode == 'log':
+        eps = 1e-6
+        return np.log10(np.clip(arr, eps, None))
+    raise ValueError(f'Unknown normalization mode: {mode!r}')
+
+
+def _colorbar_label(mode: str) -> str:
+    return {
+        'raw':        'Predicted occurrence probability',
+        'max':        'Probability / max (per species)',
+        'sum':        'Share of predicted activity at this point',
+        'percentile': 'Percentile within species',
+        'log':        'log10(probability)',
+    }[mode]
 
 
 def build_grid(
@@ -155,8 +246,15 @@ def _plot_gt_cells(ax, gt_df, cell_lats, cell_lons, taxon_key: str, week: int):
     )
 
 
-def load_model_and_labels(checkpoint_path: str, device: torch.device):
-    """Load model checkpoint and labels. Returns model, idx_to_species, labels dict."""
+def load_model_and_labels(checkpoint_path: str, device: torch.device,
+                          taxonomy_path: Optional[str] = None):
+    """Load model checkpoint and labels.
+
+    Returns ``(model, idx_to_species, labels)``. If ``labels.txt`` is
+    present but unnamed (a row's scientific / common name equals the
+    taxonKey), names are filled in from ``taxonomy_path`` — auto-detected
+    next to the input data parquet or at repo root, or explicit via arg.
+    """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_config = ckpt['model_config']
     species_vocab = ckpt['species_vocab']
@@ -181,7 +279,67 @@ def load_model_and_labels(checkpoint_path: str, device: torch.device):
         labels_path = ckpt_dir / 'labels.txt'
     labels = load_labels(str(labels_path)) if labels_path.exists() else {}
 
+    # Enrich unnamed labels (where sci == com == taxonKey) from taxonomy CSV.
+    labels = _enrich_labels_with_taxonomy(labels, taxonomy_path)
     return model, idx_to_species, labels
+
+
+def _enrich_labels_with_taxonomy(
+    labels: Dict[int, Tuple[str, str, str]],
+    taxonomy_path: Optional[str],
+) -> Dict[int, Tuple[str, str, str]]:
+    """Replace numeric-only label entries with names from the taxonomy CSV."""
+    if not labels:
+        return labels
+    # Nothing to do if every row already has sci != code.
+    needs_enrich = any(
+        sci == code or com == code
+        for code, sci, com in labels.values()
+    )
+    if not needs_enrich:
+        return labels
+
+    candidates: List[Path] = []
+    if taxonomy_path:
+        candidates.append(Path(taxonomy_path))
+    # common locations
+    repo_root = Path(__file__).resolve().parent.parent
+    candidates.extend([
+        repo_root / 'taxonomy.csv',
+        Path('/media/pc/HD1/aibirder_model_data/combined_taxonomy.csv'),
+        Path('/media/pc/HD1/aibirder_model_data/nordic_combined/taxonomy.csv'),
+    ])
+    tax_file = next((p for p in candidates if p.is_file()), None)
+    if tax_file is None:
+        return labels
+
+    import csv as _csv
+    tax: Dict[str, Tuple[str, str]] = {}
+    with tax_file.open(encoding='utf-8') as f:
+        reader = _csv.DictReader(f)
+        # support either combine.py-style (taxonKey) or BirdNET-style (species_code)
+        for row in reader:
+            key = str(row.get('taxonKey') or row.get('species_code') or '').strip()
+            if not key:
+                continue
+            sci = (row.get('sci_name') or row.get('scientificName') or '').strip()
+            com = (row.get('com_name') or row.get('commonName') or sci).strip()
+            if sci:
+                tax[key] = (sci, com)
+    if not tax:
+        return labels
+
+    out = dict(labels)
+    n_enriched = 0
+    for idx, (code, sci, com) in labels.items():
+        if sci == code or com == code:
+            new = tax.get(code)
+            if new:
+                out[idx] = (code, new[0], new[1])
+                n_enriched += 1
+    if n_enriched:
+        print(f"  Enriched {n_enriched} labels with names from {tax_file}")
+    return out
 
 
 def resolve_species_indices(
@@ -227,9 +385,15 @@ def predict_grid(
     species_indices: List[int],
     device: torch.device,
     batch_size: int = 4096,
+    point_normalize: bool = False,
 ) -> np.ndarray:
     """
     Run inference for all grid cells at a given week.
+
+    If ``point_normalize`` is True, the *full* species vector's sigmoid is
+    computed per cell and each row is divided by its sum before slicing to
+    the requested species. The resulting values are each species' share of
+    the total predicted activity at that cell.
 
     Returns:
         probs: np.ndarray of shape (n_cells, n_requested_species)
@@ -247,8 +411,14 @@ def predict_grid(
         wb = week_t[start:end].to(device)
         with torch.no_grad():
             output = model(lb, lnb, wb, return_env=False)
-            logits = output['species_logits'][:, species_indices]
-            probs = torch.sigmoid(logits).cpu().numpy()
+            if point_normalize:
+                full = torch.sigmoid(output['species_logits'])
+                denom = full.sum(dim=1, keepdim=True).clamp_min(1e-12)
+                full = full / denom
+                probs = full[:, species_indices].cpu().numpy()
+            else:
+                logits = output['species_logits'][:, species_indices]
+                probs = torch.sigmoid(logits).cpu().numpy()
         all_probs.append(probs)
 
     return np.concatenate(all_probs, axis=0)  # (n_cells, n_species)
@@ -264,37 +434,75 @@ def plot_range_map(
     bounds: Tuple[float, float, float, float],
     vmax: Optional[float] = None,
     gt_data=None,
+    normalization: str = 'raw',
+    plot_weeks: Optional[List[int]] = None,
 ):
     """
-    Plot a 2×2 grid of range maps for one species across 4 weeks.
+    Plot a grid of range maps for one species across the selected weeks.
 
     Parameters:
         lats, lons: grid cell coordinates
-        probs_per_week: {week: probs_array} for each of the 4 weeks
+        probs_per_week: {week: probs_array} for each week in *plot_weeks*
         species_info: (model_idx, taxonKey, sciName, comName)
         outdir: output directory
         resolution_deg: grid resolution (for marker sizing)
         bounds: (lon_min, lat_min, lon_max, lat_max)
         vmax: optional max for color scale (default: auto from data)
+        normalization: one of NORMALIZATION_CHOICES — applied jointly over
+            all selected weeks of this species before rendering.
+        plot_weeks: weeks to plot (default: ``compute_plot_weeks(DEFAULT_WEEK_STRIDE)``).
     """
     _, taxon_key, sci_name, com_name = species_info
     is_global = bounds == (-180.0, -90.0, 180.0, 90.0)
+    if plot_weeks is None:
+        plot_weeks = compute_plot_weeks(DEFAULT_WEEK_STRIDE)
+
+    if normalization != 'raw':
+        pooled = np.concatenate([probs_per_week[w] for w in plot_weeks])
+        transformed = apply_normalization(pooled, normalization)
+        split_sizes = [probs_per_week[w].size for w in plot_weeks]
+        offsets = np.cumsum([0] + split_sizes)
+        probs_per_week = {
+            w: transformed[offsets[i]:offsets[i + 1]]
+            for i, w in enumerate(plot_weeks)
+        }
 
     if vmax is None:
-        all_vals = np.concatenate([probs_per_week[w] for w in PLOT_WEEKS])
-        vmax = float(np.percentile(all_vals[all_vals > 0], 99)) if (all_vals > 0).any() else 1.0
-        vmax = max(vmax, 0.05)  # Ensure a minimum scale
+        all_vals = np.concatenate([probs_per_week[w] for w in plot_weeks])
+        if normalization == 'log':
+            vmin = float(np.percentile(all_vals, 5))
+            vmax = float(np.percentile(all_vals, 99))
+        elif normalization in ('max', 'percentile'):
+            vmin, vmax = 0.0, 1.0
+        elif normalization == 'sum':
+            # Values sum to 1 across cells × weeks; a single cell's share
+            # is ≈ 1/N. No 0.05 floor here — that would flatten the scale.
+            positive = all_vals[all_vals > 0]
+            vmax = float(np.percentile(positive, 99)) if positive.size else 1.0
+            vmin = 0.0
+        else:
+            positive = all_vals[all_vals > 0]
+            vmax = float(np.percentile(positive, 99)) if positive.size else 1.0
+            vmax = max(vmax, 0.05)
+            vmin = 0.0
+    else:
+        vmin = 0.0 if normalization != 'log' else float(vmax) - 4.0
 
-    norm = mpl.colors.Normalize(vmin=0.0, vmax=vmax)
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
     cmap = plt.cm.YlOrRd.copy()
-    cmap.set_under(color='#f0f0f0', alpha=0.0)  # transparent for zero/near-zero
+    if normalization != 'log':
+        cmap.set_under(color='#f0f0f0', alpha=0.0)  # transparent for zero/near-zero
 
     proj = ccrs.Robinson() if is_global else ccrs.PlateCarree()
     # Suppress cartopy facecolor warning for BORDERS feature
     warnings.filterwarnings('ignore', message='facecolor will have no effect', category=UserWarning)
-    fig, axes = plt.subplots(2, 2, figsize=(18, 10), subplot_kw=dict(projection=proj))
+    nrows, ncols = _layout_rows_cols(len(plot_weeks))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.5, nrows * 2.7 + 1.0),
+                             subplot_kw=dict(projection=proj), squeeze=False)
+    flat_axes = axes.ravel()
 
-    for ax, week in zip(axes.ravel(), PLOT_WEEKS):
+    for i, week in enumerate(plot_weeks):
+        ax = flat_axes[i]
         probs = probs_per_week[week]
 
         if is_global:
@@ -307,7 +515,11 @@ def plot_range_map(
         if gt_data is not None:
             _plot_gt_cells(ax, *gt_data, taxon_key, week)
 
-        ax.set_title(WEEK_LABELS[week], fontsize=12, fontweight='bold')
+        ax.set_title(_week_label(week), fontsize=11, fontweight='bold')
+
+    # Hide any leftover axes when n_weeks doesn't fill the grid
+    for ax in flat_axes[len(plot_weeks):]:
+        ax.set_visible(False)
 
     gt_note = "\n(● = observed in training data)" if gt_data is not None else ""
     fig.suptitle(
@@ -318,7 +530,7 @@ def plot_range_map(
     # Shared colorbar
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     cbar = fig.colorbar(sm, ax=axes, orientation='horizontal', fraction=0.04, pad=0.06, shrink=0.6)
-    cbar.set_label('Predicted occurrence probability', fontsize=11)
+    cbar.set_label(_colorbar_label(normalization), fontsize=11)
 
     os.makedirs(outdir, exist_ok=True)
     safe_name = com_name.replace(' ', '_').replace('/', '_')
@@ -449,6 +661,8 @@ def _plot_gif(
     cols: int,
     fps: int,
     gt_data=None,
+    normalization: str = 'raw',
+    skip_weeks: Tuple[int, ...] = DEFAULT_SKIP_WEEKS,
 ):
     """Predict all 48 weeks and assemble an animated GIF."""
     n_species = len(species_list)
@@ -458,23 +672,46 @@ def _plot_gif(
     print(f"GIF mode: {n_species} species in {math.ceil(n_species / n_cols)}×{n_cols} grid, 48 frames")
 
     # First pass: predict all weeks and compute vmax per species
-    all_weeks = list(range(1, 49))
+    skip_set = set(skip_weeks or ())
+    all_weeks = [w for w in range(1, 49) if w not in skip_set]
+    if skip_set:
+        print(f"  (skipping weeks {sorted(skip_set)} from GIF — "
+              f"{len(all_weeks)} frames)")
+    point_norm = (normalization == 'sum')
     all_probs = {}
     for week in all_weeks:
         print(f"  Predicting week {week}/48...", end='\r')
-        all_probs[week] = predict_grid(model, lats, lons, week, model_indices, device, batch_size)
+        all_probs[week] = predict_grid(model, lats, lons, week, model_indices, device, batch_size,
+                                       point_normalize=point_norm)
     print(f"  Predictions complete for all 48 weeks.       ")
+
+    # Apply normalization per species, jointly over all 48 weeks
+    if normalization != 'raw':
+        for sp_idx in range(n_species):
+            pooled = np.concatenate([all_probs[w][:, sp_idx] for w in all_weeks])
+            transformed = apply_normalization(pooled, normalization)
+            n_cells = all_probs[all_weeks[0]].shape[0]
+            for i, w in enumerate(all_weeks):
+                all_probs[w][:, sp_idx] = transformed[i * n_cells:(i + 1) * n_cells]
 
     # Compute per-species vmax from the 99th percentile across all weeks
     vmax_per_species = []
     for sp_idx in range(n_species):
         all_vals = np.concatenate([all_probs[w][:, sp_idx] for w in all_weeks])
-        positive = all_vals[all_vals > 0]
-        if len(positive) > 0:
-            vmax = float(np.percentile(positive, 99))
-            vmax = max(vmax, 0.05)
-        else:
+        if normalization in ('max', 'percentile'):
             vmax = 1.0
+        elif normalization == 'log':
+            vmax = float(np.percentile(all_vals, 99)) if all_vals.size else 0.0
+        elif normalization == 'sum':
+            positive = all_vals[all_vals > 0]
+            vmax = float(np.percentile(positive, 99)) if positive.size else 1.0
+        else:
+            positive = all_vals[all_vals > 0]
+            if len(positive) > 0:
+                vmax = float(np.percentile(positive, 99))
+                vmax = max(vmax, 0.05)
+            else:
+                vmax = 1.0
         vmax_per_species.append(vmax)
 
     # Render frames
@@ -516,6 +753,10 @@ def plot_range_maps(
     cols: int = 0,
     fps: int = 4,
     data_path: Optional[str] = None,
+    normalization: str = 'raw',
+    week_stride: int = DEFAULT_WEEK_STRIDE,
+    skip_weeks: Tuple[int, ...] = DEFAULT_SKIP_WEEKS,
+    taxonomy_path: Optional[str] = None,
 ):
     """Generate species range maps for the given species.
 
@@ -533,7 +774,9 @@ def plot_range_maps(
         dev = torch.device(device)
 
     print(f"Using device: {dev}")
-    model, idx_to_species, labels = load_model_and_labels(checkpoint_path, dev)
+    model, idx_to_species, labels = load_model_and_labels(
+        checkpoint_path, dev, taxonomy_path=taxonomy_path,
+    )
 
     species_list = resolve_species_indices(species_names, None, idx_to_species, labels)
     if not species_list:
@@ -562,19 +805,26 @@ def plot_range_maps(
     if gif:
         _plot_gif(model, lats, lons, model_indices, species_list,
                   dev, batch_size, resolution_deg, bounds, outdir, cols, fps,
-                  gt_data=gt_data)
+                  gt_data=gt_data, normalization=normalization, skip_weeks=skip_weeks)
     else:
-        # Default mode: predict 4 seasonal weeks, one PNG per species
+        # Default mode: predict selected weeks, one PNG per species
+        plot_weeks = compute_plot_weeks(week_stride, skip=skip_weeks)
+        print(f"Plotting {len(plot_weeks)} weeks (stride={week_stride}): {plot_weeks}")
+        if skip_weeks:
+            print(f"  (skipping weeks {sorted(skip_weeks)} — pass '--skip_weeks' to override)")
+        point_norm = (normalization == 'sum')
         probs_by_week = {}
-        for week in PLOT_WEEKS:
+        for week in plot_weeks:
             print(f"  Predicting week {week}...")
-            probs = predict_grid(model, lats, lons, week, model_indices, dev, batch_size)
+            probs = predict_grid(model, lats, lons, week, model_indices, dev, batch_size,
+                                 point_normalize=point_norm)
             probs_by_week[week] = probs
 
         for sp_idx, sp_info in enumerate(species_list):
-            sp_probs_per_week = {w: probs_by_week[w][:, sp_idx] for w in PLOT_WEEKS}
+            sp_probs_per_week = {w: probs_by_week[w][:, sp_idx] for w in plot_weeks}
             plot_range_map(lats, lons, sp_probs_per_week, sp_info, outdir, resolution_deg, bounds,
-                           gt_data=gt_data)
+                           gt_data=gt_data, normalization=normalization,
+                           plot_weeks=plot_weeks)
 
         print(f"\nDone. {len(species_list)} range maps saved to {outdir}/")
 
@@ -610,6 +860,29 @@ def main():
                         help='Frames per second for the GIF (default: 4)')
     parser.add_argument('--data_path', type=str, default=None,
                         help='Path to training parquet for ground truth overlay')
+    parser.add_argument('--normalization', type=str, default='raw',
+                        choices=NORMALIZATION_CHOICES,
+                        help='How to scale probabilities for display: '
+                             'raw (default, sigmoid values); max (divide by '
+                             'per-species max → [0,1]); percentile (rank-'
+                             'transform → [0,1], outlier-robust); log '
+                             '(log10, good when probs span orders of magnitude).')
+    parser.add_argument('--week_stride', type=int, default=DEFAULT_WEEK_STRIDE,
+                        help=f'Stride between plotted weeks (default: {DEFAULT_WEEK_STRIDE}). '
+                             'Weeks are range(1, 49, stride). 12 → 4 seasonal panels; '
+                             '6 → 8 bimonthly; 4 → 12 monthly. Ignored in --gif mode.')
+    parser.add_argument('--skip_weeks', type=int, nargs='*',
+                        default=list(DEFAULT_SKIP_WEEKS),
+                        help='Weeks to exclude from plots. Default: 48 — its sin/cos '
+                             'encoding coincides with the synthetic week-0 "yearly" '
+                             'sample, so week-48 predictions are contaminated by '
+                             'the yearly species bag. Pass without arguments '
+                             "(i.e. --skip_weeks) to keep every week.")
+    parser.add_argument('--taxonomy', type=str, default=None,
+                        help='Path to taxonomy CSV (combined_taxonomy.csv or taxonomy.csv). '
+                             'Used to fill in species names when the checkpoint\'s '
+                             'labels.txt only contains taxonKeys. Auto-detected at '
+                             'repo root and common locations when omitted.')
     args = parser.parse_args()
 
     bounds = resolve_bounds_arg(args.bounds)
@@ -629,6 +902,10 @@ def main():
         cols=args.cols,
         fps=args.fps,
         data_path=args.data_path,
+        normalization=args.normalization,
+        week_stride=args.week_stride,
+        skip_weeks=tuple(args.skip_weeks),
+        taxonomy_path=args.taxonomy,
     )
 
 

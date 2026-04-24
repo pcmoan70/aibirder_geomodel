@@ -1022,6 +1022,10 @@ if __name__ == '__main__':
     parser.add_argument('--fill-missing', action='store_true', help='After combining parts, fill missing values by nearest neighbours')
     parser.add_argument('--combine', action='store_true', help='Combine chunk parquet files into a single parquet after processing')
     parser.add_argument('--combined-out', type=str, default=None, help='Path to write combined parquet (when --combine used)')
+    parser.add_argument('--keep-chunks', action='store_true',
+                        help='Preserve the per-chunk parquet files in --out-dir after '
+                             'combining. Default: chunks are deleted once the combined '
+                             'parquet is successfully written.')
     parser.add_argument('--fraction', type=float, default=1.0, help='Random fraction (0-1] of all H3 cells to process (useful for quick tests)')
     parser.add_argument('--fill-only', type=str, default=None, help='Skip EE sampling and only run fill_missing_with_nearest on the given existing parquet. Writes back in place unless --combined-out is given.')
     parser.add_argument('--skip-empty-rows', action='store_true', help='When filling, skip H3 cells whose values are NaN in every column (old behaviour). Default: fill them too.')
@@ -1057,7 +1061,8 @@ if __name__ == '__main__':
 
     if args.combine:
         combined_out = args.combined_out or os.path.join(args.out_dir, f'grid_{args.km}km_combined.parquet')
-        combined = combine_parquet_parts(args.out_dir, out_path=combined_out, remove_parts=True)
+        combined = combine_parquet_parts(args.out_dir, out_path=combined_out,
+                                         remove_parts=not args.keep_chunks)
         if combined:
             LOG.info('Combined parquet written to %s', combined)
             if args.fill_missing:
