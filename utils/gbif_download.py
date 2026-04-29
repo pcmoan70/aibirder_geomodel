@@ -175,13 +175,35 @@ def request_download(
 
 
 def poll_until_ready(key: str, poll_interval: int = 30) -> dict:
-    """Poll the download metadata until status is terminal. Return final meta."""
+    """Poll the download metadata until status is terminal. Return final meta.
+
+    Retries on transient connection errors (DNS hiccup, brief loss of
+    connectivity) with exponential backoff so a momentary network glitch
+    doesn't kill a multi-hour download run.
+    """
     terminal = {"SUCCEEDED", "CANCELLED", "KILLED", "FAILED", "FILE_ERASED"}
     url = f"{GBIF_API}/occurrence/download/{key}"
     last_status = None
+    max_retries = 8
+    retry_count = 0
     while True:
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
+        try:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            retry_count = 0   # reset on successful poll
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError) as exc:
+            retry_count += 1
+            if retry_count > max_retries:
+                raise
+            sleep_s = min(60, 2 ** retry_count)
+            LOG.warning(
+                "Poll %s failed (%s); retry %d/%d after %ds",
+                key, type(exc).__name__, retry_count, max_retries, sleep_s,
+            )
+            time.sleep(sleep_s)
+            continue
         meta = r.json()
         status = meta.get("status", "UNKNOWN")
         if status != last_status:
